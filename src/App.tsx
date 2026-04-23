@@ -1,0 +1,6829 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  LayoutDashboard, 
+  PlusCircle, 
+  Users, 
+  CheckCircle2, 
+  XCircle, 
+  FileText, 
+  Upload, 
+  LogOut, 
+  Shield, 
+  ChevronRight,
+  Paperclip,
+  Trash2,
+  Clock,
+  AlertCircle,
+  Send,
+  Inbox,
+  ClipboardList,
+  Filter,
+  Building2,
+  Download,
+  RotateCcw,
+  Edit2,
+  UserPlus,
+  ShoppingCart,
+  Package,
+  Receipt,
+  Search,
+  Plus,
+  X,
+  Eye,
+  RefreshCw,
+  TrendingUp,
+  Activity
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { Toaster, toast } from 'react-hot-toast';
+import { jsPDF } from 'jspdf';
+import { 
+  BarChart, 
+  Bar, 
+  XAxis, 
+  YAxis, 
+  CartesianGrid, 
+  Tooltip, 
+  ResponsiveContainer,
+  PieChart,
+  Pie,
+  Cell
+} from 'recharts';
+import { User, Workflow, WorkflowStep, Attachment, WorkflowRequest, RequestApproval, Role } from './types';
+import { cn } from './lib/utils';
+
+// --- API Helpers ---
+const FLOWMASTER_ENTITY_KEY = 'flowmaster_entity';
+
+const api = {
+  token: localStorage.getItem('token'),
+  setToken(token: string | null) {
+    this.token = token;
+    if (token) localStorage.setItem('token', token);
+    else {
+      localStorage.removeItem('token');
+      localStorage.removeItem(FLOWMASTER_ENTITY_KEY);
+    }
+  },
+  setActiveEntity(entity: string | null) {
+    if (entity) localStorage.setItem(FLOWMASTER_ENTITY_KEY, entity);
+    else localStorage.removeItem(FLOWMASTER_ENTITY_KEY);
+  },
+  async request(path: string, options: RequestInit & { skipEntity?: boolean } = {}) {
+    const { skipEntity: skipEntityOpt, ...fetchOptions } = options;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${this.token}`,
+      ...(fetchOptions.headers as Record<string, string>),
+    };
+    const skipEntity = !!skipEntityOpt || path === '/api/login' || path === '/api/register' || path === '/api/me';
+    const entity = localStorage.getItem(FLOWMASTER_ENTITY_KEY);
+    if (!skipEntity && entity) {
+      headers['X-Entity'] = entity;
+    }
+    const res = await fetch(path, {
+      ...fetchOptions,
+      headers,
+    });
+    const contentType = res.headers.get('content-type') || '';
+    const isJson = contentType.includes('application/json');
+
+    if (!res.ok) {
+      if (isJson) {
+        const err = await res.json();
+        throw new Error(err.error || 'Something went wrong');
+      }
+      const text = await res.text();
+      throw new Error(text || `Request failed (${res.status})`);
+    }
+
+    if (isJson) return res.json();
+    // Some endpoints might return empty responses (e.g., 204) or non-JSON.
+    // Keep callers safe by returning a minimal object.
+    const text = await res.text().catch(() => '');
+    return text ? { message: text } : {};
+  }
+};
+
+/** Open or download a request attachment (disk-backed `file_url` or legacy `file_data`). */
+async function openWorkflowRequestAttachment(
+  requestId: number,
+  att: Attachment,
+  setViewingPdf: (pdf: { url: string; fileName: string } | null) => void
+): Promise<void> {
+  const isPdf = att.file_type === "application/pdf" || att.file_name.toLowerCase().endsWith(".pdf");
+  const headers: Record<string, string> = { Authorization: `Bearer ${api.token}` };
+  const entity = localStorage.getItem(FLOWMASTER_ENTITY_KEY);
+  if (entity) headers["X-Entity"] = entity;
+  let url: string | undefined;
+  if (att.file_data && String(att.file_data).trim()) {
+    url = att.file_data;
+  } else {
+    const fetchPath =
+      att.file_url && att.file_url.startsWith("/")
+        ? att.file_url
+        : att.id
+          ? `/api/workflow-requests/${requestId}/attachments/${att.id}/file`
+          : null;
+    if (!fetchPath) {
+      toast.error("File not available");
+      return;
+    }
+    const res = await fetch(fetchPath, { headers });
+    if (!res.ok) {
+      toast.error("Could not open file");
+      return;
+    }
+    const blob = await res.blob();
+    url = URL.createObjectURL(blob);
+  }
+  if (isPdf) setViewingPdf({ url, fileName: att.file_name });
+  else {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = att.file_name;
+    link.click();
+    if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+  }
+}
+
+function downloadFileFromUrl(url: string, fileName: string): void {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.click();
+}
+
+// --- Components ---
+
+const PdfViewer = ({
+  url,
+  fileName,
+  onDownload,
+  onClose,
+}: {
+  url: string;
+  fileName: string;
+  onDownload: () => void;
+  onClose: () => void;
+}) => {
+  const iframeSrc = `${url}${url.includes("#") ? "&" : "#"}view=FitH`;
+  return (
+    <div className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm p-2 md:p-3">
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95 }}
+        animate={{ opacity: 1, scale: 1 }}
+        exit={{ opacity: 0, scale: 0.95 }}
+        className="relative w-full h-full bg-white rounded-2xl shadow-2xl overflow-hidden flex flex-col"
+      >
+        <div className="flex items-center justify-between gap-3 p-4 border-b border-zinc-100 bg-white">
+          <h3 className="text-sm font-bold text-zinc-900 truncate">PDF Viewer: {fileName}</h3>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onDownload}
+              className="inline-flex items-center gap-2 px-3 py-2 text-xs font-bold rounded-lg bg-indigo-600 text-white hover:bg-indigo-500 transition-colors"
+            >
+              <Download className="w-4 h-4" />
+              Download
+            </button>
+            <button
+              onClick={onClose}
+              className="p-2 hover:bg-zinc-100 rounded-full transition-colors"
+            >
+              <X className="w-5 h-5 text-zinc-500" />
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 bg-zinc-100 overflow-hidden">
+          <iframe
+            src={iframeSrc}
+            className="w-full h-full border-none"
+            title="PDF Viewer"
+          />
+        </div>
+      </motion.div>
+    </div>
+  );
+};
+
+function buildPdfPreview(doc: jsPDF, fileName: string): { url: string; fileName: string } {
+  const blob = doc.output("blob");
+  const url = URL.createObjectURL(blob);
+  return { url, fileName };
+}
+
+function toUpperSerial(value: string | number | null | undefined): string {
+  return String(value ?? "").toUpperCase();
+}
+
+function displayRequestSerial(request: Pick<WorkflowRequest, "formatted_id" | "id">): string {
+  return toUpperSerial(request.formatted_id || request.id);
+}
+
+const SECTION_OPTIONS = ["NAR1", "NAR2", "POWDER PLANT", "PRESS", "INSTRUMENT", "FACILITY", "NA"] as const;
+const SECTION_NA = "NA";
+
+function sectionSelectionFromStored(value: string | null | undefined): string {
+  const normalized = String(value ?? "").trim().toUpperCase();
+  return SECTION_OPTIONS.includes(normalized as (typeof SECTION_OPTIONS)[number]) ? normalized : "";
+}
+
+function sectionPayloadFromSelection(value: string | null | undefined): string {
+  const normalized = String(value ?? "").trim().toUpperCase();
+  return normalized === SECTION_NA ? "" : normalized;
+}
+
+const EntitySelection = ({ entities, onSelect }: { entities: string[]; onSelect: (entity: string) => void }) => {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-zinc-50 p-4">
+      <motion.div 
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-zinc-200 p-8"
+      >
+        <div className="flex flex-col items-center mb-8">
+          <div className="w-12 h-12 bg-indigo-600 rounded-xl flex items-center justify-center mb-4 shadow-lg shadow-indigo-200">
+            <Building2 className="text-white w-6 h-6" />
+          </div>
+          <h1 className="text-2xl font-bold text-zinc-900">Select Entity</h1>
+          <p className="text-zinc-500 text-sm mt-1">Please select an entity to continue</p>
+        </div>
+
+        <div className="grid gap-3">
+          {entities.map((entity) => (
+            <button
+              key={entity}
+              onClick={() => onSelect(entity)}
+              className="w-full flex items-center justify-between p-4 rounded-xl border border-zinc-100 hover:border-indigo-200 hover:bg-indigo-50 transition-all group"
+            >
+              <span className="font-bold text-zinc-700 group-hover:text-indigo-600">{entity}</span>
+              <ChevronRight className="w-5 h-5 text-zinc-300 group-hover:text-indigo-400" />
+            </button>
+          ))}
+        </div>
+      </motion.div>
+    </div>
+  );
+};
+
+const Login = ({ onLogin }: { onLogin: (user: User) => void }) => {
+  const [isRegister, setIsRegister] = useState(false);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [department, setDepartment] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      if (isRegister) {
+        await api.request('/api/register', {
+          method: 'POST',
+          body: JSON.stringify({ username, password, department }),
+        });
+        toast.success('Registered successfully! Please login.');
+        setIsRegister(false);
+      } else {
+        const data = await api.request('/api/login', {
+          method: 'POST',
+          body: JSON.stringify({ username, password }),
+        });
+        api.setToken(data.token);
+        onLogin(data.user);
+        toast.success('Welcome back!');
+      }
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-zinc-50 p-4">
+      <motion.div 
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-zinc-200 p-8"
+      >
+        <div className="flex flex-col items-center mb-8">
+          <div className="w-12 h-12 bg-indigo-600 rounded-xl flex items-center justify-center mb-4 shadow-lg shadow-indigo-200">
+            <Shield className="text-white w-6 h-6" />
+          </div>
+          <h1 className="text-2xl font-bold text-zinc-900">FlowMaster</h1>
+          <p className="text-zinc-500 text-sm mt-1">
+            {isRegister ? 'Create your account' : 'Sign in to your account'}
+          </p>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-zinc-700 mb-1">Username</label>
+            <input
+              type="text"
+              required
+              className="w-full px-4 py-2 rounded-lg border border-zinc-300 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-zinc-700 mb-1">Password</label>
+            <input
+              type="password"
+              required
+              className="w-full px-4 py-2 rounded-lg border border-zinc-300 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
+          {isRegister && (
+            <div>
+              <label className="block text-sm font-medium text-zinc-700 mb-1">Department</label>
+              <select
+                required
+                className="w-full px-4 py-2 rounded-lg border border-zinc-300 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
+                value={department}
+                onChange={(e) => setDepartment(e.target.value)}
+              >
+                <option value="">Select Department</option>
+                <option value="IT">IT</option>
+                <option value="HR">HR</option>
+                <option value="Finance">Finance</option>
+                <option value="Sales">Sales</option>
+                <option value="General">General</option>
+              </select>
+            </div>
+          )}
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full bg-indigo-600 text-white py-2 rounded-lg font-semibold hover:bg-indigo-700 transition-colors disabled:opacity-50"
+          >
+            {loading ? 'Processing...' : (isRegister ? 'Register' : 'Login')}
+          </button>
+        </form>
+
+        <div className="mt-6 text-center">
+          <button
+            onClick={() => setIsRegister(!isRegister)}
+            className="text-sm text-indigo-600 hover:underline"
+          >
+            {isRegister ? 'Already have an account? Login' : "Don't have an account? Register"}
+          </button>
+        </div>
+
+        {!isRegister && (
+          <div className="mt-8 p-4 bg-zinc-50 rounded-xl border border-zinc-200">
+            <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Test Accounts (Password: password123)</h3>
+            <div className="grid grid-cols-2 gap-2 text-[10px]">
+              <div className="text-zinc-600">IT: <span className="font-mono">preparer_it, checker_it, approver_it, director_it</span></div>
+              <div className="text-zinc-600">HR: <span className="font-mono">preparer_hr, checker_hr, approver_hr</span></div>
+              <div className="text-zinc-600 col-span-2">Multi-Role (IT): <span className="font-mono">multi_role_user</span> (Prep + Check)</div>
+              <div className="text-zinc-600 col-span-2">Admin: <span className="font-mono">admin / admin123</span></div>
+            </div>
+          </div>
+        )}
+      </motion.div>
+    </div>
+  );
+};
+
+const TemplateSelector = ({ templates, onSelect }: { templates: Workflow[], onSelect: (w: Workflow) => void }) => {
+  // Backend stores workflow status in lowercase (e.g. "approved"), while UI types/UI code
+  // sometimes expect Title Case. Normalize to make the submit page work reliably.
+  const approvedTemplates = templates.filter(t => (t.status ?? '').toString().trim().toLowerCase() === 'approved');
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col gap-1">
+        <h2 className="text-xl font-bold text-zinc-900">Select a Workflow Template</h2>
+        <p className="text-sm text-zinc-500">Choose an approved template to start your request</p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {approvedTemplates.length === 0 && (
+          <div className="col-span-full text-center py-12 bg-white rounded-xl border border-dashed border-zinc-300">
+            <AlertCircle className="w-12 h-12 text-zinc-300 mx-auto mb-3" />
+            <p className="text-zinc-500">No approved templates available. Please create one or wait for approval.</p>
+          </div>
+        )}
+        {approvedTemplates.map((w) => (
+          <div
+            key={w.id}
+            onClick={() => onSelect(w)}
+            className="bg-white p-5 rounded-xl border border-zinc-200 hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer group flex flex-col justify-between"
+          >
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <div className="w-8 h-8 bg-indigo-50 rounded-lg flex items-center justify-center">
+                  <ClipboardList className="w-4 h-4 text-indigo-600" />
+                </div>
+                <h3 className="font-bold text-zinc-900 group-hover:text-indigo-600 transition-colors">{w.name}</h3>
+              </div>
+            </div>
+            <div className="flex items-center justify-between pt-4 border-t border-zinc-50">
+              <span className="text-xs text-zinc-400 font-medium">{w.steps.length} Approval Steps</span>
+              <div className="text-indigo-600 flex items-center gap-1 text-xs font-bold">
+                Select <ChevronRight className="w-3 h-3" />
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const WorkflowCreator = ({ onSuccess, availableRoles }: { onSuccess: () => void, availableRoles: Role[] }) => {
+  const [name, setName] = useState('');
+  const [category, setCategory] = useState<'Purchasing' | 'HR' | 'Finance' | 'IT' | 'General'>('general');
+  const [steps, setSteps] = useState<WorkflowStep[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [tableColumns, setTableColumns] = useState<{ id: string; name: string }[]>([]);
+  const [newColumnName, setNewColumnName] = useState('');
+  const [attachmentsRequired, setAttachmentsRequired] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const isPR = isPRTemplate({ name, category });
+  const isPO = isPOTemplate({ name, category });
+  const isSR = isSRTemplate({ name, category });
+
+  useEffect(() => {
+    if (isPR) setSteps(FIXED_PR_STEPS);
+    else if (isPO) setSteps(FIXED_PO_STEPS_FULL);
+    else if (isSR) setSteps(FIXED_SR_STEPS);
+  }, [isPR, isPO, isSR]);
+
+  useEffect(() => {
+    const fetchUsers = async () => {
+      try {
+        const data = await api.request('/api/users');
+        setUsers(data);
+      } catch (err) {
+        console.error('Failed to fetch users', err);
+      }
+    };
+    fetchUsers();
+  }, []);
+
+  useEffect(() => {
+    if (steps.length === 0 && availableRoles.length > 0) {
+      setSteps([{ 
+        id: Math.random().toString(36).substr(2, 9), 
+        label: 'Initial Review', 
+        approverRole: availableRoles.find(r => r.name === 'checker')?.name || availableRoles[0].name 
+      }]);
+    }
+  }, [availableRoles]);
+
+  const addStep = () => {
+    if (isPR || isPO || isSR) return;
+    setSteps([...steps, { 
+      id: Math.random().toString(36).substr(2, 9), 
+      label: '', 
+      approverRole: availableRoles.find(r => r.name === 'approver')?.name || availableRoles[0]?.name || '' 
+    }]);
+  };
+
+  const removeStep = (id: string) => {
+    if (isPR || isPO || isSR) return;
+    setSteps(steps.filter(s => s.id !== id));
+  };
+
+  const addColumn = () => {
+    if (newColumnName.trim()) {
+      setTableColumns([...tableColumns, { id: Math.random().toString(36).substr(2, 9), name: newColumnName.trim() }]);
+      setNewColumnName('');
+    }
+  };
+
+  const removeColumn = (id: string) => {
+    setTableColumns(tableColumns.filter(c => c.id !== id));
+  };
+
+  const updateColumn = (id: string, newName: string) => {
+    setTableColumns(tableColumns.map(c => c.id === id ? { ...c, name: newName } : c));
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (steps.some(s => !s.label || !s.approverRole)) {
+      return toast.error('Please fill in all step details');
+    }
+    setLoading(true);
+    try {
+      await api.request('/api/workflows', {
+        method: 'POST',
+        body: JSON.stringify({ 
+          name, 
+          category,
+          steps, 
+          table_columns: tableColumns.map(c => c.name), 
+          attachments_required: attachmentsRequired
+        }),
+      });
+      toast.success('Workflow template submitted for approval!');
+      onSuccess();
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="bg-white rounded-xl border border-zinc-200 p-6 shadow-sm">
+      <h2 className="text-xl font-bold text-zinc-900 mb-6 flex items-center gap-2">
+        <PlusCircle className="w-5 h-5 text-indigo-600" />
+        Design New Workflow Template
+      </h2>
+      <form onSubmit={handleSubmit} className="space-y-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-zinc-700">Workflow Name</label>
+            <input
+              type="text"
+              required
+              placeholder="e.g., Expense Reimbursement"
+              className="w-full px-4 py-2 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-zinc-700">Category</label>
+            <select
+              className="w-full px-4 py-2 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+              value={category}
+              onChange={(e) => setCategory(e.target.value as any)}
+            >
+              <option value="general">General</option>
+              <option value="procurement">Procurement</option>
+              <option value="hr">HR</option>
+              <option value="finance">Finance</option>
+              <option value="it">IT</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <label className="text-sm font-medium text-zinc-700">Approval Steps</label>
+            {!isPR && !isPO && !isSR && (
+              <button
+                type="button"
+                onClick={addStep}
+                className="text-xs bg-indigo-50 text-indigo-600 px-3 py-1 rounded-full font-semibold hover:bg-indigo-100 transition-colors"
+              >
+                + Add Step
+              </button>
+            )}
+          </div>
+          <div className="space-y-3">
+            {steps.map((step, index) => (
+              <div key={step.id} className="flex items-center gap-3 bg-zinc-50 p-3 rounded-lg border border-zinc-200">
+                <div className="w-6 h-6 bg-indigo-600 text-white rounded-full flex items-center justify-center text-xs font-bold">
+                  {index + 1}
+                </div>
+                <input
+                  placeholder="Step Label (e.g., Dept Head Approval)"
+                  className="flex-1 bg-transparent border-none focus:ring-0 text-sm"
+                  disabled={isPR || isPO || isSR}
+                  value={step.label}
+                  onChange={(e) => {
+                    const newSteps = [...steps];
+                    newSteps[index].label = e.target.value;
+                    setSteps(newSteps);
+                  }}
+                />
+                <select
+                  className="w-32 bg-transparent border-none focus:ring-0 text-sm outline-none"
+                  disabled={isPR || isPO || isSR}
+                  value={step.approverRole}
+                  onChange={(e) => {
+                    const newSteps = [...steps];
+                    newSteps[index].approverRole = e.target.value;
+                    setSteps(newSteps);
+                  }}
+                >
+                  {availableRoles.map(r => (
+                    <option key={r.id} value={r.name}>{r.name.charAt(0).toUpperCase() + r.name.slice(1)}</option>
+                  ))}
+                </select>
+                {steps.length > 1 && !isPR && !isPO && !isSR && (
+                  <button type="button" onClick={() => removeStep(step.id)} className="text-zinc-400 hover:text-red-500">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 bg-zinc-50 p-4 rounded-xl border border-zinc-200">
+          <input
+            type="checkbox"
+            id="attachments_required"
+            className="w-4 h-4 text-indigo-600 rounded border-zinc-300 focus:ring-indigo-500"
+            checked={attachmentsRequired}
+            onChange={(e) => setAttachmentsRequired(e.target.checked)}
+          />
+          <label htmlFor="attachments_required" className="text-sm font-medium text-zinc-700 cursor-pointer">
+            Require attachments when submitting requests
+          </label>
+        </div>
+
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <label className="text-sm font-medium text-zinc-700">Data Table Columns (Optional)</label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                placeholder="e.g., Amount, Qty"
+                className="text-xs px-2 py-1 rounded border border-zinc-300 outline-none focus:ring-1 focus:ring-indigo-500"
+                value={newColumnName}
+                onChange={(e) => setNewColumnName(e.target.value)}
+                onKeyPress={(e) => e.key === 'Enter' && (e.preventDefault(), addColumn())}
+              />
+              <button
+                type="button"
+                onClick={addColumn}
+                className="text-xs bg-emerald-50 text-emerald-600 px-3 py-1 rounded-full font-semibold hover:bg-emerald-100 transition-colors"
+              >
+                + Add Column
+              </button>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {tableColumns.length === 0 && <p className="text-xs text-zinc-400 italic">No custom columns defined. Requests will only have title and details.</p>}
+            {tableColumns.map((col) => (
+              <div key={col.id} className="flex items-center gap-2 bg-zinc-100 px-3 py-1 rounded-full text-xs text-zinc-600 border border-zinc-200 focus-within:border-indigo-300 focus-within:ring-1 focus-within:ring-indigo-500 transition-all">
+                <input
+                  type="text"
+                  className="bg-transparent border-none focus:ring-0 text-xs w-24 outline-none font-medium"
+                  value={col.name}
+                  onChange={(e) => updateColumn(col.id, e.target.value)}
+                  placeholder="Column name..."
+                />
+                <button type="button" onClick={() => removeColumn(col.id)} className="text-zinc-400 hover:text-red-500">
+                  <Trash2 className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <button
+          type="submit"
+          disabled={loading}
+          className="w-full bg-indigo-600 text-white py-3 rounded-xl font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 disabled:opacity-50"
+        >
+          {loading ? 'Submitting...' : 'Submit Workflow Template for Approval'}
+        </button>
+      </form>
+    </div>
+  );
+};
+
+/** Line-item column for short notes (legacy JSON may use "Remarks (Purpose)"). */
+const REMARKS_LINE_COL = 'Remarks';
+
+/** Entity code on requests / X-Entity → legal name on PR/PO PDFs and drafts. */
+const ENTITY_LEGAL_NAMES: Record<string, string> = {
+  GCBCM: 'GCB COCOA MALAYSIA SDN BHD',
+  GCCM: 'GUAN CHONG COCOA MANUFACTURER SDN BHD',
+  CCI: "GCB COCOA COTE D'IVOIRE",
+  GCBCS: 'GCB COCOA SINGAPORE PTE LTD',
+  ACI: 'PT. ACI COCOA INDONESIA',
+};
+
+function entityLegalDisplayName(code: string | undefined | null): string {
+  if (code == null || !String(code).trim()) return '-';
+  const key = String(code).trim().toUpperCase();
+  return ENTITY_LEGAL_NAMES[key] || String(code).trim();
+}
+
+/** SST (Malaysia entities), TVA (CCI), generic Tax elsewhere — for PDFs and forms. */
+function procurementTaxLabelForEntity(code: string | undefined | null): string {
+  const k = String(code ?? '').trim().toUpperCase();
+  if (k === 'GCCM' || k === 'GCBCM') return 'SST';
+  if (k === 'CCI') return 'TVA';
+  return 'Tax';
+}
+
+function procurementTaxRateFormLabel(code: string | undefined | null): string {
+  const lab = procurementTaxLabelForEntity(code);
+  return lab === 'Tax' ? 'Tax rate' : `${lab} rate`;
+}
+
+function clampUnitRate(n: number): number {
+  if (Number.isNaN(n) || n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+}
+
+/** User enters percent (e.g. 10 = 10%); API/storage use unit rate 0–1. */
+function procurementPercentToUnitRate(percent: number): number {
+  return clampUnitRate(percent / 100);
+}
+
+/** Stored unit rate (0–1) → percent for form fields (e.g. 0.18 → 18). `whenMissingUseUnitRate` is the stored default when value is null/undefined. */
+function procurementUnitRateToPercent(unit: number | undefined | null, whenMissingUseUnitRate: number): number {
+  const u =
+    unit !== undefined && unit !== null && !Number.isNaN(Number(unit))
+      ? Number(unit)
+      : whenMissingUseUnitRate;
+  return Math.round(u * 10000) / 100;
+}
+
+/** Line qty for money: max quantity (stock requisition), else quantity, else min quantity — matches server `lineItemQtyForTotals`. */
+function lineItemQtyForDisplay(item: any): number {
+  const max = parseFloat(String(item?.['Max quantity'] ?? item?.['Max Quantity'] ?? ''));
+  if (!Number.isNaN(max) && max > 0) return max;
+  const q = parseFloat(String(item?.['Quantity'] ?? item?.quantity ?? 0));
+  if (!Number.isNaN(q) && q > 0) return q;
+  const min = parseFloat(String(item?.['Min quantity'] ?? item?.['Min Quantity'] ?? ''));
+  if (!Number.isNaN(min)) return min;
+  return 0;
+}
+
+/** Subtotal, discount (on subtotal), tax (on amount after discount), total — matches server `computeRequestTotalMyr` logic. */
+function procurementMoneyTotals(req: Pick<WorkflowRequest, 'line_items' | 'tax_rate' | 'discount_rate'>) {
+  let subtotal = 0;
+  for (const item of req.line_items || []) {
+    const qty = lineItemQtyForDisplay(item);
+    const price = parseFloat(String(item?.['Unit Price'] ?? item?.['Price'] ?? item?.['Amount'] ?? 0));
+    subtotal += qty * price;
+  }
+  const dr = clampUnitRate(req.discount_rate !== undefined && req.discount_rate !== null ? Number(req.discount_rate) : 0);
+  const tr = clampUnitRate(req.tax_rate !== undefined && req.tax_rate !== null ? Number(req.tax_rate) : 0.18);
+  const discountAmount = subtotal * dr;
+  const taxableBase = subtotal * (1 - dr);
+  const taxAmount = taxableBase * tr;
+  const total = taxableBase + taxAmount;
+  return { subtotal, discountRate: dr, discountAmount, taxableBase, taxRate: tr, taxAmount, total };
+}
+
+const PR_COLUMNS = [
+  'Item',
+  'Suggested Supplier',
+  'Quantity',
+  'Unit Price',
+  'Cost Center',
+  'Request to be delivered on',
+  REMARKS_LINE_COL,
+];
+
+const PO_COLUMNS = [
+  'Item',
+  'Final Supplier',
+  'Quantity',
+  'Unit Price',
+  'Cost Center',
+  'Request to be delivered on',
+  REMARKS_LINE_COL,
+];
+
+/** Stock / spare requisition line grid (No is the row index in the UI table). */
+const SR_COLUMNS = [
+  'Item',
+  'Unit Price',
+  'Purchase From (Supplier)',
+  'Min quantity',
+  'Max quantity',
+  'Spare for (Location)',
+  'Reason',
+];
+
+const isProcurementNumericGridColumn = (col: string) => {
+  const c = col.trim().toLowerCase();
+  return (
+    c === 'quantity' ||
+    c === 'unit price' ||
+    c === 'price' ||
+    c === 'amount' ||
+    c === 'min quantity' ||
+    c === 'max quantity'
+  );
+};
+
+const lineItemRemarksDisplay = (item: any) =>
+  String(item?.[REMARKS_LINE_COL] ?? item?.['Remarks (Purpose)'] ?? '').trim();
+
+const mergeLineItemRemarksWrite = (item: any, value: string) => {
+  const next = { ...item, [REMARKS_LINE_COL]: value };
+  delete (next as any)['Remarks (Purpose)'];
+  return next;
+};
+
+/** Multi-line notes per line item (stored in JSON; not a template column). */
+const LINE_ITEM_REMARKS_KEY = '_lineRemarks';
+
+/** Signature images are stored as data URLs in NVARCHAR(MAX). Very short strings are usually legacy truncated rows. */
+function isSignatureImageDataUrl(s: string | undefined | null): boolean {
+  if (!s || typeof s !== 'string') return false;
+  const t = s.trim();
+  if (!/^data:image\/(png|jpeg|jpg);base64,/i.test(t)) return false;
+  return t.length >= 80;
+}
+
+function formatSignatureProofTimestamp(iso: string | undefined | null): string {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return '';
+  }
+}
+
+function hasRequesterSignatureProof(req: WorkflowRequest): boolean {
+  return !!(req.requester_signed_at || isSignatureImageDataUrl(req.requester_signature));
+}
+
+/** PR, PO, and procurement invoice flows require a drawn signature on each approval (stored for PDFs). */
+function requiresProcurementApproverSignaturePad(req: WorkflowRequest): boolean {
+  if (req.category !== 'procurement') return false;
+  if (isPRRequest(req) || isPO_Only(req) || isSRRequest(req)) return true;
+  return req.template_name.toLowerCase().includes('invoice');
+}
+
+const SignaturePad = ({ onSave, onClear }: { onSave: (data: string) => void, onClear: () => void }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const isDrawingRef = useRef(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+  }, []);
+
+  const getCanvasCoords = (e: React.MouseEvent | React.TouchEvent, canvas: HTMLCanvasElement) => {
+    const rect = canvas.getBoundingClientRect();
+    let clientX: number;
+    let clientY: number;
+    if ('touches' in e && e.touches.length > 0) {
+      clientX = e.touches[0].clientX;
+      clientY = e.touches[0].clientY;
+    } else {
+      const me = e as React.MouseEvent;
+      clientX = me.clientX;
+      clientY = me.clientY;
+    }
+    const rw = rect.width || 1;
+    const rh = rect.height || 1;
+    const x = ((clientX - rect.left) / rw) * canvas.width;
+    const y = ((clientY - rect.top) / rh) * canvas.height;
+    return { x, y };
+  };
+
+  const startDrawing = (e: React.MouseEvent | React.TouchEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    isDrawingRef.current = true;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const { x, y } = getCanvasCoords(e, canvas);
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+  };
+
+  const stopDrawing = () => {
+    isDrawingRef.current = false;
+    const canvas = canvasRef.current;
+    if (canvas) {
+      onSave(canvas.toDataURL());
+    }
+  };
+
+  const draw = (e: React.MouseEvent | React.TouchEvent) => {
+    if (!isDrawingRef.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const { x, y } = getCanvasCoords(e, canvas);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  };
+
+  const clear = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    onClear();
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="border border-zinc-300 rounded-lg overflow-hidden bg-white">
+        <canvas
+          ref={canvasRef}
+          width={400}
+          height={150}
+          className="w-full cursor-crosshair touch-none"
+          onMouseDown={startDrawing}
+          onMouseMove={draw}
+          onMouseUp={stopDrawing}
+          onMouseOut={stopDrawing}
+          onTouchStart={startDrawing}
+          onTouchMove={draw}
+          onTouchEnd={stopDrawing}
+        />
+      </div>
+      <button
+        type="button"
+        onClick={clear}
+        className="text-xs text-zinc-500 hover:text-zinc-700 font-medium flex items-center gap-1"
+      >
+        <RotateCcw className="w-3 h-3" />
+        Clear Signature
+      </button>
+    </div>
+  );
+};
+
+const isPOTemplate = (template: { name: string; category: string }) => {
+  const n = template.name.toLowerCase();
+  return template.category === 'procurement' && (n.includes('purchase order') || n.includes('po'));
+};
+
+const isSRTemplate = (template: { name: string; category: string }) => {
+  if (template.category !== 'procurement') return false;
+  const n = template.name.toLowerCase();
+  return n.includes('stock requisition') || (n.includes('stock') && n.includes('requisition'));
+};
+
+/** Purchase Request template (excludes PO and stock requisition templates). */
+const isPRTemplate = (template: { name: string; category: string }) => {
+  if (template.category !== 'procurement') return false;
+  if (isPOTemplate(template)) return false;
+  if (isSRTemplate(template)) return false;
+  const n = template.name.toLowerCase();
+  return n.includes('purchase request') || n.includes('pr');
+};
+
+/** Purchase Request instance (not PO). */
+const isPRRequest = (request: WorkflowRequest) => {
+  if (!request || request.category !== 'procurement') return false;
+  if (isPO_Only(request)) return false;
+  const n = request.template_name.toLowerCase();
+  return n.includes('purchase request') || n.includes('pr');
+};
+
+const isPR_Only = (item: any) => {
+  if (!item) return false;
+  const name = (item.template_name || item.name || '').toLowerCase();
+  return item.category === 'procurement' && (name.includes('purchase request') || name.includes('pr')) && !name.includes('order') && !name.includes('po');
+};
+
+const isPO_Only = (item: any) => {
+  if (!item) return false;
+  const name = (item.template_name || item.name || '').toLowerCase();
+  return item.category === 'procurement' && (name.includes('purchase order') || name.includes('po'));
+};
+
+const isSR_Only = (item: any) => {
+  if (!item) return false;
+  if (item.category !== 'procurement' || isPO_Only(item)) return false;
+  const name = (item.template_name || item.name || '').toLowerCase();
+  return name.includes('stock requisition') || (name.includes('stock') && name.includes('requisition'));
+};
+
+const isSRRequest = (request: WorkflowRequest) => {
+  if (!request || request.category !== 'procurement' || isPO_Only(request)) return false;
+  const n = request.template_name.toLowerCase();
+  return n.includes('stock requisition') || (n.includes('stock') && n.includes('requisition'));
+};
+
+/** Hide free-text request details (formerly justification) for procurement PR/PO/SR only. */
+const isProcurementPRorPORequest = (req: WorkflowRequest | null | undefined) =>
+  !!req && req.category === 'procurement' && (isPRRequest(req) || isPO_Only(req) || isSRRequest(req));
+
+const procurementGridColumns = (req: WorkflowRequest) => {
+  if (isPRRequest(req)) return PR_COLUMNS;
+  if (isSRRequest(req)) return SR_COLUMNS;
+  return req.table_columns || [];
+};
+
+const procurementRowShowsLineTotal = (req: WorkflowRequest) => isPRRequest(req) || isSRRequest(req);
+
+const getColumns = (item: any) => {
+  if (!item) return [];
+  if (isPO_Only(item)) return PO_COLUMNS;
+  if (isSR_Only(item)) return SR_COLUMNS;
+  if (isPR_Only(item)) return PR_COLUMNS;
+  return item.table_columns || [];
+};
+
+/** Matches server approval rules (SOM = cross-department for PO SOM step). */
+const userCanApproveWorkflowStep = (user: User, request: WorkflowRequest, currentStep: WorkflowStep) => {
+  const role = currentStep.approverRole.toLowerCase();
+  const userHasRole = user.roles?.some((r) => r.toLowerCase() === role);
+  const isAdmin = user.roles?.some((r) => r.toLowerCase() === 'admin');
+  const isDirector = user.roles?.some((r) => r.toLowerCase() === 'director') && (user.department || '').toLowerCase() === 'management';
+  const isSom = user.roles?.some((r) => r.toLowerCase() === 'som') && (user.department || '').toLowerCase() === 'management';
+  if (isAdmin || isDirector) return true;
+  if (role === 'som' && isSom) return true;
+  const ent = (request.entity || '').trim().toUpperCase();
+  const pick = request.assigned_approver_id != null ? Number(request.assigned_approver_id) : NaN;
+  if (ent === 'GCCM' && role === 'approver' && Number.isFinite(pick) && pick > 0 && user.id === pick) return true;
+  if (userHasRole && user.department === request.department) return true;
+  return false;
+};
+
+/** API stores workflow request status in lowercase (pending | approved | rejected). */
+const normalizeWorkflowRequestStatus = (s: string | undefined) =>
+  (s ?? '').toString().trim().toLowerCase();
+
+/** All approval steps completed — server sets `status` to approved only after the final step. */
+const isWorkflowRequestFullyApproved = (r: Pick<WorkflowRequest, 'status'>) =>
+  normalizeWorkflowRequestStatus(r.status) === 'approved';
+
+const isWorkflowRequestPending = (r: Pick<WorkflowRequest, 'status'>) =>
+  normalizeWorkflowRequestStatus(r.status) === 'pending';
+
+const isWorkflowRequestRejected = (r: Pick<WorkflowRequest, 'status'>) =>
+  normalizeWorkflowRequestStatus(r.status) === 'rejected';
+
+const workflowRequestStatusBadgeClass = (r: WorkflowRequest) => {
+  const n = normalizeWorkflowRequestStatus(r.status);
+  if (n === 'approved') return 'bg-emerald-100 text-emerald-700 ring-1 ring-inset ring-emerald-200/70';
+  if (n === 'rejected') return 'bg-red-100 text-red-700 ring-1 ring-inset ring-red-200/70';
+  return 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-200/70';
+};
+
+const formatWorkflowRequestStatusLabel = (r: WorkflowRequest) => {
+  const n = normalizeWorkflowRequestStatus(r.status);
+  if (n === 'approved') return 'Approved';
+  if (n === 'rejected') return 'Rejected';
+  if (n === 'pending') return 'Pending';
+  return r.status ?? '—';
+};
+
+/** Purchasing users only; used for PR → PO actions. */
+const isPurchasingRole = (user: User) =>
+  !!user.roles?.some((role) => role.toLowerCase() === 'purchasing');
+
+/** Show Convert to PO only for fully approved procurement PRs on the purchasing side. */
+const canShowConvertPRToPO = (r: WorkflowRequest, user: User) =>
+  isWorkflowRequestFullyApproved(r) && isPR_Only(r) && isPurchasingRole(user);
+
+/** F-PU-003 style form PDF — only for procurement Purchase Request (see isPR_Only). Landscape for wider table. */
+const printProcurementPRFormPdf = (request: WorkflowRequest) => {
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+  const pageW = 297;
+  const pageH = 210;
+  const left = 10;
+  const right = pageW - 10;
+  const tableLeft = left;
+  const tableRight = right;
+  /** Column widths (mm); sum === tableRight − tableLeft (277mm). */
+  const colWidths = [10, 78, 36, 14, 32, 32, 75];
+  const colXs: number[] = [];
+  {
+    let x = tableLeft;
+    colWidths.forEach((w) => {
+      colXs.push(x);
+      x += w;
+    });
+    colXs.push(tableRight);
+  }
+
+  const padX = 1.2;
+  const padY = 1.8;
+  const headerFont = 7;
+  const bodyFont = 6;
+  const lineStepHeader = 3.0;
+  const lineStepBody = 2.75;
+  const minRowH = 6.5;
+  const totalsBlockH = 26;
+  const pageBottomSafe = pageH - 12;
+  const taxLabel = procurementTaxLabelForEntity(request.entity);
+
+  const getItemValue = (item: any, keys: string[]) => {
+    const foundKey = Object.keys(item || {}).find((k) => keys.includes(k.toLowerCase()));
+    if (!foundKey) return '';
+    return String(item[foundKey] ?? '');
+  };
+
+  const lineItems = request.line_items || [];
+  const money = procurementMoneyTotals(request);
+  const { subtotal, discountRate, discountAmount, taxRate, taxAmount: tax, total } = money;
+
+  const headerLabels = [
+    'No',
+    'Item',
+    'Suggested Supplier',
+    'Qty',
+    'Cost Center Account No.',
+    'Request to be delivered on',
+    'Remarks'
+  ];
+
+  const wrap = (text: string, colIndex: number, fontSize: number) => {
+    doc.setFontSize(fontSize);
+    const maxW = Math.max(4, colWidths[colIndex] - padX * 2);
+    return doc.splitTextToSize(text || '-', maxW);
+  };
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(headerFont);
+  const headerLineArrays = headerLabels.map((label, i) => wrap(label, i, headerFont));
+  const headerRowH =
+    Math.max(1, ...headerLineArrays.map((lines) => lines.length)) * lineStepHeader + padY * 2;
+
+  type RowBlock = { kind: 'data'; cells: string[][]; h: number } | { kind: 'totals'; h: number };
+
+  const dataBlocks: RowBlock[] = [];
+  const approvedApprovals = (request.approvals || []).filter((a) => a.status.toLowerCase() === 'approved');
+  const finalApproval =
+    approvedApprovals.length > 0
+      ? approvedApprovals.reduce((a, b) => (a.step_index >= b.step_index ? a : b))
+      : undefined;
+
+  lineItems.forEach((item, idx) => {
+    doc.setFontSize(bodyFont);
+    const qty = getItemValue(item, ['quantity', 'qty']);
+    const itemName = getItemValue(item, ['item', 'description']);
+    const supplier = getItemValue(item, ['suggested supplier', 'supplier', 'vendor']);
+    const cc = getItemValue(item, ['cost center', 'cost center account no.', 'cost centre']) || request.cost_center || '-';
+    const eta = getItemValue(item, ['request to be delivered on', 'delivery date', 'date of delivery']);
+    /** PR grid "Remarks" / "Remarks (Purpose)" only — not `_lineRemarks` line notes. */
+    const tableRemarks = lineItemRemarksDisplay(item);
+    const lineOnlyRemarks = item && item[LINE_ITEM_REMARKS_KEY] ? String(item[LINE_ITEM_REMARKS_KEY]).trim() : '';
+    const itemCellText = lineOnlyRemarks ? `${itemName}\n\n${lineOnlyRemarks}` : itemName;
+
+    const cells: string[][] = [
+      wrap(String(idx + 1), 0, bodyFont),
+      wrap(itemCellText, 1, bodyFont),
+      wrap(supplier, 2, bodyFont),
+      wrap(qty || '-', 3, bodyFont),
+      wrap(cc, 4, bodyFont),
+      wrap(eta, 5, bodyFont),
+      wrap(tableRemarks || '-', 6, bodyFont),
+    ];
+    const linesPerCol = cells.map((lines) => lines.length);
+    const h = Math.max(minRowH, Math.max(...linesPerCol, 1) * lineStepBody + padY * 2);
+    dataBlocks.push({ kind: 'data', cells, h });
+  });
+  dataBlocks.push({ kind: 'totals', h: totalsBlockH });
+
+  const drawPageChrome = (tableTop: number) => {
+    doc.setLineWidth(0.3);
+    doc.rect(left, 8, right - left, pageH - 16);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    doc.text(entityLegalDisplayName(request.entity).toUpperCase(), pageW / 2, 15, { align: 'center' });
+    doc.setFontSize(9);
+    doc.text('PURCHASE REQUISITION FORM: F-PU-003 (REV 0)', pageW / 2, 23, { align: 'center' });
+    doc.setFontSize(8);
+    doc.text('Department :', 14, 30);
+    doc.setFont('helvetica', 'normal');
+    doc.text(request.department || '-', 34, 30);
+    doc.text(`Date: ${new Date(request.created_at).toLocaleDateString()}`, tableRight - padX, 30, { align: 'right' });
+    doc.text(`PR No: ${displayRequestSerial(request)}`, tableRight - padX, 34, { align: 'right' });
+    doc.line(tableLeft, tableTop, tableRight, tableTop);
+  };
+
+  const drawVerticalRules = (y0: number, y1: number) => {
+    colXs.forEach((x) => doc.line(x, y0, x, y1));
+  };
+
+  const drawHeaderRow = (yTop: number) => {
+    const yBot = yTop + headerRowH;
+    doc.line(tableLeft, yBot, tableRight, yBot);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(headerFont);
+    headerLineArrays.forEach((lines, i) => {
+      let y = yTop + padY + lineStepHeader * 0.85;
+      lines.forEach((line) => {
+        doc.text(line, colXs[i] + padX, y);
+        y += lineStepHeader;
+      });
+    });
+    return yBot;
+  };
+
+  const drawDataRow = (yTop: number, rowH: number, cells: string[][]) => {
+    const yBot = yTop + rowH;
+    doc.line(tableLeft, yBot, tableRight, yBot);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(bodyFont);
+    cells.forEach((lines, i) => {
+      let y = yTop + padY + lineStepBody * 0.85;
+      lines.forEach((line) => {
+        doc.text(line, colXs[i] + padX, y);
+        y += lineStepBody;
+      });
+    });
+    return yBot;
+  };
+
+  const drawTotalsBlock = (yTop: number) => {
+    const yBot = yTop + totalsBlockH;
+    doc.line(tableLeft, yBot, tableRight, yBot);
+    const splitAt = 5;
+    doc.line(colXs[splitAt], yTop, colXs[splitAt], yBot);
+    doc.line(colXs[6], yTop + 20, tableRight, yTop + 20);
+    doc.setFontSize(8);
+    doc.text('Subtotal', colXs[splitAt] + padX, yTop + 5);
+    doc.text(subtotal.toFixed(2), tableRight - padX, yTop + 5, { align: 'right' });
+    doc.text(`Discount (${(discountRate * 100).toFixed(0)}%)`, colXs[splitAt] + padX, yTop + 11);
+    doc.text(discountAmount.toFixed(2), tableRight - padX, yTop + 11, { align: 'right' });
+    doc.text(`${taxLabel} ${(taxRate * 100).toFixed(0)}%`, colXs[splitAt] + padX, yTop + 17);
+    doc.text(`${(tax || 0).toFixed(2)}`, tableRight - padX, yTop + 17, { align: 'right' });
+    doc.text((request.currency?.trim() || '—').toUpperCase(), colXs[6] + padX, yBot - 3);
+    doc.text(total.toFixed(2), tableRight - padX, yBot - 3, { align: 'right' });
+    return yBot;
+  };
+
+  let tableTop = 36;
+  let y = tableTop;
+  drawPageChrome(tableTop);
+  let headerBottom = drawHeaderRow(y);
+  y = headerBottom;
+  drawVerticalRules(tableTop, headerBottom);
+
+  let blockIndex = 0;
+  while (blockIndex < dataBlocks.length) {
+    const block = dataBlocks[blockIndex];
+    if (block.kind === 'data') {
+      if (y + block.h > pageBottomSafe) {
+        doc.addPage('a4', 'l');
+        tableTop = 20;
+        y = tableTop;
+        drawPageChrome(tableTop);
+        headerBottom = drawHeaderRow(y);
+        y = headerBottom;
+        drawVerticalRules(tableTop, y);
+      }
+      y = drawDataRow(y, block.h, block.cells);
+      drawVerticalRules(tableTop, y);
+    } else {
+      if (y + block.h > pageBottomSafe) {
+        doc.addPage('a4', 'l');
+        tableTop = 20;
+        y = tableTop;
+        drawPageChrome(tableTop);
+        headerBottom = drawHeaderRow(y);
+        y = headerBottom;
+        drawVerticalRules(tableTop, y);
+      }
+      y = drawTotalsBlock(y);
+      drawVerticalRules(tableTop, y);
+    }
+    blockIndex += 1;
+  }
+
+  const tableBottom = y;
+  drawVerticalRules(tableTop, tableBottom);
+
+  const prDisclaimerText =
+    'Details of request items/services such as model no., grades/quality, date of delivery, and other requirements as appropriate to ensure the correct purchase shall be Clearly stated or attached.';
+  doc.setFont('helvetica', 'italic');
+  doc.setFontSize(7);
+  const discMaxW = tableRight - tableLeft - 4;
+  const discLines = doc.splitTextToSize(prDisclaimerText, discMaxW);
+  const discLineH = 3.35;
+  const discBlockH = discLines.length * discLineH + 2;
+
+  /** Taller box so signatures are not squeezed; image area uses max height below labels. */
+  const signatureBlockH = 56;
+  const signatureBoxInnerH = 52;
+  const footerGap = 2;
+  const footerTotalH = discBlockH + footerGap + signatureBlockH;
+  let discY = tableBottom + 3;
+  if (discY + footerTotalH > pageBottomSafe) {
+    doc.addPage('a4', 'l');
+    discY = 14;
+  }
+  discLines.forEach((ln) => {
+    doc.text(ln, left + 2, discY);
+    discY += discLineH;
+  });
+  doc.setFont('helvetica', 'normal');
+  const signTop = discY + footerGap;
+  const signBottom = signTop + signatureBoxInnerH;
+  const approverWithRenderableSig = approvedApprovals
+    .filter((a) => a.approver_signature && isSignatureImageDataUrl(a.approver_signature))
+    .reduce<RequestApproval | undefined>(
+      (best, a) => (!best || a.step_index > best.step_index ? a : best),
+      undefined
+    );
+  const approverForDisplay = approverWithRenderableSig || finalApproval;
+
+  const addSignatureImageFit = (dataUrl: string, xMm: number, yTopMm: number, maxW: number, maxH: number) => {
+    if (!dataUrl) return;
+    const lower = dataUrl.toLowerCase();
+    const fmtGuess: 'PNG' | 'JPEG' =
+      lower.includes('image/jpeg') || lower.includes('image/jpg') ? 'JPEG' : 'PNG';
+    const fitToBox = (iw: number, ih: number) => {
+      let w = maxW;
+      let h = (w * ih) / iw;
+      if (h > maxH) {
+        h = maxH;
+        w = (h * iw) / ih;
+      }
+      return { w, h };
+    };
+    try {
+      const { width: iw, height: ih } = doc.getImageProperties(dataUrl);
+      if (iw > 0 && ih > 0) {
+        const { w, h } = fitToBox(iw, ih);
+        try {
+          doc.addImage(dataUrl, fmtGuess, xMm, yTopMm, w, h);
+        } catch {
+          doc.addImage(dataUrl, fmtGuess === 'PNG' ? 'JPEG' : 'PNG', xMm, yTopMm, w, h);
+        }
+        return;
+      }
+    } catch {
+      /* fall through */
+    }
+    const { w, h } = fitToBox(400, 150);
+    for (const fmt of ['PNG', 'JPEG'] as const) {
+      try {
+        doc.addImage(dataUrl, fmt, xMm, yTopMm, w, h);
+        return;
+      } catch {
+        /* try next format */
+      }
+    }
+  };
+
+  doc.rect(left, signTop, right - left, signBottom - signTop);
+  const mid = (left + right) / 2;
+  doc.line(mid, signTop, mid, signBottom);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8);
+  doc.text('Requested By:', left + 2, signTop + 6);
+  doc.text('Approved By:', mid + 2, signTop + 6);
+  const sigPadX = 3;
+  const sigMaxW = mid - left - sigPadX * 2;
+  const sigMaxH = 22;
+  const sigImgY = signTop + 8;
+  const reqSigUrl = isSignatureImageDataUrl(request.requester_signature) ? request.requester_signature! : '';
+  if (reqSigUrl) {
+    addSignatureImageFit(reqSigUrl, left + sigPadX, sigImgY, sigMaxW, sigMaxH);
+  } else if (request.requester_signed_at) {
+    doc.setFontSize(7);
+    doc.text('Electronic signature', left + sigPadX, sigImgY + 5);
+    doc.text(formatSignatureProofTimestamp(request.requester_signed_at), left + sigPadX, sigImgY + 11);
+    doc.setFontSize(8);
+  }
+  const apprSigUrl =
+    approverWithRenderableSig?.approver_signature && isSignatureImageDataUrl(approverWithRenderableSig.approver_signature)
+      ? approverWithRenderableSig.approver_signature!
+      : '';
+  if (apprSigUrl) {
+    addSignatureImageFit(apprSigUrl, mid + sigPadX, sigImgY, sigMaxW, sigMaxH);
+  } else if (finalApproval && finalApproval.status.toLowerCase() === 'approved') {
+    doc.setFontSize(7);
+    doc.text('Electronic signature', mid + sigPadX, sigImgY + 5);
+    doc.text(formatSignatureProofTimestamp(finalApproval.created_at), mid + sigPadX, sigImgY + 11);
+    doc.setFontSize(8);
+  }
+
+  doc.text(`Name : ${request.requester_name || ''}`, left + 2, signBottom - 14);
+  doc.text('Designation :', left + 2, signBottom - 8);
+  doc.text(`Name: ${approverForDisplay?.approver_name || ''}`, mid + 2, signBottom - 14);
+  doc.text('Designation :', mid + 2, signBottom - 8);
+  doc.text(new Date(request.created_at).toLocaleDateString(), left + 2, signBottom - 2);
+  doc.text(
+    approverForDisplay?.created_at
+      ? new Date(approverForDisplay.created_at).toLocaleDateString()
+      : new Date().toLocaleDateString(),
+    mid + 2,
+    signBottom - 2
+  );
+
+  return buildPdfPreview(doc, `PR_${displayRequestSerial(request)}.pdf`);
+};
+
+/** Landscape stock item requisition form — matches company template (header, grid, 3 signatures, note). */
+const printProcurementSRFormPdf = (request: WorkflowRequest) => {
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+  const pageW = 297;
+  const pageH = 210;
+  const left = 10;
+  const right = pageW - 10;
+  const tableLeft = left;
+  const tableRight = right;
+  /** Min table rows (blank lines) like paper form. */
+  const SR_MIN_DATA_ROWS = 1;
+  const colWidths = [8, 44, 22, 50, 18, 18, 38, 79];
+  const colXs: number[] = [];
+  {
+    let x = tableLeft;
+    colWidths.forEach((w) => {
+      colXs.push(x);
+      x += w;
+    });
+    colXs.push(tableRight);
+  }
+
+  const padX = 1.2;
+  const padY = 1.8;
+  const headerFont = 7;
+  const bodyFont = 6;
+  const lineStepHeader = 3.0;
+  const lineStepBody = 2.75;
+  const minRowH = 6.5;
+  const pageBottomSafe = pageH - 12;
+
+  const getItemValue = (item: any, keys: string[]) => {
+    const foundKey = Object.keys(item || {}).find((k) => keys.includes(k.toLowerCase()));
+    if (!foundKey) return '';
+    return String(item[foundKey] ?? '');
+  };
+
+  const lineItems = request.line_items || [];
+
+  const headerLabels = [
+    'No',
+    'Item',
+    'Unit Price',
+    'Purchase From (Supplier)',
+    'Min Quantity',
+    'Max Quantity',
+    'Spare for (Location)',
+    'Reason',
+  ];
+
+  const wrap = (text: string, colIndex: number, fontSize: number) => {
+    doc.setFontSize(fontSize);
+    const maxW = Math.max(4, colWidths[colIndex] - padX * 2);
+    return doc.splitTextToSize(text || '-', maxW);
+  };
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(headerFont);
+  const headerLineArrays = headerLabels.map((label, i) => wrap(label, i, headerFont));
+  const headerRowH =
+    Math.max(1, ...headerLineArrays.map((lines) => lines.length)) * lineStepHeader + padY * 2;
+
+  type RowBlock = { kind: 'data'; cells: string[][]; h: number };
+
+  const dataBlocks: RowBlock[] = [];
+  const approvedApprovals = (request.approvals || []).filter((a) => a.status.toLowerCase() === 'approved');
+
+  const curPfx = procurementCurrencyPrefix(request.currency);
+
+  lineItems.forEach((item, idx) => {
+    doc.setFontSize(bodyFont);
+    const itemName = getItemValue(item, ['item', 'description']);
+    const priceRaw = getItemValue(item, ['unit price', 'price', 'amount']);
+    const priceNum = Number(priceRaw);
+    const priceDisp =
+      priceRaw !== '' && !Number.isNaN(priceNum) ? `${curPfx}${priceNum.toLocaleString()}`.trim() : '-';
+    const supplier = getItemValue(item, [
+      'purchase from (supplier)',
+      'purchase from',
+      'supplier',
+      'suggested supplier',
+      'vendor',
+    ]);
+    const minQ = getItemValue(item, ['min quantity']);
+    const maxQ = getItemValue(item, ['max quantity']);
+    const spareLoc = getItemValue(item, ['spare for (location)', 'spare for', 'location']);
+    const reason = getItemValue(item, ['reason']);
+    const lineOnlyRemarks = item && item[LINE_ITEM_REMARKS_KEY] ? String(item[LINE_ITEM_REMARKS_KEY]).trim() : '';
+    const itemCellText = lineOnlyRemarks ? `${itemName}\n\n${lineOnlyRemarks}` : itemName;
+
+    const cells: string[][] = [
+      wrap(String(idx + 1), 0, bodyFont),
+      wrap(itemCellText, 1, bodyFont),
+      wrap(priceDisp, 2, bodyFont),
+      wrap(supplier, 3, bodyFont),
+      wrap(minQ || '-', 4, bodyFont),
+      wrap(maxQ || '-', 5, bodyFont),
+      wrap(spareLoc, 6, bodyFont),
+      wrap(reason || '-', 7, bodyFont),
+    ];
+    const linesPerCol = cells.map((lines) => lines.length);
+    const h = Math.max(minRowH, Math.max(...linesPerCol, 1) * lineStepBody + padY * 2);
+    dataBlocks.push({ kind: 'data', cells, h });
+  });
+
+  const padRows = Math.max(0, SR_MIN_DATA_ROWS - lineItems.length);
+  for (let p = 0; p < padRows; p++) {
+    const cells: string[][] = [
+      wrap('', 0, bodyFont),
+      wrap('', 1, bodyFont),
+      wrap('', 2, bodyFont),
+      wrap('', 3, bodyFont),
+      wrap('', 4, bodyFont),
+      wrap('', 5, bodyFont),
+      wrap('', 6, bodyFont),
+      wrap('', 7, bodyFont),
+    ];
+    dataBlocks.push({ kind: 'data', cells, h: minRowH });
+  }
+
+  const subsidiaryLabel = entityLegalDisplayName(request.entity);
+  const formRef = displayRequestSerial(request);
+
+  const drawPageChrome = (tableTop: number) => {
+    doc.setLineWidth(0.3);
+    doc.rect(left, 8, right - left, pageH - 16);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(12);
+    doc.text('STOCK ITEM REQUISITION FORM', pageW / 2, 14, { align: 'center' });
+    doc.setFontSize(8);
+    doc.text('Department:', left + 2, 22);
+    doc.setFont('helvetica', 'normal');
+    doc.text(request.department || '-', left + 30, 22);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Section:', left + 2, 26);
+    doc.setFont('helvetica', 'normal');
+    doc.text(request.section || '-', left + 30, 26);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Date:', left + 2, 29);
+    doc.setFont('helvetica', 'normal');
+    doc.text(new Date(request.created_at).toLocaleDateString(), left + 20, 29);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Subsidiary:', tableRight - 2, 22, { align: 'right' });
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    const subMaxW = 115;
+    const subLines = doc.splitTextToSize(subsidiaryLabel || '-', subMaxW);
+    let subY = 25;
+    subLines.forEach((ln) => {
+      doc.text(ln, tableRight - 2, subY, { align: 'right' });
+      subY += 3.6;
+    });
+    doc.setFontSize(7);
+    doc.setTextColor(90, 90, 90);
+    doc.text(`Ref: ${formRef}`, left + 2, Math.max(33, subY + 1));
+    doc.setTextColor(0, 0, 0);
+    doc.setFontSize(8);
+    doc.setFont('helvetica', 'normal');
+    doc.line(tableLeft, tableTop, tableRight, tableTop);
+  };
+
+  const drawVerticalRules = (y0: number, y1: number) => {
+    colXs.forEach((x) => doc.line(x, y0, x, y1));
+  };
+
+  const drawHeaderRow = (yTop: number) => {
+    const yBot = yTop + headerRowH;
+    doc.line(tableLeft, yBot, tableRight, yBot);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(headerFont);
+    headerLineArrays.forEach((lines, i) => {
+      let y = yTop + padY + lineStepHeader * 0.85;
+      lines.forEach((line) => {
+        doc.text(line, colXs[i] + padX, y);
+        y += lineStepHeader;
+      });
+    });
+    return yBot;
+  };
+
+  const drawDataRow = (yTop: number, rowH: number, cells: string[][]) => {
+    const yBot = yTop + rowH;
+    doc.line(tableLeft, yBot, tableRight, yBot);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(bodyFont);
+    cells.forEach((lines, i) => {
+      let y = yTop + padY + lineStepBody * 0.85;
+      lines.forEach((line) => {
+        doc.text(line, colXs[i] + padX, y);
+        y += lineStepBody;
+      });
+    });
+    return yBot;
+  };
+
+  let tableTop = 40;
+  let y = tableTop;
+  drawPageChrome(tableTop);
+  let headerBottom = drawHeaderRow(y);
+  y = headerBottom;
+  drawVerticalRules(tableTop, headerBottom);
+
+  let blockIndex = 0;
+  while (blockIndex < dataBlocks.length) {
+    const block = dataBlocks[blockIndex];
+    if (y + block.h > pageBottomSafe) {
+      doc.addPage('a4', 'l');
+      tableTop = 20;
+      y = tableTop;
+      drawPageChrome(tableTop);
+      headerBottom = drawHeaderRow(y);
+      y = headerBottom;
+      drawVerticalRules(tableTop, y);
+    }
+    y = drawDataRow(y, block.h, block.cells);
+    drawVerticalRules(tableTop, y);
+    blockIndex += 1;
+  }
+
+  const tableBottom = y;
+  drawVerticalRules(tableTop, tableBottom);
+
+  const srNoteText =
+    "Note: Stock Item Requisition Form is just for those part that need to be reorder regularly once it's reach minimum quantity or those critical machine parts.";
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7);
+  const discMaxW = tableRight - tableLeft - 4;
+  const discLines = doc.splitTextToSize(srNoteText, discMaxW);
+  const discLineH = 3.35;
+  const discBlockH = discLines.length * discLineH + 2;
+
+  const signatureBlockH = 48;
+  const signatureBoxInnerH = 44;
+  const footerGap = 3;
+  const footerTotalH = signatureBlockH + footerGap + discBlockH;
+  let signTop = tableBottom + 4;
+  if (signTop + footerTotalH > pageBottomSafe) {
+    doc.addPage('a4', 'l');
+    signTop = 14;
+  }
+  const signBottom = signTop + signatureBoxInnerH;
+  const sortedApproved = [...approvedApprovals].sort((a, b) => a.step_index - b.step_index);
+  const opManagerApproval = sortedApproved[0];
+  const seniorApproval = sortedApproved.length > 1 ? sortedApproved[sortedApproved.length - 1] : undefined;
+
+  const addSignatureImageFit = (dataUrl: string, xMm: number, yTopMm: number, maxW: number, maxH: number) => {
+    if (!dataUrl) return;
+    const lower = dataUrl.toLowerCase();
+    const fmtGuess: 'PNG' | 'JPEG' =
+      lower.includes('image/jpeg') || lower.includes('image/jpg') ? 'JPEG' : 'PNG';
+    const fitToBox = (iw: number, ih: number) => {
+      let w = maxW;
+      let h = (w * ih) / iw;
+      if (h > maxH) {
+        h = maxH;
+        w = (h * iw) / ih;
+      }
+      return { w, h };
+    };
+    try {
+      const { width: iw, height: ih } = doc.getImageProperties(dataUrl);
+      if (iw > 0 && ih > 0) {
+        const { w, h } = fitToBox(iw, ih);
+        try {
+          doc.addImage(dataUrl, fmtGuess, xMm, yTopMm, w, h);
+        } catch {
+          doc.addImage(dataUrl, fmtGuess === 'PNG' ? 'JPEG' : 'PNG', xMm, yTopMm, w, h);
+        }
+        return;
+      }
+    } catch {
+      /* fall through */
+    }
+    const { w, h } = fitToBox(400, 150);
+    for (const fmt of ['PNG', 'JPEG'] as const) {
+      try {
+        doc.addImage(dataUrl, fmt, xMm, yTopMm, w, h);
+        return;
+      } catch {
+        /* try next format */
+      }
+    }
+  };
+
+  const colW = (right - left) / 3;
+  const xDiv1 = left + colW;
+  const xDiv2 = left + 2 * colW;
+  doc.rect(left, signTop, right - left, signBottom - signTop);
+  doc.line(xDiv1, signTop, xDiv1, signBottom);
+  doc.line(xDiv2, signTop, xDiv2, signBottom);
+
+  const sigPad = 2;
+  const sigMaxW = colW - sigPad * 2;
+  const sigMaxH = 16;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7);
+  let ly = signTop + 4;
+  doc.text('Requested By:', left + sigPad, ly);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(6.5);
+  const lblMid = doc.splitTextToSize('Approved By Operation Manager:', sigMaxW);
+  let my = signTop + 4;
+  lblMid.forEach((ln) => {
+    doc.text(ln, xDiv1 + sigPad, my);
+    my += 3.2;
+  });
+  const lblSen = doc.splitTextToSize('Approved By Senior Operation Manager', sigMaxW);
+  let sy = signTop + 4;
+  lblSen.forEach((ln) => {
+    doc.text(ln, xDiv2 + sigPad, sy);
+    sy += 3.2;
+  });
+  const sigImgY = Math.max(signTop + 14, my, sy) + 1;
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7);
+  const reqSigUrl = isSignatureImageDataUrl(request.requester_signature) ? request.requester_signature! : '';
+  if (reqSigUrl) {
+    addSignatureImageFit(reqSigUrl, left + sigPad, sigImgY, sigMaxW, sigMaxH);
+  } else if (request.requester_signed_at) {
+    doc.text('Electronic signature', left + sigPad, sigImgY + 4);
+    doc.text(formatSignatureProofTimestamp(request.requester_signed_at), left + sigPad, sigImgY + 9);
+  }
+
+  const opSigUrl =
+    opManagerApproval?.approver_signature && isSignatureImageDataUrl(opManagerApproval.approver_signature)
+      ? opManagerApproval.approver_signature!
+      : '';
+  if (opSigUrl) {
+    addSignatureImageFit(opSigUrl, xDiv1 + sigPad, sigImgY, sigMaxW, sigMaxH);
+  } else if (opManagerApproval && opManagerApproval.status.toLowerCase() === 'approved') {
+    doc.text('Electronic signature', xDiv1 + sigPad, sigImgY + 4);
+    doc.text(formatSignatureProofTimestamp(opManagerApproval.created_at), xDiv1 + sigPad, sigImgY + 9);
+  }
+
+  const seniorDistinct =
+    seniorApproval && opManagerApproval && seniorApproval.step_index !== opManagerApproval.step_index;
+  const senSigUrl =
+    seniorDistinct &&
+    seniorApproval?.approver_signature &&
+    isSignatureImageDataUrl(seniorApproval.approver_signature)
+      ? seniorApproval.approver_signature!
+      : '';
+  if (senSigUrl) {
+    addSignatureImageFit(senSigUrl, xDiv2 + sigPad, sigImgY, sigMaxW, sigMaxH);
+  } else if (seniorDistinct && seniorApproval && seniorApproval.status.toLowerCase() === 'approved') {
+    doc.text('Electronic signature', xDiv2 + sigPad, sigImgY + 4);
+    doc.text(formatSignatureProofTimestamp(seniorApproval.created_at), xDiv2 + sigPad, sigImgY + 9);
+  }
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7);
+  doc.text(`Name: ${request.requester_name || ''}`, left + sigPad, signBottom - 12);
+  doc.text('Designation:', left + sigPad, signBottom - 6);
+  doc.text(`Name: ${opManagerApproval?.approver_name || ''}`, xDiv1 + sigPad, signBottom - 12);
+  doc.text(`Name: ${seniorDistinct ? seniorApproval?.approver_name || '' : ''}`, xDiv2 + sigPad, signBottom - 12);
+
+  let noteY = signBottom + footerGap;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7);
+  discLines.forEach((ln) => {
+    doc.text(ln, left + 2, noteY);
+    noteY += discLineH;
+  });
+  doc.setFont('helvetica', 'normal');
+
+  return buildPdfPreview(doc, `SR_${displayRequestSerial(request)}.pdf`);
+};
+
+/** Standard report-style PDF (line items + approvals) — not the F-PU-003 form. */
+const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
+  const doc = new jsPDF();
+  const margin = 20;
+  let y = 20;
+
+  doc.setFontSize(20);
+  doc.setFont('helvetica', 'bold');
+  doc.text('PURCHASE REQUISITION', margin, y);
+  y += 10;
+
+  doc.setFontSize(10);
+  doc.setFont('helvetica', 'normal');
+  const entCode = request.entity?.trim() || '-';
+  doc.text(`Entity: ${entityLegalDisplayName(request.entity)} (${entCode})`, margin, y);
+  doc.text(`Date: ${new Date(request.created_at).toLocaleDateString()}`, 150, y);
+  y += 10;
+
+  doc.setDrawColor(200);
+  doc.line(margin, y, 190, y);
+  y += 10;
+
+  doc.setFont('helvetica', 'bold');
+  doc.text('Request Information', margin, y);
+  y += 7;
+  doc.setFont('helvetica', 'normal');
+  doc.text(`PR ID: ${displayRequestSerial(request)}`, margin, y);
+  y += 5;
+  doc.text(`Requester: ${request.requester_name}`, margin, y);
+  y += 5;
+  doc.text(`Department: ${request.department}`, margin, y);
+  y += 5;
+  doc.text(`Cost Center: ${request.cost_center || '-'}`, margin, y);
+  y += 5;
+  doc.text(`Title: ${request.title}`, margin, y);
+  y += 10;
+
+  if (!isPRRequest(request) && !isPO_Only(request) && !isSRRequest(request)) {
+    doc.setFont('helvetica', 'bold');
+    doc.text('Details:', margin, y);
+    y += 7;
+    doc.setFont('helvetica', 'normal');
+    const detailsLines = doc.splitTextToSize(request.details || '', 170);
+    doc.text(detailsLines, margin, y);
+    y += (detailsLines.length * 5) + 10;
+  }
+
+  doc.setFont('helvetica', 'bold');
+  doc.text('Line Items', margin, y);
+  y += 7;
+
+  const columns = getColumns(request);
+  const headers = ['No', ...columns];
+  if (procurementRowShowsLineTotal(request)) headers.push('Total');
+
+  doc.setFillColor(240, 240, 240);
+  doc.rect(margin, y - 5, 170, 7, 'F');
+  doc.setFontSize(8);
+  let x = margin;
+
+  const colWidth = 170 / headers.length;
+  headers.forEach((h) => {
+    doc.text(h, x + 2, y);
+    x += colWidth;
+  });
+  y += 7;
+
+  doc.setFont('helvetica', 'normal');
+  let subtotal = 0;
+  request.line_items?.forEach((item, idx) => {
+    if (y > 270) {
+      doc.addPage();
+      y = 20;
+    }
+    x = margin;
+    doc.text(String(idx + 1), x + 2, y);
+    x += colWidth;
+
+    columns.forEach((col) => {
+      let val = String(item[col] || '-');
+      if (col === 'Unit Price' || col === 'Price' || col === 'Amount') {
+        val = `${procurementCurrencyPrefix(request.currency)}${Number(item[col] || 0).toLocaleString()}`.trim();
+      }
+      doc.text(val, x + 2, y, { maxWidth: colWidth - 4 });
+      x += colWidth;
+    });
+
+    if (procurementRowShowsLineTotal(request)) {
+      const qty = lineItemQtyForDisplay(item);
+      const price = parseFloat(item['Unit Price'] || '0');
+      const total = qty * price;
+      subtotal += total;
+      doc.text(`${procurementCurrencyPrefix(request.currency)}${total.toLocaleString()}`.trim(), x + 2, y);
+    }
+    y += 7;
+  });
+
+  if (isPRRequest(request) || isPO_Only(request) || isSRRequest(request)) {
+    y += 5;
+    const m = procurementMoneyTotals(request);
+    const curp = procurementCurrencyPrefix(request.currency);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`Subtotal: ${curp}${m.subtotal.toLocaleString()}`.trim(), 110, y);
+    y += 5;
+    doc.text(`Discount (${(m.discountRate * 100).toFixed(0)}%): ${curp}${m.discountAmount.toLocaleString()}`.trim(), 110, y);
+    y += 5;
+    const tlab = procurementTaxLabelForEntity(request.entity);
+    doc.text(`${tlab} (${(m.taxRate * 100).toFixed(0)}%): ${curp}${m.taxAmount.toLocaleString()}`.trim(), 110, y);
+    y += 7;
+    doc.setFontSize(12);
+    doc.text(`TOTAL: ${curp}${m.total.toLocaleString()}`.trim(), 110, y);
+    y += 15;
+  }
+
+  if (y > 240) {
+    doc.addPage();
+    y = 20;
+  }
+  doc.setFontSize(10);
+  doc.setFont('helvetica', 'bold');
+  doc.text('Approval History', margin, y);
+  y += 10;
+
+  request.template_steps.forEach((step, i) => {
+    const approval = request.approvals?.find(a => a.step_index === i);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`${step.label}:`, margin, y);
+    doc.setFont('helvetica', 'normal');
+    if (approval) {
+      doc.text(`${approval.status.toUpperCase()} by ${approval.approver_name} on ${new Date(approval.created_at).toLocaleDateString()}`, margin + 50, y);
+      const asig = approval.approver_signature;
+      if (isSignatureImageDataUrl(asig)) {
+        try {
+          doc.addImage(asig!, 'PNG', margin + 140, y - 8, 30, 10);
+        } catch {
+          /* ignore */
+        }
+      } else if (approval.status.toLowerCase() === 'approved') {
+        doc.setFontSize(7);
+        doc.text('E-signed', margin + 128, y - 2);
+        doc.setFontSize(10);
+      }
+    } else {
+      doc.text('Pending', margin + 50, y);
+    }
+    y += 12;
+  });
+
+  return buildPdfPreview(doc, `PR_${displayRequestSerial(request)}.pdf`);
+};
+
+function createWorkflowRequestPdfPreview(request: WorkflowRequest): { url: string; fileName: string } {
+  if (isPR_Only(request)) return printProcurementPRFormPdf(request);
+  if (isSR_Only(request)) return printProcurementSRFormPdf(request);
+  return printWorkflowRequestReportPdf(request);
+}
+
+const FIXED_PR_STEPS = [{ id: 'step-1', label: 'Approver', approverRole: 'approver' }];
+
+/** PO template definition (director step is omitted per request when total ≤ RM30k equivalent). */
+const FIXED_PO_STEPS_FULL = [
+  { id: 'po-step-1', label: 'Checker Verification', approverRole: 'checker' },
+  { id: 'po-step-2', label: 'Final Approval', approverRole: 'som' },
+  { id: 'po-step-3', label: 'Director Authorization (> RM30,000)', approverRole: 'director' },
+];
+
+/** SR template definition: fixed two-step approval chain. */
+const FIXED_SR_STEPS = [
+  { id: 'sr-step-1', label: 'HOD Approval', approverRole: 'approver' },
+  { id: 'sr-step-2', label: 'Final Approval', approverRole: 'som' },
+];
+
+const CURRENCIES = ['MYR', 'SGD', 'EURO', 'GBP', 'USD', 'FCFA'];
+
+/** UI: show stored currency only — no default code. */
+function procurementCurrencyLabel(code: string | undefined | null): string {
+  const s = String(code ?? '').trim();
+  return s || '—';
+}
+
+/** Prefix for amounts in PDFs/lists when currency exists. */
+function procurementCurrencyPrefix(code: string | undefined | null): string {
+  const s = String(code ?? '').trim();
+  return s ? `${s} ` : '';
+}
+
+/** Used when `/api/cost-centers` is empty or unreachable; primary list comes from `cost_centers` table (SQL Server). */
+const FALLBACK_COST_CENTER_OPTIONS = [
+  '1000 - IT Department',
+  '2000 - HR Department',
+  '3000 - Finance Department',
+  '4000 - Marketing',
+  '5000 - Operations',
+  '6000 - Sales',
+  '7000 - R&D',
+  '8000 - Legal',
+  '9000 - Administration',
+];
+
+function costCenterRowToLabel(r: { code?: string; name?: string }): string {
+  const c = String(r.code ?? '').trim();
+  const n = String(r.name ?? '').trim();
+  if (c && n) return `${c} - ${n}`;
+  return c || n || '';
+}
+
+function useCostCenterOptions(): string[] {
+  const [opts, setOpts] = useState<string[]>(FALLBACK_COST_CENTER_OPTIONS);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const rows = await api.request('/api/cost-centers');
+        if (cancelled || !Array.isArray(rows)) return;
+        const labels = (rows as { code?: string; name?: string }[])
+          .map(costCenterRowToLabel)
+          .filter(Boolean);
+        setOpts(labels.length > 0 ? labels : FALLBACK_COST_CENTER_OPTIONS);
+      } catch {
+        if (!cancelled) setOpts(FALLBACK_COST_CENTER_OPTIONS);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return opts;
+}
+
+const isSpareLocationColumn = (col: string) => col.trim().toLowerCase() === 'spare for (location)';
+
+const SearchableSelect = ({ options, value, onChange, placeholder }: { options: string[], value: string, onChange: (val: string) => void, placeholder: string }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const filteredOptions = options.filter(opt => opt.toLowerCase().includes(search.toLowerCase()));
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  return (
+    <div className="relative" ref={containerRef}>
+      <div 
+        onClick={() => setIsOpen(!isOpen)}
+        className="w-full px-4 py-2 rounded-lg border border-zinc-300 bg-white cursor-pointer flex items-center justify-between"
+      >
+        <span className={value ? "text-zinc-900" : "text-zinc-400"}>
+          {value || placeholder}
+        </span>
+        <Search className="w-4 h-4 text-zinc-400" />
+      </div>
+      
+      <AnimatePresence>
+        {isOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="absolute z-50 w-full mt-1 bg-white border border-zinc-200 rounded-lg shadow-xl max-h-60 overflow-hidden flex flex-col"
+          >
+            <div className="p-2 border-b border-zinc-100">
+              <input
+                type="text"
+                autoFocus
+                className="w-full px-3 py-1.5 text-sm border border-zinc-200 rounded-md outline-none focus:ring-2 focus:ring-indigo-500"
+                placeholder="Search..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+            </div>
+            <div className="overflow-y-auto">
+              {filteredOptions.length > 0 ? (
+                filteredOptions.map(opt => (
+                  <div
+                    key={opt}
+                    onClick={() => {
+                      onChange(opt);
+                      setIsOpen(false);
+                      setSearch('');
+                    }}
+                    className={cn(
+                      "px-4 py-2 text-sm cursor-pointer hover:bg-indigo-50 transition-colors",
+                      value === opt ? "bg-indigo-50 text-indigo-600 font-bold" : "text-zinc-700"
+                    )}
+                  >
+                    {opt}
+                  </div>
+                ))
+              ) : (
+                <div className="px-4 py-3 text-sm text-zinc-400 italic">No results found</div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Workflow, entity?: string, onSuccess: () => void }) => {
+  const [title, setTitle] = useState('');
+  const [details, setDetails] = useState('');
+  const [currency, setCurrency] = useState('');
+  const [section, setSection] = useState("");
+  const [lineItems, setLineItems] = useState<any[]>([]);
+  const [attachments, setAttachments] = useState<{ name: string; type: string; data: string }[]>([]);
+  const [signature, setSignature] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [taxRateInput, setTaxRateInput] = useState('');
+  const [discountRateInput, setDiscountRateInput] = useState('');
+  const [eligibleApprovers, setEligibleApprovers] = useState<{ id: number; username: string; department: string }[]>([]);
+  const [assignedApproverId, setAssignedApproverId] = useState<number | ''>('');
+
+  const isPR = isPRTemplate(template);
+  const isPO = isPOTemplate(template);
+  const isSR = isSRTemplate(template);
+  const costCenterOptions = useCostCenterOptions();
+  const columns = getColumns(template);
+  const needsGccmApproverPicker =
+    (entity || '').trim().toUpperCase() === 'GCCM' &&
+    (template.steps || []).some((s) => (s.approverRole || '').toLowerCase() === 'approver');
+
+  useEffect(() => {
+    if (!needsGccmApproverPicker) {
+      setEligibleApprovers([]);
+      setAssignedApproverId('');
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await api.request('/api/users/eligible-approvers');
+        if (!cancelled && Array.isArray(list)) setEligibleApprovers(list);
+      } catch {
+        if (!cancelled) setEligibleApprovers([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [needsGccmApproverPicker, entity]);
+
+  const addLineItem = () => {
+    const newItem: any = { id: Math.random().toString(36).substr(2, 9), [LINE_ITEM_REMARKS_KEY]: '' };
+    columns.forEach(col => newItem[col] = '');
+    setLineItems([...lineItems, newItem]);
+  };
+
+  const removeLineItem = (index: number) => {
+    setLineItems(lineItems.filter((_, i) => i !== index));
+  };
+
+  const updateLineItem = (index: number, col: string, value: string) => {
+    const newItems = [...lineItems];
+    if (col === REMARKS_LINE_COL) {
+      newItems[index] = mergeLineItemRemarksWrite(newItems[index], value);
+    } else {
+      newItems[index][col] = value;
+    }
+    setLineItems(newItems);
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+
+    Array.from(files).forEach((file: File) => {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        setAttachments(prev => [...prev, {
+          id: Math.random().toString(36).substr(2, 9),
+          name: file.name,
+          type: file.type,
+          data: event.target?.result as string
+        }]);
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+    const handleSubmit = async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (template.attachments_required && attachments.length === 0) {
+        return toast.error('This workflow requires at least one attachment');
+      }
+      if ((isPR || isSR) && !signature) {
+        return toast.error(isSR ? 'Signature is mandatory for stock requisitions' : 'Signature is mandatory for Purchase Requests');
+      }
+      if ((isPR || isPO || isSR) && !String(currency).trim()) {
+        return toast.error('Please select a currency.');
+      }
+      if (isSR && !SECTION_OPTIONS.includes(String(section || "").trim().toUpperCase() as (typeof SECTION_OPTIONS)[number])) {
+        return toast.error('Please select a section.');
+      }
+      if (needsGccmApproverPicker && (assignedApproverId === '' || !Number.isFinite(Number(assignedApproverId)))) {
+        return toast.error('GCCM: please select who should approve this request.');
+      }
+      let taxRateNum = 0;
+      if (isPR || isPO || isSR) {
+        const trimmed = taxRateInput.trim();
+        if (trimmed === '') {
+          const lab = procurementTaxLabelForEntity(entity);
+          return toast.error(`Please enter ${lab} rate as a percentage (e.g. 18 for 18%).`);
+        }
+        const taxPct = parseFloat(trimmed);
+        if (Number.isNaN(taxPct) || taxPct < 0 || taxPct > 100) {
+          const lab = procurementTaxLabelForEntity(entity);
+          return toast.error(`${lab} rate must be between 0 and 100 (e.g. 18 for 18%).`);
+        }
+        taxRateNum = procurementPercentToUnitRate(taxPct);
+      }
+      let discountRateNum = 0;
+      if (isPR || isPO || isSR) {
+        const dtrim = discountRateInput.trim();
+        if (dtrim !== '') {
+          const discPct = parseFloat(dtrim);
+          if (Number.isNaN(discPct) || discPct < 0 || discPct > 100) {
+            return toast.error('Discount must be between 0 and 100 (e.g. 5 for 5%). Leave blank for no discount.');
+          }
+          discountRateNum = procurementPercentToUnitRate(discPct);
+        }
+      }
+      setLoading(true);
+      try {
+        await api.request('/api/workflow-requests', {
+          method: 'POST',
+          body: JSON.stringify({ 
+            template_id: template.id, 
+            title, 
+            details: isPR || isPO || isSR ? '' : details, 
+            entity,
+            currency: isPR || isPO || isSR ? String(currency).trim() : undefined,
+            section: isSR ? sectionPayloadFromSelection(section) : undefined,
+            line_items: lineItems, 
+            attachments,
+            requester_signed: !!((isPR || isSR) && signature),
+            requester_signature: (isPR || isSR) && signature ? signature : undefined,
+            tax_rate: isPR || isPO || isSR ? taxRateNum : 0,
+            discount_rate: isPR || isPO || isSR ? discountRateNum : 0,
+            ...(needsGccmApproverPicker && assignedApproverId !== ''
+              ? { assigned_approver_id: Number(assignedApproverId) }
+              : {}),
+          }),
+        });
+        toast.success('Request submitted successfully!');
+        onSuccess();
+      } catch (err: any) {
+        toast.error(err.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+  return (
+    <div className="flex flex-col h-full min-h-0 bg-white rounded-2xl border border-zinc-200 shadow-sm overflow-hidden">
+      <div className="shrink-0 px-5 sm:px-6 py-4 border-b border-zinc-100 bg-gradient-to-r from-zinc-50/80 to-white flex items-center gap-3">
+        <div className="w-10 h-10 bg-indigo-100 rounded-lg flex items-center justify-center shrink-0">
+          <Send className="w-5 h-5 text-indigo-600" />
+        </div>
+        <div className="min-w-0">
+          <h2 className="text-lg sm:text-xl font-bold text-zinc-900 truncate">Start Request</h2>
+          <p className="text-xs sm:text-sm text-zinc-500 truncate">Template: <span className="font-semibold text-indigo-600">{template.name}</span></p>
+        </div>
+      </div>
+
+      <form onSubmit={handleSubmit} className="flex flex-col flex-1 min-h-0">
+        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
+          <div className="px-5 sm:px-6 py-5 space-y-5 max-w-[1600px] mx-auto">
+            <div className="grid gap-5 lg:grid-cols-2">
+              <div className="space-y-2 lg:col-span-2">
+                <label className="text-sm font-medium text-zinc-700">Request Title</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g., Marketing Budget for Q3"
+                  className="w-full px-4 py-2.5 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                />
+              </div>
+              {!isPR && !isPO && !isSR && (
+              <div className="space-y-2 lg:col-span-2">
+                <label className="text-sm font-medium text-zinc-700">Details</label>
+                <textarea
+                  required
+                  rows={3}
+                  placeholder="Provide necessary information for the approvers..."
+                  className="w-full px-4 py-2.5 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500 resize-y min-h-[88px]"
+                  value={details}
+                  onChange={(e) => setDetails(e.target.value)}
+                />
+              </div>
+              )}
+            </div>
+
+            {(isPR || isPO || isSR) && (
+              <div className="space-y-4">
+              <div className="grid sm:grid-cols-3 gap-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-zinc-700">Currency</label>
+                  <select
+                    className="w-full px-4 py-2.5 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+                    value={currency}
+                    onChange={(e) => setCurrency(e.target.value)}
+                    required={isPR || isPO || isSR}
+                  >
+                    <option value="">Select currency…</option>
+                    {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-zinc-700">{procurementTaxRateFormLabel(entity)}</label>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      autoComplete="off"
+                      placeholder="e.g. 18"
+                      className="w-36 px-4 py-2.5 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+                      value={taxRateInput}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (v === '' || /^\d*\.?\d*$/.test(v)) setTaxRateInput(v);
+                      }}
+                    />
+                    <span className="text-sm text-zinc-500">
+                      {(() => {
+                        const t = taxRateInput.trim();
+                        if (t === '') return 'Percent (18 = 18%)';
+                        const n = parseFloat(t);
+                        if (Number.isNaN(n)) return 'Percent (18 = 18%)';
+                        return `${n}%`;
+                      })()}
+                    </span>
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-zinc-700">Discount (%)</label>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      autoComplete="off"
+                      placeholder="e.g. 5 or leave blank"
+                      className="w-36 px-4 py-2.5 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+                      value={discountRateInput}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (v === '' || /^\d*\.?\d*$/.test(v)) setDiscountRateInput(v);
+                      }}
+                    />
+                    <span className="text-sm text-zinc-500">
+                      {(() => {
+                        const t = discountRateInput.trim();
+                        if (t === '') return 'Optional; blank = none';
+                        const n = parseFloat(t);
+                        if (Number.isNaN(n)) return 'Optional; blank = none';
+                        return `${n}% off subtotal`;
+                      })()}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              {isSR && (
+                <div className="space-y-2 max-w-xl">
+                  <label className="text-sm font-medium text-zinc-700">Section</label>
+                  <select
+                    className="w-full px-4 py-2.5 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+                    value={section}
+                    onChange={(e) => setSection(e.target.value)}
+                    required
+                  >
+                    <option value="" disabled>Select section...</option>
+                    {SECTION_OPTIONS.map((opt) => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              </div>
+            )}
+
+            {needsGccmApproverPicker && (
+              <div className="space-y-2 max-w-xl">
+                <label className="text-sm font-medium text-zinc-700">Approver (GCCM)</label>
+                <select
+                  className="w-full px-4 py-2.5 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+                  value={assignedApproverId === '' ? '' : String(assignedApproverId)}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setAssignedApproverId(v === '' ? '' : Number(v));
+                  }}
+                  required
+                >
+                  <option value="">Select approver…</option>
+                  {eligibleApprovers.map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.username}
+                      {u.department ? ` — ${u.department}` : ''}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-zinc-500">
+                  GCCM only: you choose who acts at the approver step. Checker / SOM / director steps are unchanged.
+                </p>
+              </div>
+            )}
+
+            {(columns.length > 0) && (
+              <div className="flex flex-col min-h-[min(50vh,520px)] -mx-5 sm:-mx-6 border-y border-zinc-200 bg-zinc-50/40">
+                <div className="shrink-0 flex items-center justify-between gap-3 px-5 sm:px-6 py-3 border-b border-zinc-200 bg-white/90 backdrop-blur-sm sticky top-0 z-10">
+                  <label className="text-sm font-semibold text-zinc-800">
+                    {isPR ? 'PR line items' : isPO ? 'PO line items' : isSR ? 'Stock requisition line items' : 'Line items'}
+                  </label>
+                  <button
+                    type="button"
+                    onClick={addLineItem}
+                    className="text-xs bg-indigo-600 text-white px-3 py-1.5 rounded-lg font-semibold hover:bg-indigo-700 transition-colors shadow-sm"
+                  >
+                    + Add Row
+                  </button>
+                </div>
+                <div className="flex-1 min-h-0 overflow-auto">
+                  <table className="w-full text-sm border-collapse">
+                    <thead className="sticky top-0 z-[1] bg-zinc-100 shadow-[0_1px_0_0_rgb(228_228_231)]">
+                      <tr>
+                        <th className="px-3 sm:px-4 py-3 font-bold text-zinc-700 w-11 text-center border-b border-zinc-200">No</th>
+                        {columns.map(col => (
+                          <th key={col} className="px-2 sm:px-3 py-3 font-bold text-zinc-700 text-left min-w-[140px] border-b border-zinc-200">{col}</th>
+                        ))}
+                        <th className="px-3 py-3 font-bold text-zinc-700 w-14 text-center border-b border-zinc-200">Del</th>
+                      </tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-zinc-100">
+                      {lineItems.length === 0 && (
+                        <tr>
+                          <td colSpan={columns.length + 2} className="py-16 text-center align-middle">
+                            <Package className="w-12 h-12 text-zinc-300 mx-auto mb-3" />
+                            <p className="text-zinc-500">No items yet. Click &quot;+ Add Row&quot; to start.</p>
+                          </td>
+                        </tr>
+                      )}
+                      {lineItems.map((item, idx) => (
+                        <React.Fragment key={item.id || idx}>
+                        <tr className="hover:bg-indigo-50/40 transition-colors">
+                          <td className="px-3 sm:px-4 py-2.5 text-center text-zinc-500 font-medium align-top">{idx + 1}</td>
+                          {columns.map(col => (
+                            <td key={col} className="px-2 py-2 align-top">
+                              {col === 'Cost Center' ? (
+                                <SearchableSelect
+                                  options={costCenterOptions}
+                                  value={item[col]}
+                                  onChange={(val) => updateLineItem(idx, col, val)}
+                                  placeholder="Select Cost Center..."
+                                />
+                              ) : (isSR && isSpareLocationColumn(col)) ? (
+                                <SearchableSelect
+                                  options={costCenterOptions}
+                                  value={item[col]}
+                                  onChange={(val) => updateLineItem(idx, col, val)}
+                                  placeholder="Select Cost Center..."
+                                />
+                              ) : (
+                                <input
+                                  type={col === 'Delivery Date' || col === 'Request to be delivered on' ? 'date' : (isProcurementNumericGridColumn(col) ? 'number' : 'text')}
+                                  min={isProcurementNumericGridColumn(col) ? '0' : undefined}
+                                  step={col.trim().toLowerCase() === 'quantity' || col.trim().toLowerCase() === 'min quantity' || col.trim().toLowerCase() === 'max quantity' ? '1' : (col.trim().toLowerCase() === 'unit price' || col.trim().toLowerCase() === 'price' || col.trim().toLowerCase() === 'amount' ? '0.01' : undefined)}
+                                  className="w-full min-w-0 px-2.5 py-2 rounded-lg border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+                                  value={col === REMARKS_LINE_COL ? lineItemRemarksDisplay(item) : (item[col] ?? '')}
+                                  onChange={(e) => updateLineItem(idx, col, e.target.value)}
+                                  placeholder={col}
+                                />
+                              )}
+                            </td>
+                          ))}
+                          <td className="px-2 py-2 text-center align-top">
+                            <button 
+                              type="button" 
+                              onClick={() => removeLineItem(idx)} 
+                              className="p-2 text-zinc-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                              title="Remove row"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </td>
+                        </tr>
+                        <tr className="bg-zinc-50/80 border-b border-zinc-100">
+                          <td colSpan={columns.length + 2} className="px-4 sm:px-5 py-2 align-top">
+                            <label className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wide">Line remarks <span className="font-normal normal-case text-zinc-400">(optional, multiple lines)</span></label>
+                            <textarea
+                              rows={3}
+                              className="w-full mt-1.5 px-3 py-2 rounded-lg border border-zinc-200 text-sm text-zinc-800 outline-none focus:ring-2 focus:ring-indigo-500 bg-white resize-y min-h-[72px] placeholder:text-zinc-400"
+                              value={item[LINE_ITEM_REMARKS_KEY] ?? ''}
+                              onChange={(e) => updateLineItem(idx, LINE_ITEM_REMARKS_KEY, e.target.value)}
+                              placeholder="Extra notes for this line only…"
+                            />
+                          </td>
+                        </tr>
+                        </React.Fragment>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-zinc-700">Attachments</label>
+              <div className="flex flex-wrap gap-2 mb-2">
+                {attachments.map((file) => (
+                  <div key={file.id} className="flex items-center gap-2 bg-zinc-100 px-3 py-1 rounded-full text-xs text-zinc-600 border border-zinc-200">
+                    <Paperclip className="w-3 h-3" />
+                    {file.name}
+                    <button type="button" onClick={() => setAttachments(attachments.filter((a) => a.id !== file.id))}>
+                      <Trash2 className="w-3 h-3 hover:text-red-500" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <label className="flex flex-col items-center justify-center w-full h-24 border-2 border-dashed border-zinc-300 rounded-xl cursor-pointer hover:bg-zinc-50 transition-colors">
+                <div className="flex flex-col items-center justify-center">
+                  <Upload className="w-6 h-6 text-zinc-400 mb-1" />
+                  <p className="text-xs text-zinc-500">Upload supporting documents</p>
+                </div>
+                <input type="file" className="hidden" multiple onChange={handleFileChange} />
+              </label>
+            </div>
+
+            {(isPR || isSR) && (
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-zinc-700 flex items-center gap-2">
+                  Signature (Preparer)
+                  <span className="text-[10px] bg-red-100 text-red-600 px-1.5 py-0.5 rounded uppercase font-bold">Mandatory</span>
+                </label>
+                <SignaturePad onSave={setSignature} onClear={() => setSignature(null)} />
+              </div>
+            )}
+
+            <div className="bg-zinc-50 p-4 rounded-xl border border-zinc-200">
+              <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-3">Approval Steps for this Request</h4>
+              <div className="space-y-2">
+                {template.steps.map((step, i) => (
+                  <div key={step.id} className="flex items-center gap-3 text-sm">
+                    <div className="w-5 h-5 rounded-full bg-zinc-200 text-zinc-600 flex items-center justify-center text-[10px] font-bold shrink-0">
+                      {i + 1}
+                    </div>
+                    <span className="text-zinc-700">{step.label}</span>
+                    <span className="text-zinc-400 text-xs">({step.approverRole})</span>
+                  </div>
+                ))}
+                {isPO && (
+                  <p className="text-[11px] text-zinc-500 mt-2">
+                    The Director step is included only when the order total (including tax), converted to MYR, exceeds RM 30,000.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="shrink-0 border-t border-zinc-200 bg-zinc-50/90 px-5 sm:px-6 py-4">
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full bg-indigo-600 text-white py-3.5 rounded-xl font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 disabled:opacity-50"
+          >
+            {loading ? 'Submitting...' : 'Submit Request'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+};
+
+const WorkflowRequestList = ({ 
+  requests, 
+  user, 
+  onRefresh,
+  preSelectedRequestId,
+  onClearPreSelected
+}: { 
+  requests: WorkflowRequest[], 
+  user: User, 
+  onRefresh: () => void,
+  preSelectedRequestId?: number | null,
+  onClearPreSelected?: () => void
+}) => {
+  const [selectedRequest, setSelectedRequest] = useState<WorkflowRequest | null>(null);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [approvals, setApprovals] = useState<RequestApproval[]>([]);
+  const [comment, setComment] = useState('');
+  const [approverSignature, setApproverSignature] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const costCenterOptions = useCostCenterOptions();
+  const [filterStatus, setFilterStatus] = useState<string>('all');
+  const [filterDept, setFilterDept] = useState<string>('all');
+  const [filterEntity, setFilterEntity] = useState<string>('all');
+  const [sortBy, setSortBy] = useState<'request' | 'entity' | 'department' | 'requester' | 'status' | 'date'>('date');
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
+  const [isEditing, setIsEditing] = useState(false);
+  const [editData, setEditData] = useState({ title: '', details: '', line_items: [] as any[], currency: '', cost_center: '', section: '', tax_rate: 18, discount_rate: 0 });
+  const [viewingPdf, setViewingPdf] = useState<{ url: string; fileName: string } | null>(null);
+  const [detailsViewMode, setDetailsViewMode] = useState<'details' | 'pdf'>('details');
+  const [detailsPdfPreview, setDetailsPdfPreview] = useState<{ url: string; fileName: string } | null>(null);
+
+  useEffect(() => {
+    if (preSelectedRequestId) {
+      const request = requests.find(r => r.id === preSelectedRequestId);
+      if (request) {
+        handleViewRequest(request);
+        if (onClearPreSelected) onClearPreSelected();
+      }
+    }
+  }, [preSelectedRequestId, requests]);
+
+  const hasPermission = (permission: string) => {
+    if (!user) return false;
+    if (user.permissions?.includes('admin')) return true;
+    return user.permissions?.includes(permission);
+  };
+
+  const isAdmin = user.roles?.some(r => r.toLowerCase() === 'admin') || hasPermission('admin');
+  const isPurchasing = user.roles?.some(r => r.toLowerCase() === 'purchasing');
+  const isDirector = user.roles?.some(r => r.toLowerCase() === 'director') && (user.department || '').toLowerCase() === 'management';
+
+  const departments = Array.from(new Set(requests.map(r => r.department)));
+  const entities = Array.from(
+    new Set(
+      requests
+        .map((r) => String(r.entity || '').trim())
+        .filter((e) => !!e)
+    )
+  );
+
+  const filteredRequests = requests.filter(r => {
+    const statusMatch = filterStatus === 'all' || normalizeWorkflowRequestStatus(r.status) === filterStatus;
+    const deptMatch = filterDept === 'all' || r.department === filterDept;
+    const entityMatch = filterEntity === 'all' || String(r.entity || '').trim() === filterEntity;
+    return statusMatch && deptMatch && entityMatch;
+  });
+
+  const toggleSort = (next: 'request' | 'entity' | 'department' | 'requester' | 'status' | 'date') => {
+    if (sortBy === next) {
+      setSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
+      return;
+    }
+    setSortBy(next);
+    setSortDirection(next === 'date' ? 'desc' : 'asc');
+  };
+
+  const sortedFilteredRequests = [...filteredRequests].sort((a, b) => {
+    const dir = sortDirection === 'asc' ? 1 : -1;
+    const byText = (x: string, y: string) => x.localeCompare(y, undefined, { sensitivity: 'base' }) * dir;
+    if (sortBy === 'date') {
+      return (new Date(a.created_at).getTime() - new Date(b.created_at).getTime()) * dir;
+    }
+    if (sortBy === 'request') {
+      const at = `${displayRequestSerial(a)} ${a.title || ''}`.trim();
+      const bt = `${displayRequestSerial(b)} ${b.title || ''}`.trim();
+      return byText(at, bt);
+    }
+    if (sortBy === 'entity') return byText(String(a.entity || ''), String(b.entity || ''));
+    if (sortBy === 'department') return byText(String(a.department || ''), String(b.department || ''));
+    if (sortBy === 'requester') return byText(String(a.requester_name || ''), String(b.requester_name || ''));
+    return byText(formatWorkflowRequestStatusLabel(a), formatWorkflowRequestStatusLabel(b));
+  });
+
+  const sortIndicator = (key: 'request' | 'entity' | 'department' | 'requester' | 'status' | 'date') =>
+    sortBy === key ? (sortDirection === 'asc' ? ' ↑' : ' ↓') : '';
+
+  const handleViewRequest = async (request: WorkflowRequest) => {
+    api.setActiveEntity(String(request.entity || '').trim() || null);
+    setSelectedRequest(request);
+    setEditData({
+      title: request.title,
+      details: request.details,
+      line_items: request.line_items || [],
+      currency: request.currency?.trim() ?? '',
+      cost_center: request.cost_center || '',
+      section: sectionSelectionFromStored(request.section),
+      tax_rate: procurementUnitRateToPercent(request.tax_rate, 0.18),
+      discount_rate: procurementUnitRateToPercent(request.discount_rate, 0)
+    });
+    setComment('');
+    setApproverSignature(null);
+    setIsEditing(false);
+    setDetailsViewMode('details');
+    setDetailsPdfPreview((prev) => {
+      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+      return null;
+    });
+    await fetchDetails(request.id);
+  };
+
+  const handlePrintPR = (request: WorkflowRequest) => {
+    setViewingPdf((prev) => {
+      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+      return createWorkflowRequestPdfPreview(request);
+    });
+    toast.success('PDF ready to view');
+  };
+
+  const handleShowRequestPdfInline = (request: WorkflowRequest) => {
+    setDetailsPdfPreview((prev) => {
+      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+      return createWorkflowRequestPdfPreview(request);
+    });
+    setDetailsViewMode('pdf');
+  };
+
+  const fetchDetails = async (id: number) => {
+    try {
+      const [attData, appData] = await Promise.all([
+        api.request(`/api/workflow-requests/${id}/attachments`),
+        api.request(`/api/workflow-requests/${id}/approvals`)
+      ]);
+      setAttachments(attData);
+      setApprovals(appData);
+    } catch (err) {
+      toast.error('Failed to load request details');
+    }
+  };
+
+  const handleSaveEdit = async () => {
+    if (!selectedRequest) return;
+    if (
+      (isPRRequest(selectedRequest) || isPO_Only(selectedRequest) || isSRRequest(selectedRequest)) &&
+      !String(editData.currency).trim()
+    ) {
+      return toast.error('Please select a currency.');
+    }
+    if (
+      isSRRequest(selectedRequest) &&
+      !SECTION_OPTIONS.includes(String(editData.section || "").trim().toUpperCase() as (typeof SECTION_OPTIONS)[number])
+    ) {
+      return toast.error('Please select a section.');
+    }
+    setLoading(true);
+    try {
+      const detailsOut = isProcurementPRorPORequest(selectedRequest) ? '' : editData.details;
+      const taxUnit = procurementPercentToUnitRate(Number(editData.tax_rate) || 0);
+      const discUnit = procurementPercentToUnitRate(Number(editData.discount_rate) || 0);
+      const sectionOut = isSRRequest(selectedRequest) ? sectionPayloadFromSelection(editData.section) : editData.section;
+      const curOut =
+        isPRRequest(selectedRequest) || isPO_Only(selectedRequest) || isSRRequest(selectedRequest)
+          ? String(editData.currency).trim()
+          : undefined;
+      await api.request(`/api/workflow-requests/${selectedRequest.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          ...editData,
+          tax_rate: taxUnit,
+          discount_rate: discUnit,
+          details: detailsOut,
+          currency: curOut,
+          section: sectionOut,
+        }),
+      });
+      toast.success('Request updated');
+      setIsEditing(false);
+      onRefresh();
+      // Update local selected request
+      setSelectedRequest({
+        ...selectedRequest,
+        ...editData,
+        tax_rate: taxUnit,
+        discount_rate: discUnit,
+        currency: curOut !== undefined ? curOut : selectedRequest.currency,
+        details: detailsOut,
+        section: sectionOut,
+      });
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleApprove = async (id: number, status: 'approved' | 'rejected') => {
+    const needSig = selectedRequest && requiresProcurementApproverSignaturePad(selectedRequest);
+    if (status === 'approved' && needSig && !approverSignature) {
+      return toast.error('Signature is required to approve this document');
+    }
+    setLoading(true);
+    try {
+      const sendSig = needSig && approverSignature ? approverSignature : undefined;
+      await api.request(`/api/workflow-requests/${id}/approve`, {
+        method: 'POST',
+        body: JSON.stringify({
+          status,
+          comment,
+          approver_signed: !!sendSig,
+          approver_signature: sendSig,
+        }),
+      });
+      toast.success(`Request ${status}`);
+      onRefresh();
+      setSelectedRequest(null);
+      setComment('');
+      setApproverSignature(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResubmit = async (id: number) => {
+    setLoading(true);
+    try {
+      await api.request(`/api/workflow-requests/${id}/resubmit`, {
+        method: 'POST',
+      });
+      toast.success('Request resubmitted successfully!');
+      onRefresh();
+      setSelectedRequest(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleGeneratePODraft = (request: WorkflowRequest) => {
+    const doc = new jsPDF();
+    const margin = 20;
+    let y = 20;
+
+    // Header
+    doc.setFontSize(20);
+    doc.setTextColor(79, 70, 229); // Indigo-600
+    doc.text('PURCHASE ORDER DRAFT', margin, y);
+    y += 10;
+
+    doc.setFontSize(10);
+    doc.setTextColor(100);
+    doc.text(`Generated on: ${new Date().toLocaleString()}`, margin, y);
+    y += 15;
+
+    // Request Info
+    doc.setFontSize(12);
+    doc.setTextColor(0);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Request Information', margin, y);
+    y += 7;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.text(`PR ID: ${displayRequestSerial(request)}`, margin, y);
+    y += 5;
+    doc.text(`Title: ${request.title}`, margin, y);
+    y += 5;
+    doc.text(`Department: ${request.department}`, margin, y);
+    y += 5;
+    doc.text(`Entity: ${entityLegalDisplayName(request.entity)} (${request.entity?.trim() || '-'})`, margin, y);
+    y += 15;
+
+    // Line Items Table
+    doc.setFontSize(12);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Order Items', margin, y);
+    y += 7;
+
+    const headers = ['Item', 'Qty', 'Unit Price', 'Total'];
+    const colWidths = [80, 20, 35, 35];
+    
+    // Table Header
+    doc.setFillColor(244, 244, 245);
+    doc.rect(margin, y - 5, 170, 7, 'F');
+    doc.setFontSize(9);
+    let x = margin;
+    headers.forEach((h, i) => {
+      doc.text(h, x + 2, y);
+      x += colWidths[i];
+    });
+    y += 7;
+
+    // Table Rows
+    doc.setFont('helvetica', 'normal');
+    request.line_items?.forEach((item) => {
+      const qty = parseFloat(item['Quantity'] || '0');
+      const price = parseFloat(item['Unit Price'] || '0');
+      const rowTot = qty * price;
+
+      x = margin;
+      doc.text(String(item['Item'] || '-'), x + 2, y, { maxWidth: colWidths[0] - 4 });
+      doc.text(String(qty), x + colWidths[0] + 2, y);
+      doc.text(`${procurementCurrencyPrefix(request.currency)}${price.toLocaleString()}`.trim(), x + colWidths[0] + colWidths[1] + 2, y);
+      doc.text(`${procurementCurrencyPrefix(request.currency)}${rowTot.toLocaleString()}`.trim(), x + colWidths[0] + colWidths[1] + colWidths[2] + 2, y);
+      y += 7;
+    });
+
+    y += 5;
+    const m = procurementMoneyTotals(request);
+    const curp = procurementCurrencyPrefix(request.currency);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`Subtotal: ${curp}${m.subtotal.toLocaleString()}`.trim(), 110, y);
+    y += 5;
+    doc.text(`Discount (${(m.discountRate * 100).toFixed(0)}%): ${curp}${m.discountAmount.toLocaleString()}`.trim(), 110, y);
+    y += 5;
+    doc.text(`${procurementTaxLabelForEntity(request.entity)} (${(m.taxRate * 100).toFixed(0)}%): ${curp}${m.taxAmount.toLocaleString()}`.trim(), 110, y);
+    y += 7;
+    doc.setFontSize(12);
+    doc.text(`TOTAL AMOUNT: ${curp}${m.total.toLocaleString()}`.trim(), 110, y);
+
+    doc.save(`PO_Draft_${displayRequestSerial(request)}.pdf`);
+    toast.success('PO Draft PDF generated');
+  };
+
+  const handleConvertToPO = async (id: number) => {
+    if (!window.confirm('Are you sure you want to convert this PR to a PO Request? This will create a new PO request based on this PR.')) return;
+    setLoading(true);
+    try {
+      const result = await api.request(`/api/workflow-requests/${id}/convert-to-po`, {
+        method: 'POST',
+      });
+      toast.success(`Successfully converted to PO: ${toUpperSerial(result.formatted_id)}`);
+      onRefresh();
+      setSelectedRequest(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const currentStep = selectedRequest ? selectedRequest.template_steps[selectedRequest.current_step_index] : null;
+  const canApprove =
+    selectedRequest &&
+    currentStep &&
+    userCanApproveWorkflowStep(user, selectedRequest, currentStep);
+
+  const canEdit = selectedRequest && (
+    (isWorkflowRequestPending(selectedRequest) && (
+      user.id === selectedRequest.requester_id || 
+      (canApprove && hasPermission('edit_requests'))
+    )) ||
+    (isWorkflowRequestFullyApproved(selectedRequest) && isPR_Only(selectedRequest) && isPurchasing)
+  );
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-2">
+        <h2 className="text-xl font-bold text-zinc-900">
+          {(isAdmin || isDirector || hasPermission('view_history')) ? 'All Requests' : 'My Requests'}
+        </h2>
+        
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-2 bg-white border border-zinc-200 rounded-lg px-3 py-1.5">
+            <Filter className="w-3 h-3 text-zinc-400" />
+            <select 
+              className="text-xs bg-transparent border-none focus:ring-0 outline-none text-zinc-600 font-medium"
+              value={filterStatus}
+              onChange={(e) => setFilterStatus(e.target.value)}
+            >
+              <option value="all">All Status</option>
+              <option value="pending">Pending</option>
+              <option value="approved">Approved</option>
+              <option value="rejected">Rejected</option>
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2 bg-white border border-zinc-200 rounded-lg px-3 py-1.5">
+            <Building2 className="w-3 h-3 text-zinc-400" />
+            <select 
+              className="text-xs bg-transparent border-none focus:ring-0 outline-none text-zinc-600 font-medium"
+              value={filterDept}
+              onChange={(e) => setFilterDept(e.target.value)}
+            >
+              <option value="all">All Depts</option>
+              {departments.map(dept => (
+                <option key={dept} value={dept}>{dept}</option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-2 bg-white border border-zinc-200 rounded-lg px-3 py-1.5">
+            <Shield className="w-3 h-3 text-zinc-400" />
+            <select
+              className="text-xs bg-transparent border-none focus:ring-0 outline-none text-zinc-600 font-medium"
+              value={filterEntity}
+              onChange={(e) => setFilterEntity(e.target.value)}
+            >
+              <option value="all">All Entities</option>
+              {entities.map((ent) => (
+                <option key={ent} value={ent}>{ent}</option>
+              ))}
+            </select>
+          </div>
+
+          <span className="text-[10px] text-zinc-400 font-bold uppercase ml-2">
+              {sortedFilteredRequests.length} Results
+          </span>
+
+          {(filterStatus !== 'all' || filterDept !== 'all' || filterEntity !== 'all') && (
+            <button 
+              onClick={() => { setFilterStatus('all'); setFilterDept('all'); setFilterEntity('all'); }}
+              className="flex items-center gap-1 text-[10px] font-bold text-indigo-600 hover:text-indigo-700 bg-indigo-50 px-2 py-1 rounded-full transition-colors"
+            >
+              <RotateCcw className="w-2.5 h-2.5" />
+              Clear Filters
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden shadow-sm">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left">
+            <thead className="bg-zinc-50 text-zinc-500 text-xs uppercase font-bold">
+              <tr>
+                <th className="px-6 py-3">
+                  <button type="button" onClick={() => toggleSort('request')} className="hover:text-zinc-700 transition-colors">
+                    Request{sortIndicator('request')}
+                  </button>
+                </th>
+                <th className="px-6 py-3">
+                  <button type="button" onClick={() => toggleSort('entity')} className="hover:text-zinc-700 transition-colors">
+                    Entity{sortIndicator('entity')}
+                  </button>
+                </th>
+                <th className="px-6 py-3">
+                  <button type="button" onClick={() => toggleSort('department')} className="hover:text-zinc-700 transition-colors">
+                    Department{sortIndicator('department')}
+                  </button>
+                </th>
+                <th className="px-6 py-3">
+                  <button type="button" onClick={() => toggleSort('requester')} className="hover:text-zinc-700 transition-colors">
+                    Requester{sortIndicator('requester')}
+                  </button>
+                </th>
+                <th className="px-6 py-3">
+                  <button type="button" onClick={() => toggleSort('status')} className="hover:text-zinc-700 transition-colors">
+                    Status{sortIndicator('status')}
+                  </button>
+                </th>
+                <th className="px-6 py-3">
+                  <button type="button" onClick={() => toggleSort('date')} className="hover:text-zinc-700 transition-colors">
+                    Date{sortIndicator('date')}
+                  </button>
+                </th>
+                <th className="px-6 py-3 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-100">
+              {sortedFilteredRequests.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-6 py-12 text-center text-zinc-400 italic">
+                    No requests found matching filters.
+                  </td>
+                </tr>
+              ) : (
+                sortedFilteredRequests.map((r) => (
+                  <tr
+                    key={r.id}
+                    onClick={() => {
+                      void handleViewRequest(r);
+                    }}
+                    className="hover:bg-zinc-50 transition-colors text-sm cursor-pointer"
+                  >
+                    <td className="px-6 py-4">
+                      <p className="text-sm font-semibold text-zinc-900 truncate max-w-[340px]">
+                        {r.formatted_id ? `[${toUpperSerial(r.formatted_id)}] ${r.title}` : r.title}
+                      </p>
+                      <p className="text-xs text-zinc-500 truncate max-w-[340px]">{r.template_name}</p>
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-indigo-600 uppercase tracking-wide">
+                          {String(r.entity || '-')}
+                        </span>
+                        <span className="text-[11px] text-zinc-500">
+                          {entityLegalDisplayName(r.entity)}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 text-zinc-700 font-medium">{r.department}</td>
+                    <td className="px-6 py-4 text-zinc-700">{r.requester_name}</td>
+                    <td className="px-6 py-4">
+                      <span className={cn(
+                        "text-[10px] uppercase font-bold px-2 py-0.5 rounded-full",
+                        workflowRequestStatusBadgeClass(r)
+                      )}>
+                        {formatWorkflowRequestStatusLabel(r)}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 text-zinc-500">{new Date(r.created_at).toLocaleDateString()}</td>
+                    <td className="px-6 py-4 text-right">
+                      <div className="flex items-center justify-end gap-2">
+                        {canShowConvertPRToPO(r, user) && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleConvertToPO(r.id);
+                            }}
+                            className="inline-flex items-center gap-1.5 px-3 py-2 bg-indigo-600 text-white rounded-lg font-bold text-xs hover:bg-indigo-700 transition-colors shadow-sm"
+                          >
+                            <RefreshCw className="w-3.5 h-3.5" />
+                            Convert to PO
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleViewRequest(r);
+                          }}
+                          className="inline-flex items-center gap-2 px-3 py-2 bg-indigo-50 text-indigo-600 rounded-lg font-bold text-xs hover:bg-indigo-100 transition-all border border-indigo-100 shadow-sm"
+                        >
+                          <FileText className="w-4 h-4" />
+                          Details
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <AnimatePresence>
+        {selectedRequest && (
+          <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white w-full max-w-[96vw] rounded-2xl shadow-2xl overflow-hidden flex flex-col h-[94vh]"
+            >
+              <div className="p-6 border-b border-zinc-100 flex items-center justify-between bg-zinc-50 shrink-0">
+                <div>
+                  <h2 className="text-xl font-bold text-zinc-900">
+                    {selectedRequest.formatted_id ? `[${toUpperSerial(selectedRequest.formatted_id)}] ${selectedRequest.title}` : selectedRequest.title}
+                  </h2>
+                  <p className="text-sm text-zinc-500">Template: {selectedRequest.template_name} • Dept: {selectedRequest.department} • Entity: <span className="font-bold text-indigo-600">{entityLegalDisplayName(selectedRequest.entity)}</span> <span className="text-zinc-400">({selectedRequest.entity?.trim() || '-'})</span></p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {canEdit && !isEditing && (
+                    <button 
+                      onClick={() => {
+                        setEditData({ 
+                          title: selectedRequest.title, 
+                          details: selectedRequest.details, 
+                          line_items: [...(selectedRequest.line_items || [])],
+                          tax_rate: procurementUnitRateToPercent(selectedRequest.tax_rate, 0.18),
+                          discount_rate: procurementUnitRateToPercent(selectedRequest.discount_rate, 0),
+                          currency: selectedRequest.currency?.trim() ?? '',
+                          cost_center: selectedRequest.cost_center || '',
+                          section: sectionSelectionFromStored(selectedRequest.section)
+                        } as any);
+                        setIsEditing(true);
+                      }}
+                      className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-indigo-200 text-indigo-600 text-xs font-bold hover:bg-indigo-50 transition-all"
+                    >
+                      <Edit2 className="w-3.5 h-3.5" />
+                      Edit Request
+                    </button>
+                  )}
+                  {canShowConvertPRToPO(selectedRequest, user) && !isEditing && (
+                    <>
+                      <button 
+                        onClick={() => handleGeneratePODraft(selectedRequest)}
+                        className="flex items-center gap-2 px-4 py-2 bg-amber-50 border border-amber-200 rounded-xl text-sm font-bold text-amber-700 hover:bg-amber-100 transition-colors"
+                      >
+                        <Download className="w-4 h-4" />
+                        Generate PO Draft PDF
+                      </button>
+                      <button 
+                        onClick={() => handleConvertToPO(selectedRequest.id)}
+                        className="flex items-center gap-2 px-4 py-2 bg-indigo-600 rounded-xl text-sm font-bold text-white hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-100"
+                      >
+                        <RefreshCw className="w-4 h-4" />
+                        Convert PR → PO
+                      </button>
+                    </>
+                  )}
+                  <button onClick={() => {
+                    setSelectedRequest(null);
+                    setIsEditing(false);
+                    setDetailsViewMode('details');
+                    setDetailsPdfPreview((prev) => {
+                      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+                      return null;
+                    });
+                  }} className="text-zinc-400 hover:text-zinc-600">
+                    <XCircle className="w-6 h-6" />
+                  </button>
+                </div>
+              </div>
+              <div className="p-0 overflow-y-auto flex-1 bg-zinc-50/50">
+                {isEditing ? (
+                  <div className="p-8 w-full">
+                    <div className="bg-white rounded-2xl shadow-sm border border-zinc-200 p-8 space-y-8">
+                      <div className="flex items-center gap-3 mb-6">
+                        <div className="w-10 h-10 bg-indigo-100 rounded-xl flex items-center justify-center">
+                          <Edit2 className="w-5 h-5 text-indigo-600" />
+                        </div>
+                        <div>
+                          <h3 className="text-xl font-bold text-zinc-900">Edit Request</h3>
+                          <p className="text-sm text-zinc-500">Update your request details and line items</p>
+                        </div>
+                      </div>
+
+                      <div className="space-y-6">
+                        {isProcurementPRorPORequest(selectedRequest) && (
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Currency</label>
+                              <select
+                                className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                value={editData.currency}
+                                onChange={(e) => setEditData({ ...editData, currency: e.target.value })}
+                                required
+                              >
+                                <option value="">Select currency…</option>
+                                {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
+                              </select>
+                            </div>
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">{procurementTaxRateFormLabel(selectedRequest.entity)}</label>
+                              <div className="flex items-center gap-3">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0"
+                                  max="100"
+                                  className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                  value={editData.tax_rate !== undefined ? editData.tax_rate : 18}
+                                  onChange={(e) => setEditData({ ...editData, tax_rate: parseFloat(e.target.value) || 0 })}
+                                />
+                                <span className="text-xs text-zinc-500 font-bold uppercase tracking-tighter">%</span>
+                              </div>
+                            </div>
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Discount (%)</label>
+                              <div className="flex items-center gap-3">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0"
+                                  max="100"
+                                  className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                  value={editData.discount_rate !== undefined ? editData.discount_rate : 0}
+                                  onChange={(e) => setEditData({ ...editData, discount_rate: parseFloat(e.target.value) || 0 })}
+                                />
+                                <span className="text-xs text-zinc-500 font-bold uppercase tracking-tighter">%</span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                        {isSRRequest(selectedRequest) && (
+                          <div className="max-w-md">
+                            <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Section</label>
+                            <select
+                              className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                              value={sectionSelectionFromStored(editData.section)}
+                              onChange={(e) => setEditData({ ...editData, section: e.target.value })}
+                              required
+                            >
+                              <option value="" disabled>Select section...</option>
+                              {SECTION_OPTIONS.map((opt) => (
+                                <option key={opt} value={opt}>{opt}</option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+                        <div>
+                          <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Request Title</label>
+                          <input
+                            type="text"
+                            className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                            value={editData.title}
+                            onChange={(e) => setEditData({ ...editData, title: e.target.value })}
+                          />
+                        </div>
+                        {!isProcurementPRorPORequest(selectedRequest) && (
+                        <div>
+                          <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Details</label>
+                          <textarea
+                            rows={4}
+                            className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                            value={editData.details}
+                            onChange={(e) => setEditData({ ...editData, details: e.target.value })}
+                          />
+                        </div>
+                        )}
+
+                        <div>
+                          <div className="flex items-center justify-between mb-4">
+                            <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">
+                              {isPRRequest(selectedRequest) ? 'PR line items' : isSRRequest(selectedRequest) ? 'Stock requisition line items' : isPO_Only(selectedRequest) ? 'PO line items' : 'Line items'}
+                            </label>
+                            <button
+                              onClick={() => {
+                                const newItem: any = { [LINE_ITEM_REMARKS_KEY]: '' };
+                                const columns = getColumns(selectedRequest);
+                                columns.forEach(col => newItem[col] = '');
+                                setEditData({ ...editData, line_items: [...editData.line_items, newItem] });
+                              }}
+                              className="flex items-center gap-1 text-xs font-bold text-indigo-600 hover:text-indigo-800"
+                            >
+                              <Plus className="w-3 h-3" />
+                              Add Item
+                            </button>
+                          </div>
+                          <div className="overflow-x-auto border border-zinc-200 rounded-xl">
+                            <table className="w-full text-sm">
+                              <thead className="bg-zinc-50 border-b border-zinc-200">
+                                <tr>
+                                  <th className="px-3 py-2 font-bold text-zinc-600 w-10 text-center">#</th>
+                                  {getColumns(selectedRequest).map(col => (
+                                    <th key={col} className="px-3 py-2 font-bold text-zinc-600 text-left">{col}</th>
+                                  ))}
+                                  <th className="px-3 py-2 font-bold text-zinc-600 w-10 text-center"></th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-zinc-200">
+                                {editData.line_items.map((item, idx) => {
+                                  const cols = getColumns(selectedRequest);
+                                  return (
+                                  <React.Fragment key={idx}>
+                                  <tr className="group hover:bg-zinc-50 transition-colors">
+                                    <td className="px-3 py-2 text-center text-zinc-400 font-bold">{idx + 1}</td>
+                                    {cols.map(col => (
+                                      <td key={col} className="px-3 py-2">
+                                        {col === 'Cost Center' ? (
+                                          <SearchableSelect
+                                            options={costCenterOptions}
+                                            value={item[col] || ''}
+                                            onChange={(val) => {
+                                              const newItems = [...editData.line_items];
+                                              newItems[idx] = { ...newItems[idx], [col]: val };
+                                              setEditData({ ...editData, line_items: newItems });
+                                            }}
+                                            placeholder="Select Cost Center..."
+                                          />
+                                        ) : (isSRRequest(selectedRequest) && isSpareLocationColumn(col)) ? (
+                                          <SearchableSelect
+                                            options={costCenterOptions}
+                                            value={item[col] || ''}
+                                            onChange={(val) => {
+                                              const newItems = [...editData.line_items];
+                                              newItems[idx] = { ...newItems[idx], [col]: val };
+                                              setEditData({ ...editData, line_items: newItems });
+                                            }}
+                                            placeholder="Select Cost Center..."
+                                          />
+                                        ) : (
+                                          <input
+                                            type="text"
+                                            className="w-full px-2 py-1 rounded border border-zinc-200 text-xs outline-none focus:ring-1 focus:ring-indigo-500 bg-white"
+                                            value={item[col] || ''}
+                                            onChange={(e) => {
+                                              const newItems = [...editData.line_items];
+                                              newItems[idx] = { ...newItems[idx], [col]: e.target.value };
+                                              setEditData({ ...editData, line_items: newItems });
+                                            }}
+                                          />
+                                        )}
+                                      </td>
+                                    ))}
+                                    <td className="px-3 py-2 text-center">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const newItems = [...editData.line_items];
+                                          newItems.splice(idx, 1);
+                                          setEditData({ ...editData, line_items: newItems });
+                                        }}
+                                        className="text-zinc-300 hover:text-red-500 transition-colors"
+                                      >
+                                        <X className="w-4 h-4" />
+                                      </button>
+                                    </td>
+                                  </tr>
+                                  <tr className="bg-zinc-50/90">
+                                    <td colSpan={cols.length + 2} className="px-3 py-2">
+                                      <label className="text-[10px] font-bold text-zinc-500 uppercase">Line remarks (optional)</label>
+                                      <textarea
+                                        rows={2}
+                                        className="w-full mt-1 px-2 py-1.5 rounded border border-zinc-200 text-xs outline-none focus:ring-1 focus:ring-indigo-500 resize-y min-h-[52px]"
+                                        value={item[LINE_ITEM_REMARKS_KEY] ?? ''}
+                                        onChange={(e) => {
+                                          const newItems = [...editData.line_items];
+                                          newItems[idx] = { ...newItems[idx], [LINE_ITEM_REMARKS_KEY]: e.target.value };
+                                          setEditData({ ...editData, line_items: newItems });
+                                        }}
+                                        placeholder="Extra notes for this line…"
+                                      />
+                                    </td>
+                                  </tr>
+                                  </React.Fragment>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+
+                        <div className="flex gap-3 pt-6 border-t border-zinc-100">
+                          <button
+                            onClick={handleSaveEdit}
+                            disabled={loading}
+                            className="flex-1 bg-indigo-600 text-white py-3 rounded-xl font-bold text-sm hover:bg-indigo-700 transition-all disabled:opacity-50"
+                          >
+                            Save Changes
+                          </button>
+                          <button
+                            onClick={() => setIsEditing(false)}
+                            className="flex-1 bg-zinc-100 text-zinc-600 py-3 rounded-xl font-bold text-sm hover:bg-zinc-200 transition-all"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="w-full bg-white my-8 shadow-sm border border-zinc-200 rounded-xl overflow-hidden">
+                    {/* Document Header */}
+                    <div className="p-8 border-b border-zinc-100 bg-zinc-50/30">
+                      <div className="flex justify-between items-start mb-8">
+                        <div>
+                          <h1 className="text-2xl font-black text-zinc-900 uppercase tracking-tight">
+                            {isPRRequest(selectedRequest)
+                              ? 'Purchase Requisition Form'
+                              : isSRRequest(selectedRequest)
+                                ? 'Stock Item Requisition Form'
+                                : isPO_Only(selectedRequest)
+                                  ? 'Purchase Order'
+                                  : 'Workflow Request'}
+                          </h1>
+                          <p className="text-sm text-zinc-500 font-medium">Ref: #{selectedRequest.id.toString().padStart(6, '0')}</p>
+                        </div>
+                        <div className="flex items-center gap-4">
+                          <button 
+                            onClick={() => handlePrintPR(selectedRequest)}
+                            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-zinc-200 text-zinc-600 bg-white hover:bg-zinc-50 hover:text-indigo-600 transition-colors"
+                            title={isPR_Only(selectedRequest) ? 'View PR form' : isSR_Only(selectedRequest) ? 'View SR form' : 'View PDF'}
+                          >
+                            <FileText className="w-4 h-4" />
+                            <span className="text-xs font-bold">
+                              {isPR_Only(selectedRequest) ? 'View PR form' : isSR_Only(selectedRequest) ? 'View SR form' : 'View PDF'}
+                            </span>
+                          </button>
+                          <div className="text-right">
+                            <span className={cn(
+                              "px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider",
+                              workflowRequestStatusBadgeClass(selectedRequest)
+                            )}>
+                              {formatWorkflowRequestStatusLabel(selectedRequest)}
+                            </span>
+                            <p className="text-[10px] text-zinc-400 mt-2 font-bold uppercase tracking-widest">
+                              {new Date(selectedRequest.created_at).toLocaleDateString()}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Summary Cards */}
+                      <div className="grid grid-cols-4 gap-4 mb-8">
+                        <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
+                          <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Total Amount</p>
+                          <p className="text-xl font-black text-indigo-600">
+                            {procurementCurrencyPrefix(selectedRequest.currency)}{(isProcurementPRorPORequest(selectedRequest)
+                              ? procurementMoneyTotals(selectedRequest).total
+                              : (selectedRequest.line_items?.reduce((sum, item) => sum + (parseFloat(item['Quantity'] || '0') * parseFloat(item['Unit Price'] || '0')), 0) || 0) * (1 + (selectedRequest.tax_rate !== undefined ? selectedRequest.tax_rate : 0.18))
+                            ).toLocaleString()}
+                          </p>
+                        </div>
+                        <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
+                          <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Items Count</p>
+                          <p className="text-xl font-black text-zinc-900">{selectedRequest.line_items?.length || 0} Items</p>
+                        </div>
+                        <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
+                          <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Requester</p>
+                          <p className="text-sm font-bold text-zinc-900 truncate">{selectedRequest.requester_name}</p>
+                          <p className="text-[10px] text-zinc-400 font-bold uppercase">{selectedRequest.department}</p>
+                        </div>
+                        <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
+                          <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Current Step</p>
+                          <p className="text-sm font-bold text-zinc-900">
+                            {isWorkflowRequestPending(selectedRequest) 
+                              ? selectedRequest.template_steps[selectedRequest.current_step_index]?.label || 'Processing'
+                              : formatWorkflowRequestStatusLabel(selectedRequest)}
+                          </p>
+                          <p className="text-[10px] text-zinc-400 font-bold uppercase">Workflow Progress</p>
+                        </div>
+                      </div>
+
+                    <div className="grid grid-cols-2 gap-8">
+                      <div>
+                        <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Requester Information</label>
+                        <p className="font-bold text-zinc-900">{selectedRequest.requester_name}</p>
+                        <p className="text-sm text-zinc-500">{selectedRequest.department}</p>
+                      </div>
+                      <div className="text-right">
+                        <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Template Type</label>
+                        <p className="font-bold text-zinc-900">{selectedRequest.template_name}</p>
+                        <p className="text-sm text-zinc-500">Category: {selectedRequest.category || 'General'}</p>
+                      </div>
+                    </div>
+
+                    {isProcurementPRorPORequest(selectedRequest) && (
+                      <div className="grid grid-cols-2 gap-8 mt-8 pt-8 border-t border-zinc-100">
+                        <div>
+                          <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Currency</label>
+                          <p className="font-bold text-zinc-900">{procurementCurrencyLabel(selectedRequest.currency)}</p>
+                        </div>
+                        <div className="text-right">
+                          <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Cost Center</label>
+                          <p className="font-bold text-zinc-900">{selectedRequest.cost_center || 'Not Specified'}</p>
+                          {isSRRequest(selectedRequest) && (
+                            <>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mt-3 mb-1">Section</label>
+                              <p className="font-bold text-zinc-900">{selectedRequest.section || 'Not Specified'}</p>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="p-8 space-y-10">
+                    <section>
+                      <div className="flex items-center justify-between gap-3 mb-3 border-b border-zinc-100 pb-2">
+                        <h4 className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Details</h4>
+                        <div className="inline-flex rounded-lg border border-zinc-200 overflow-hidden">
+                          <button
+                            type="button"
+                            onClick={() => setDetailsViewMode('details')}
+                            className={cn(
+                              "px-3 py-1.5 text-[10px] font-black uppercase tracking-widest transition-colors",
+                              detailsViewMode === 'details'
+                                ? "bg-indigo-600 text-white"
+                                : "bg-white text-zinc-500 hover:bg-zinc-50"
+                            )}
+                          >
+                            Details
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleShowRequestPdfInline(selectedRequest)}
+                            className={cn(
+                              "px-3 py-1.5 text-[10px] font-black uppercase tracking-widest transition-colors border-l border-zinc-200 inline-flex items-center gap-1.5",
+                              detailsViewMode === 'pdf'
+                                ? "bg-indigo-600 text-white"
+                                : "bg-white text-zinc-500 hover:bg-zinc-50"
+                            )}
+                          >
+                            <FileText className="w-3 h-3" />
+                            PDF
+                          </button>
+                        </div>
+                      </div>
+                      {detailsViewMode === 'pdf' ? (
+                        <div className="w-full h-[72vh] border border-zinc-200 rounded-xl overflow-hidden bg-zinc-100">
+                          {detailsPdfPreview ? (
+                            <iframe
+                              src={`${detailsPdfPreview.url}#view=FitH`}
+                              className="w-full h-full border-none"
+                              title="Request PDF Preview"
+                            />
+                          ) : (
+                            <div className="h-full flex items-center justify-center text-sm text-zinc-500">
+                              PDF is not ready.
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        !isProcurementPRorPORequest(selectedRequest) ? (
+                          <p className="text-zinc-700 whitespace-pre-wrap leading-relaxed">{selectedRequest.details}</p>
+                        ) : (
+                          <p className="text-zinc-500 text-sm">Switch to PDF to view the full form layout.</p>
+                        )
+                      )}
+                    </section>
+
+                    {/* Line Items */}
+                    {selectedRequest.line_items && selectedRequest.line_items.length > 0 && (
+                      <section>
+                        <h4 className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-3 border-b border-zinc-100 pb-2">
+                          {isPRRequest(selectedRequest) ? 'PR line items' : isSRRequest(selectedRequest) ? 'Stock requisition line items' : isPO_Only(selectedRequest) ? 'PO line items' : 'Line items'}
+                        </h4>
+                        <div className="border border-zinc-200 rounded-lg overflow-hidden">
+                          <table className="w-full text-sm">
+                            <thead className="bg-zinc-50 border-b border-zinc-200">
+                              <tr>
+                                <th className="px-4 py-2 font-bold text-zinc-600 w-12 text-center">No</th>
+                                {procurementGridColumns(selectedRequest).map(col => (
+                                  <th key={col} className="px-4 py-2 font-bold text-zinc-600 text-left">{col}</th>
+                                ))}
+                                {procurementRowShowsLineTotal(selectedRequest) && <th className="px-4 py-2 font-bold text-zinc-600 text-right">Total</th>}
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-zinc-200">
+                              {selectedRequest.line_items.map((item, idx) => {
+                                const cols = procurementGridColumns(selectedRequest);
+                                const showLineTotal = procurementRowShowsLineTotal(selectedRequest);
+                                const qty = lineItemQtyForDisplay(item);
+                                const price = parseFloat(item['Unit Price'] || '0');
+                                const total = qty * price;
+                                const lineRem = item[LINE_ITEM_REMARKS_KEY] && String(item[LINE_ITEM_REMARKS_KEY]).trim();
+                                return (
+                                  <React.Fragment key={item.id || idx}>
+                                  <tr className={idx % 2 === 0 ? 'bg-white' : 'bg-zinc-50/30'}>
+                                    <td className="px-4 py-3 text-center text-zinc-500 font-medium">{idx + 1}</td>
+                                    {cols.map(col => (
+                                      <td key={col} className="px-4 py-3 text-zinc-700">
+                                        {(col === 'Unit Price' || col === 'Price' || col === 'Amount')
+                                          ? `${procurementCurrencyPrefix(selectedRequest.currency)}${Number(item[col] || 0).toLocaleString()}`.trim()
+                                          : (col === REMARKS_LINE_COL ? (lineItemRemarksDisplay(item) || '-') : (item[col] || '-'))}
+                                      </td>
+                                    ))}
+                                    {showLineTotal && (
+                                      <td className="px-4 py-3 text-right font-bold text-zinc-900">
+                                        {`${procurementCurrencyPrefix(selectedRequest.currency)}${total.toLocaleString()}`.trim()}
+                                      </td>
+                                    )}
+                                  </tr>
+                                  {lineRem && (
+                                    <tr className="bg-indigo-50/40 border-t border-indigo-100/80">
+                                      <td colSpan={cols.length + 1 + (showLineTotal ? 1 : 0)} className="px-4 py-2.5 text-xs text-zinc-700">
+                                        <span className="font-bold text-zinc-500 uppercase tracking-wide text-[10px]">Line remarks: </span>
+                                        <span className="whitespace-pre-wrap">{lineRem}</span>
+                                      </td>
+                                    </tr>
+                                  )}
+                                  </React.Fragment>
+                                );
+                              })}
+                            </tbody>
+                            {procurementRowShowsLineTotal(selectedRequest) && (() => {
+                              const m = procurementMoneyTotals(selectedRequest);
+                              const gc = procurementGridColumns(selectedRequest);
+                              return (
+                              <tfoot className="bg-zinc-50/50 font-bold">
+                                <tr>
+                                  <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">Subtotal</td>
+                                  <td className="px-4 py-2 text-right text-zinc-900">
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.subtotal.toLocaleString()}`.trim()}
+                                  </td>
+                                </tr>
+                                <tr>
+                                  <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">Discount ({(m.discountRate * 100).toFixed(0)}%)</td>
+                                  <td className="px-4 py-2 text-right text-zinc-900">
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.discountAmount.toLocaleString()}`.trim()}
+                                  </td>
+                                </tr>
+                                <tr>
+                                  <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">{procurementTaxLabelForEntity(selectedRequest.entity)} ({(m.taxRate * 100).toFixed(0)}%)</td>
+                                  <td className="px-4 py-2 text-right text-zinc-900">
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.taxAmount.toLocaleString()}`.trim()}
+                                  </td>
+                                </tr>
+                                <tr className="bg-zinc-100/50 text-lg">
+                                  <td colSpan={gc.length + 1} className="px-4 py-4 text-right text-zinc-900 uppercase tracking-tight">Total Amount</td>
+                                  <td className="px-4 py-4 text-right text-indigo-600 font-black">
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.total.toLocaleString()}`.trim()}
+                                  </td>
+                                </tr>
+                              </tfoot>
+                              );
+                            })()}
+                          </table>
+                        </div>
+                      </section>
+                    )}
+
+                    {/* Attachments */}
+                    {attachments.length > 0 && (
+                      <section>
+                        <h4 className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-3 border-b border-zinc-100 pb-2">Attachments</h4>
+                        <div className="grid grid-cols-2 gap-3">
+                          {attachments.map((att) => (
+                            <div
+                              key={att.id}
+                              onClick={() => {
+                                void openWorkflowRequestAttachment(selectedRequest.id, att, setViewingPdf);
+                              }}
+                              className="flex items-center gap-3 p-3 bg-zinc-50 rounded-xl border border-zinc-200 hover:border-indigo-300 transition-all group cursor-pointer"
+                            >
+                              <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center border border-zinc-100 group-hover:bg-indigo-50 transition-colors">
+                                <FileText className="w-4 h-4 text-indigo-500" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <p className="text-xs font-bold text-zinc-700 truncate">{att.file_name}</p>
+                                <p className="text-[10px] text-zinc-400 uppercase font-bold">
+                                  {(att.file_type === 'application/pdf' || att.file_name.toLowerCase().endsWith('.pdf')) ? 'View PDF' : 'Download File'}
+                                </p>
+                              </div>
+                              {(att.file_type === 'application/pdf' || att.file_name.toLowerCase().endsWith('.pdf')) ? (
+                                <Eye className="w-3 h-3 text-zinc-300 group-hover:text-indigo-500" />
+                              ) : (
+                                <Download className="w-3 h-3 text-zinc-300 group-hover:text-indigo-500" />
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </section>
+                    )}
+
+                    {/* Signatures & Approvals */}
+                    <section className="pt-8 border-t-2 border-dashed border-zinc-100">
+                      <div className="grid grid-cols-2 gap-12">
+                        {/* Requester Signature */}
+                        <div>
+                          <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-4">Requested By</p>
+                          {hasRequesterSignatureProof(selectedRequest) ? (
+                            <div className="space-y-2">
+                              {isSignatureImageDataUrl(selectedRequest.requester_signature) ? (
+                                <img src={selectedRequest.requester_signature!} alt="Requester Signature" className="h-16 object-contain" referrerPolicy="no-referrer" />
+                              ) : (
+                                <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 px-3 py-2">
+                                  <p className="text-xs font-semibold text-emerald-800">Electronic signature</p>
+                                  {selectedRequest.requester_signed_at && (
+                                    <p className="text-[10px] text-emerald-700/90 mt-0.5">{formatSignatureProofTimestamp(selectedRequest.requester_signed_at)}</p>
+                                  )}
+                                </div>
+                              )}
+                              <div className="pt-2 border-t border-zinc-200">
+                                <p className="text-sm font-bold text-zinc-900">{selectedRequest.requester_name}</p>
+                                <p className="text-xs text-zinc-500">{selectedRequest.department}</p>
+                                <p className="text-[10px] text-zinc-400 mt-1">{new Date(selectedRequest.created_at).toLocaleDateString()}</p>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="h-24 border-2 border-dashed border-zinc-100 rounded-xl flex items-center justify-center">
+                              <p className="text-xs text-zinc-300 italic">No signature</p>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Approvals */}
+                        <div className="space-y-8">
+                          <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-4">Approval Workflow</p>
+                          {selectedRequest.template_steps.map((step, i) => {
+                            const approval = approvals.find(a => a.step_index === i);
+                            const isCurrent = isWorkflowRequestPending(selectedRequest) && selectedRequest.current_step_index === i;
+                            
+                            return (
+                              <div key={step.id} className="relative pl-8 border-l-2 border-zinc-100 pb-8 last:pb-0">
+                                <div className={cn(
+                                  "absolute -left-[9px] top-0 w-4 h-4 rounded-full border-2 border-white",
+                                  approval ? (approval.status === 'approved' ? "bg-emerald-500" : "bg-red-500") :
+                                  isCurrent ? "bg-amber-500 animate-pulse" : "bg-zinc-200"
+                                )} />
+                                
+                                <div className="space-y-2">
+                                  <div className="flex justify-between items-start">
+                                    <div>
+                                      <p className="text-xs font-black text-zinc-900 uppercase tracking-tight">{step.label}</p>
+                                      <p className="text-[10px] text-zinc-400 font-bold uppercase">Role: {step.approverRole}</p>
+                                    </div>
+                                    {approval && (
+                                      <span className={cn(
+                                        "text-[10px] font-black uppercase px-2 py-0.5 rounded",
+                                        approval.status === 'approved' ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
+                                      )}>
+                                        {approval.status}
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {approval && (
+                                    <div className="mt-4 p-4 bg-zinc-50 rounded-xl border border-zinc-100">
+                                      {approval.comment && <p className="text-xs text-zinc-600 italic mb-3">"{approval.comment}"</p>}
+                                      <div className="flex items-center gap-3">
+                                        {isSignatureImageDataUrl(approval.approver_signature) ? (
+                                          <img src={approval.approver_signature!} alt="Approver Signature" className="h-10 object-contain" referrerPolicy="no-referrer" />
+                                        ) : approval.status.toLowerCase() === 'approved' ? (
+                                          <div className="shrink-0 rounded-lg border border-emerald-200 bg-emerald-50/80 px-2 py-1.5">
+                                            <p className="text-[10px] font-semibold text-emerald-800">E-signed</p>
+                                            <p className="text-[9px] text-emerald-700/90">{formatSignatureProofTimestamp(approval.created_at)}</p>
+                                          </div>
+                                        ) : null}
+                                        <div>
+                                          <p className="text-xs font-bold text-zinc-900">{approval.approver_name}</p>
+                                          <p className="text-[10px] text-zinc-400">{new Date(approval.created_at).toLocaleDateString()}</p>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {isCurrent && (
+                                    <div className="mt-4 p-4 bg-amber-50 border border-amber-200 rounded-xl">
+                                      <p className="text-xs font-bold text-amber-700 flex items-center gap-2">
+                                        <Clock className="w-3 h-3" />
+                                        Awaiting decision...
+                                      </p>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </section>
+
+                    {/* Approval Form (Integrated) */}
+                    {isWorkflowRequestPending(selectedRequest) && canApprove && (
+                      <section className="pt-12 border-t-2 border-zinc-100">
+                        <div className="bg-indigo-50/50 p-8 rounded-2xl border border-indigo-100">
+                          <div className="flex items-center gap-3 mb-6">
+                            <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-200">
+                              <Shield className="w-5 h-5 text-white" />
+                            </div>
+                            <div>
+                              <h3 className="text-lg font-black text-zinc-900 uppercase tracking-tight">Your Decision</h3>
+                              <p className="text-xs text-zinc-500">Review the document above before proceeding</p>
+                            </div>
+                          </div>
+
+                          <div className="space-y-6">
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Comment (Optional)</label>
+                              <textarea
+                                rows={3}
+                                className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+                                placeholder="Add a reason for your decision..."
+                                value={comment}
+                                onChange={(e) => setComment(e.target.value)}
+                              />
+                            </div>
+
+                            {requiresProcurementApproverSignaturePad(selectedRequest) && (
+                              <div>
+                                <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">
+                                  Signature <span className="text-red-500 ml-1">* Required</span>
+                                </label>
+                                <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden">
+                                  <SignaturePad onSave={setApproverSignature} onClear={() => setApproverSignature(null)} />
+                                </div>
+                              </div>
+                            )}
+
+                            <div className="flex gap-4 pt-2">
+                              <button
+                                onClick={() => handleApprove(selectedRequest.id, 'approved')}
+                                disabled={loading}
+                                className="flex-1 bg-emerald-600 text-white py-4 rounded-xl font-black uppercase tracking-widest hover:bg-emerald-700 transition-all shadow-lg shadow-emerald-100 flex items-center justify-center gap-2 disabled:opacity-50"
+                              >
+                                <CheckCircle2 className="w-5 h-5" />
+                                Approve Document
+                              </button>
+                              <button
+                                onClick={() => handleApprove(selectedRequest.id, 'rejected')}
+                                disabled={loading}
+                                className="flex-1 bg-red-600 text-white py-4 rounded-xl font-black uppercase tracking-widest hover:bg-red-700 transition-all shadow-lg shadow-red-100 flex items-center justify-center gap-2 disabled:opacity-50"
+                              >
+                                <XCircle className="w-5 h-5" />
+                                Reject Document
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </section>
+                    )}
+
+                    {isWorkflowRequestPending(selectedRequest) && !canApprove && (
+                      <div className="mt-8 p-4 bg-zinc-100 rounded-xl border border-zinc-200 flex items-center gap-3 text-zinc-500 text-sm">
+                        <Shield className="w-5 h-5" />
+                        <span>You don't have the required role ({currentStep?.approverRole}) to approve this step.</span>
+                      </div>
+                    )}
+
+                    {isWorkflowRequestRejected(selectedRequest) && user.id === selectedRequest.requester_id && (
+                      <section className="pt-12 border-t-2 border-zinc-100">
+                        <div className="bg-red-50 p-8 rounded-2xl border border-red-100">
+                          <div className="flex items-center gap-3 mb-6">
+                            <div className="w-10 h-10 bg-red-600 rounded-xl flex items-center justify-center shadow-lg shadow-red-200">
+                              <RefreshCw className="w-5 h-5 text-white" />
+                            </div>
+                            <div>
+                              <h3 className="text-lg font-black text-zinc-900 uppercase tracking-tight">Resubmit Request</h3>
+                              <p className="text-xs text-zinc-500">This request was rejected. You can resubmit it to restart the workflow.</p>
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => handleResubmit(selectedRequest.id)}
+                            disabled={loading}
+                            className="w-full bg-indigo-600 text-white py-4 rounded-xl font-black uppercase tracking-widest hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 flex items-center justify-center gap-2 disabled:opacity-50"
+                          >
+                            <Send className="w-5 h-5" />
+                            Resubmit Now
+                          </button>
+                        </div>
+                      </section>
+                    )}
+
+                  </div>
+                </div>
+              )}
+            </div>
+            </motion.div>
+          </div>
+        )}
+        {viewingPdf && (
+          <PdfViewer
+            url={viewingPdf.url}
+            fileName={viewingPdf.fileName}
+            onDownload={() => downloadFileFromUrl(viewingPdf.url, viewingPdf.fileName)}
+            onClose={() => {
+              if (viewingPdf.url.startsWith("blob:")) URL.revokeObjectURL(viewingPdf.url);
+              setViewingPdf(null);
+            }}
+          />
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+// --- Dashboard Component ---
+
+const Dashboard = ({ 
+  requests, 
+  workflows, 
+  user, 
+  onStartRequest,
+  onViewRequest,
+  onViewAllRequests
+}: { 
+  requests: WorkflowRequest[]; 
+  workflows: Workflow[]; 
+  user: User;
+  onStartRequest: (w: Workflow) => void;
+  onViewRequest: (r: WorkflowRequest) => void;
+  onViewAllRequests: () => void;
+}) => {
+  // Calculate stats
+  const pendingForMe = requests.filter(r => {
+    if (!isWorkflowRequestPending(r)) return false;
+    const currentStep = r.template_steps[r.current_step_index];
+    if (!currentStep) return false;
+    return userCanApproveWorkflowStep(user, r, currentStep);
+  });
+
+  const myRequests = requests.filter(r => r.requester_id === user.id);
+  
+  const myApprovals = requests.filter(r => 
+    r.approvals?.some(a => a.approver_id === user.id)
+  );
+
+  const stats = [
+    { label: 'Pending My Approval', value: pendingForMe.length, icon: Clock, color: 'text-amber-600', bg: 'bg-amber-50' },
+    { label: 'My Active Requests', value: myRequests.filter(r => r.status === 'Pending').length, icon: Send, color: 'text-indigo-600', bg: 'bg-indigo-50' },
+    { label: 'Total Approved', value: myApprovals.filter(r => r.approvals?.some(a => a.approver_id === user.id && a.status === 'Approved')).length, icon: CheckCircle2, color: 'text-emerald-600', bg: 'bg-emerald-50' },
+    { label: 'Total Rejected', value: myApprovals.filter(r => r.approvals?.some(a => a.approver_id === user.id && a.status === 'Rejected')).length, icon: XCircle, color: 'text-red-600', bg: 'bg-red-50' },
+  ];
+
+  // Chart data: Requests by category
+  const categoryData = workflows.map(w => ({
+    name: w.category,
+    count: requests.filter(r => r.template_id === w.id).length
+  })).reduce((acc: any[], curr) => {
+    const existing = acc.find(a => a.name === curr.name);
+    if (existing) {
+      existing.count += curr.count;
+    } else {
+      acc.push(curr);
+    }
+    return acc;
+  }, []);
+
+  // Chart data: Status distribution
+  const statusData = [
+    { name: 'Pending', value: requests.filter(r => r.status === 'Pending').length, color: '#f59e0b' },
+    { name: 'Approved', value: requests.filter(r => r.status === 'Approved').length, color: '#10b981' },
+    { name: 'Rejected', value: requests.filter(r => r.status === 'Rejected').length, color: '#ef4444' },
+  ];
+
+  const recentActivities = requests
+    .flatMap(r => (r.approvals || []).map(a => ({ ...a, requestTitle: r.title, requestId: r.id, fullRequest: r })))
+    .filter(a => a.approver_id === user.id)
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .slice(0, 5);
+
+  return (
+    <div className="space-y-8">
+      {/* Stats Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        {stats.map((stat, i) => (
+          <motion.div
+            key={stat.label}
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: i * 0.1 }}
+            className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm"
+          >
+            <div className="flex items-center gap-4">
+              <div className={cn("w-12 h-12 rounded-xl flex items-center justify-center", stat.bg)}>
+                <stat.icon className={cn("w-6 h-6", stat.color)} />
+              </div>
+              <div>
+                <p className="text-xs font-bold text-zinc-400 uppercase tracking-wider">{stat.label}</p>
+                <p className="text-2xl font-black text-zinc-900">{stat.value}</p>
+              </div>
+            </div>
+          </motion.div>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        {/* Charts Section */}
+        <div className="lg:col-span-2 space-y-8">
+          <div className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm">
+            <h3 className="text-sm font-bold text-zinc-900 uppercase tracking-wider mb-6 flex items-center gap-2">
+              <TrendingUp className="w-4 h-4 text-indigo-600" />
+              Request Volume by Category
+            </h3>
+            <div className="h-[300px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={categoryData}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f4f4f5" />
+                  <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#71717a' }} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#71717a' }} />
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#fff', borderRadius: '12px', border: '1px solid #e4e4e7', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
+                    cursor={{ fill: '#f8fafc' }}
+                  />
+                  <Bar dataKey="count" fill="#4f46e5" radius={[4, 4, 0, 0]} barSize={40} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          <div className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm">
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-sm font-bold text-zinc-900 uppercase tracking-wider flex items-center gap-2">
+                <Clock className="w-4 h-4 text-amber-600" />
+                Recent Pending Approvals
+              </h3>
+              <button 
+                onClick={onViewAllRequests}
+                className="text-[10px] font-black text-indigo-600 uppercase tracking-widest hover:underline"
+              >
+                View All
+              </button>
+            </div>
+            <div className="space-y-3">
+              {pendingForMe.length === 0 ? (
+                <div className="text-center py-8">
+                  <CheckCircle2 className="w-10 h-10 text-emerald-200 mx-auto mb-2" />
+                  <p className="text-sm text-zinc-400 font-medium">All caught up! No pending approvals.</p>
+                </div>
+              ) : (
+                pendingForMe.slice(0, 5).map(r => (
+                  <div 
+                    key={r.id} 
+                    onClick={() => onViewRequest(r)}
+                    className="flex items-center justify-between p-4 rounded-xl border border-zinc-100 hover:bg-zinc-50 transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-lg bg-indigo-50 flex items-center justify-center">
+                        <FileText className="w-5 h-5 text-indigo-600" />
+                      </div>
+                      <div>
+                        <p className="text-sm font-bold text-zinc-900 group-hover:text-indigo-600 transition-colors">{r.title}</p>
+                        <p className="text-[10px] text-zinc-400 uppercase font-bold">{r.requester_name} • {r.template_name}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-bold px-2 py-1 bg-amber-50 text-amber-600 rounded-full border border-amber-100">
+                        Step {r.current_step_index + 1}
+                      </span>
+                      <ChevronRight className="w-4 h-4 text-zinc-300 group-hover:text-indigo-400 transition-colors" />
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Side Section */}
+        <div className="space-y-8">
+          <div className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm">
+            <h3 className="text-sm font-bold text-zinc-900 uppercase tracking-wider mb-6 flex items-center gap-2">
+              <Activity className="w-4 h-4 text-indigo-600" />
+              Overall Status
+            </h3>
+            <div className="h-[200px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={statusData}
+                    cx="50%"
+                    cy="50%"
+                    innerRadius={60}
+                    outerRadius={80}
+                    paddingAngle={5}
+                    dataKey="value"
+                  >
+                    {statusData.map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={entry.color} />
+                    ))}
+                  </Pie>
+                  <Tooltip />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+            <div className="flex justify-center gap-4 mt-4">
+              {statusData.map(s => (
+                <div key={s.name} className="flex items-center gap-1.5">
+                  <div className="w-2 h-2 rounded-full" style={{ backgroundColor: s.color }} />
+                  <span className="text-[10px] font-bold text-zinc-500 uppercase">{s.name}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm">
+            <h3 className="text-sm font-bold text-zinc-900 uppercase tracking-wider mb-6 flex items-center gap-2">
+              <RotateCcw className="w-4 h-4 text-emerald-600" />
+              My Recent Actions
+            </h3>
+            <div className="space-y-4">
+              {recentActivities.length === 0 ? (
+                <p className="text-xs text-zinc-400 italic text-center py-4">No recent actions found.</p>
+              ) : (
+                recentActivities.map((activity) => (
+                  <div 
+                    key={activity.id} 
+                    onClick={() => onViewRequest(activity.fullRequest)}
+                    className="flex items-start gap-3 cursor-pointer group"
+                  >
+                    <div className={cn(
+                      "mt-1 w-2 h-2 rounded-full shrink-0",
+                      activity.status === 'Approved' ? "bg-emerald-500" : "bg-red-500"
+                    )} />
+                    <div>
+                      <p className="text-xs font-bold text-zinc-900 group-hover:text-indigo-600 transition-colors line-clamp-1">{activity.requestTitle}</p>
+                      <p className="text-[10px] text-zinc-400">
+                        {activity.status === 'Approved' ? 'Approved' : 'Rejected'} on {new Date(activity.created_at).toLocaleDateString()}
+                      </p>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm">
+            <h3 className="text-sm font-bold text-zinc-900 uppercase tracking-wider mb-4 flex items-center gap-2">
+              <PlusCircle className="w-4 h-4 text-indigo-600" />
+              Quick Start
+            </h3>
+            <div className="space-y-2">
+              {workflows
+                .filter(w => (w.status ?? '').toString().trim().toLowerCase() === 'approved')
+                .slice(0, 3)
+                .map(w => (
+                <button
+                  key={w.id}
+                  onClick={() => onStartRequest(w)}
+                  className="w-full flex items-center justify-between p-3 rounded-xl border border-zinc-100 hover:border-indigo-200 hover:bg-indigo-50 transition-all group text-left"
+                >
+                  <span className="text-xs font-bold text-zinc-600 group-hover:text-indigo-600">{w.name}</span>
+                  <Plus className="w-4 h-4 text-zinc-300 group-hover:text-indigo-400" />
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const WorkflowList = ({ workflows, user, roles: availableRoles, onRefresh, onStartRequest }: { workflows: Workflow[], user: User, roles: Role[], onRefresh: () => void, onStartRequest: (w: Workflow) => void }) => {
+  const [selectedWorkflow, setSelectedWorkflow] = useState<Workflow | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [filter, setFilter] = useState<'all' | 'Pending' | 'Approved' | 'Rejected'>('all');
+  const [editData, setEditData] = useState({ 
+    name: '', 
+    category: 'general' as string,
+    steps: [] as WorkflowStep[], 
+    table_columns: [] as string[],
+    attachments_required: false
+  });
+  const [editNewColumnName, setEditNewColumnName] = useState('');
+  const [users, setUsers] = useState<User[]>([]);
+  const isPR = isPRTemplate(editData);
+  const isPO = isPOTemplate(editData);
+  const isSR = isSRTemplate(editData);
+
+  useEffect(() => {
+    if (isPR) setEditData(prev => ({ ...prev, steps: FIXED_PR_STEPS }));
+    else if (isPO) setEditData(prev => ({ ...prev, steps: FIXED_PO_STEPS_FULL }));
+    else if (isSR) setEditData(prev => ({ ...prev, steps: FIXED_SR_STEPS }));
+  }, [isPR, isPO, isSR]);
+
+  const filteredWorkflows = workflows.filter(w => filter === 'all' || w.status === filter);
+  
+  useEffect(() => {
+    const fetchUsers = async () => {
+      try {
+        const data = await api.request('/api/users');
+        setUsers(data);
+      } catch (err) {
+        console.error('Failed to fetch users', err);
+      }
+    };
+    fetchUsers();
+  }, []);
+
+  const hasPermission = (permission: string) => {
+    if (!user) return false;
+    if (user.permissions?.includes('admin')) return true;
+    return user.permissions?.includes(permission);
+  };
+
+  const isAdmin = user.roles?.some(r => r.toLowerCase() === 'admin') || hasPermission('admin');
+  const isDirector = user.roles?.some(r => r.toLowerCase() === 'director') && (user.department || '').toLowerCase() === 'management';
+  const canApproveTemplates = hasPermission('approve_templates');
+  const canCreateTemplates = hasPermission('create_templates');
+
+  const handleStatusUpdate = async (id: number, status: string) => {
+    try {
+      await api.request(`/api/workflows/${id}/status`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status }),
+      });
+      toast.success(`Workflow Template ${status}`);
+      onRefresh();
+      setSelectedWorkflow(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    }
+  };
+
+  const handleSaveEdit = async () => {
+    if (!selectedWorkflow) return;
+    setLoading(true);
+    try {
+      await api.request(`/api/workflows/${selectedWorkflow.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(editData),
+      });
+      toast.success('Template updated');
+      setIsEditing(false);
+      onRefresh();
+      setSelectedWorkflow({ ...selectedWorkflow, ...editData });
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const addEditColumn = () => {
+    const name = editNewColumnName.trim();
+    if (!name) return;
+    if (editData.table_columns.includes(name)) {
+      setEditNewColumnName('');
+      return;
+    }
+    setEditData({ ...editData, table_columns: [...editData.table_columns, name] });
+    setEditNewColumnName('');
+  };
+
+  const removeEditColumn = (idx: number) => {
+    setEditData({ ...editData, table_columns: editData.table_columns.filter((_, i) => i !== idx) });
+  };
+
+  const updateEditColumn = (idx: number, nextName: string) => {
+    setEditData({
+      ...editData,
+      table_columns: editData.table_columns.map((c, i) => (i === idx ? nextName : c)),
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="text-xl font-bold text-zinc-900">
+          {(isAdmin || isDirector || canApproveTemplates || canCreateTemplates) ? 'All Workflow Templates' : 'Shared Workflow Templates'}
+        </h2>
+        <span className="text-xs text-zinc-500 bg-zinc-100 px-2 py-1 rounded-full">
+        {filteredWorkflows.length} Templates
+          {/* {workflows.length} Templates */}
+        </span>
+      </div>
+      
+      <div className="flex gap-2 mb-4">
+        {['all', 'pending', 'approved', 'rejected'].map((f) => (
+          <button
+            key={f}
+            onClick={() => setFilter(f as any)}
+            className={cn(
+              "px-3 py-1.5 rounded-lg text-xs font-bold capitalize transition-all",
+              filter === f ? "bg-indigo-600 text-white" : "bg-white text-zinc-500 border border-zinc-200 hover:border-indigo-200"
+            )}
+          >
+            {f}
+          </button>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 gap-4">
+        {filteredWorkflows.length === 0 && (
+          <div className="text-center py-12 bg-white rounded-xl border border-dashed border-zinc-300">
+            <ClipboardList className="w-12 h-12 text-zinc-300 mx-auto mb-3" />
+            <p className="text-zinc-500">No {filter !== 'all' ? filter : ''} templates found.</p>
+            {/* <p className="text-zinc-500">No templates found.</p> */}
+          </div>
+        )}
+        {filteredWorkflows.map((w) => (
+          <div
+            key={w.id}
+            onClick={() => {
+              setSelectedWorkflow(w);
+            }}
+            className="bg-white p-5 rounded-xl border border-zinc-200 hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer group"
+          >
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <h3 className="font-bold text-zinc-900 group-hover:text-indigo-600 transition-colors">{w.name}</h3>
+                  <span className={cn(
+                    "text-[10px] uppercase font-bold px-2 py-0.5 rounded-full",
+                    (w.status ?? '').toString().trim().toLowerCase() === 'approved' ? "bg-emerald-100 text-emerald-700" :
+                    (w.status ?? '').toString().trim().toLowerCase() === 'rejected' ? "bg-red-100 text-red-700" :
+                    "bg-amber-100 text-amber-700"
+                  )}>
+                    {w.status}
+                  </span>
+                  <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-100">
+                    {w.category}
+                  </span>
+                </div>
+                <div className="flex items-center gap-4 mt-3 text-xs text-zinc-400">
+                  <span className="flex items-center gap-1">
+                    <Clock className="w-3 h-3" />
+                    {new Date(w.created_at).toLocaleDateString()}
+                  </span>
+                  {isAdmin && (
+                    <span className="flex items-center gap-1">
+                      <Users className="w-3 h-3" />
+                      By {w.creator_name}
+                    </span>
+                  )}
+                  <span className="flex items-center gap-1">
+                    <ChevronRight className="w-3 h-3" />
+                    {w.steps.length} Steps
+                  </span>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                {(w.status ?? '').toString().trim().toLowerCase() === 'approved' && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onStartRequest(w);
+                    }}
+                    className="bg-indigo-600 text-white px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-indigo-700 transition-colors flex items-center gap-1"
+                  >
+                    <Send className="w-3 h-3" />
+                    Start Request
+                  </button>
+                )}
+                <div className="w-8 h-8 rounded-full bg-zinc-50 flex items-center justify-center group-hover:bg-indigo-50 transition-colors">
+                  <ChevronRight className="w-4 h-4 text-zinc-400 group-hover:text-indigo-600" />
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <AnimatePresence>
+        {selectedWorkflow && (
+          <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden"
+            >
+              <div className="p-6 border-b border-zinc-100 flex items-center justify-between bg-zinc-50">
+                <div className="flex items-center gap-3">
+                  <div>
+                    <h2 className="text-xl font-bold text-zinc-900">{selectedWorkflow.name}</h2>
+                    <p className="text-sm text-zinc-500">Template created on {new Date(selectedWorkflow.created_at).toLocaleString()}</p>
+                  </div>
+                  <span className={cn(
+                    "text-[10px] uppercase font-bold px-2 py-0.5 rounded-full",
+                    selectedWorkflow.status === 'approved' ? "bg-emerald-100 text-emerald-700" :
+                    selectedWorkflow.status === 'rejected' ? "bg-red-100 text-red-700" :
+                    "bg-amber-100 text-amber-700"
+                  )}>
+                    {selectedWorkflow.status}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {(canCreateTemplates || (canApproveTemplates && selectedWorkflow.status === 'pending')) && !isEditing && (
+                    <button 
+                      onClick={() => {
+                        setEditData({ 
+                          name: selectedWorkflow.name, 
+                          category: (selectedWorkflow as Workflow).category || 'general',
+                          steps: [...selectedWorkflow.steps],
+                          table_columns: [...(selectedWorkflow.table_columns || [])],
+                          attachments_required: !!selectedWorkflow.attachments_required
+                        });
+                        setEditNewColumnName('');
+                        setIsEditing(true);
+                      }}
+                      className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-indigo-200 text-indigo-600 text-xs font-bold hover:bg-indigo-50 transition-all"
+                    >
+                      <Edit2 className="w-3.5 h-3.5" />
+                      Edit Template
+                    </button>
+                  )}
+                  <button onClick={() => { setSelectedWorkflow(null); setIsEditing(false); }} className="text-zinc-400 hover:text-zinc-600">
+                    <XCircle className="w-6 h-6" />
+                  </button>
+                </div>
+              </div>
+              <div className="p-6 space-y-6 max-h-[70vh] overflow-y-auto">
+                {isEditing ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs font-bold text-zinc-500 uppercase mb-1 block">Template Name</label>
+                      <input
+                        type="text"
+                        className="w-full px-3 py-2 rounded-lg border border-zinc-300 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                        value={editData.name}
+                        onChange={(e) => setEditData({ ...editData, name: e.target.value })}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-xs font-bold text-zinc-500 uppercase mb-1 block">Data Table Columns</label>
+                      <div className="flex items-center justify-between gap-3">
+                        <input
+                          type="text"
+                          placeholder="e.g., Amount, Qty"
+                          className="flex-1 text-xs px-3 py-2 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+                          value={editNewColumnName}
+                          onChange={(e) => setEditNewColumnName(e.target.value)}
+                          onKeyPress={(e) => e.key === 'Enter' && (e.preventDefault(), addEditColumn())}
+                        />
+                        <button
+                          type="button"
+                          onClick={addEditColumn}
+                          className="text-xs bg-emerald-50 text-emerald-600 px-3 py-2 rounded-lg font-bold hover:bg-emerald-100 transition-colors shrink-0"
+                        >
+                          + Add Column
+                        </button>
+                      </div>
+
+                      {editData.table_columns.length === 0 && (
+                        <p className="text-xs text-zinc-400 italic">No custom columns defined.</p>
+                      )}
+
+                      {editData.table_columns.length > 0 && (
+                        <div className="flex flex-wrap gap-2">
+                          {editData.table_columns.map((col, idx) => (
+                            <div
+                              key={`${col}-${idx}`}
+                              className="flex items-center gap-2 bg-zinc-100 px-3 py-1 rounded-full text-xs text-zinc-600 border border-zinc-200"
+                            >
+                              <input
+                                type="text"
+                                className="bg-transparent border-none focus:ring-0 text-xs w-28 outline-none font-medium"
+                                value={col}
+                                onChange={(e) => updateEditColumn(idx, e.target.value)}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => removeEditColumn(idx)}
+                                className="text-zinc-400 hover:text-red-500"
+                                title="Remove column"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {(isPR || isPO) && (
+                        <p className="text-[11px] text-zinc-400 pt-1">
+                          Note: procurement PR/PO templates use fixed columns in request forms.
+                        </p>
+                      )}
+                    </div>
+
+                    <div>
+                      <label className="text-xs font-bold text-zinc-500 uppercase mb-2 block">Approval Steps</label>
+                      <div className="space-y-2">
+                        {editData.steps.map((step, idx) => (
+                          <div key={step.id || idx} className="p-3 bg-zinc-50 rounded-lg border border-zinc-200 flex gap-2 items-center">
+                            <div className="w-6 h-6 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center text-[10px] font-bold shrink-0">
+                              {idx + 1}
+                            </div>
+                            <input
+                              type="text"
+                              className="flex-1 px-2 py-1 rounded border border-zinc-300 text-xs outline-none focus:ring-1 focus:ring-indigo-500"
+                              disabled={isPR || isPO}
+                              value={step.label}
+                              onChange={(e) => {
+                                const newSteps = [...editData.steps];
+                                newSteps[idx] = { ...newSteps[idx], label: e.target.value };
+                                setEditData({ ...editData, steps: newSteps });
+                              }}
+                              placeholder="Step Label"
+                            />
+                            <select
+                              className="px-2 py-1 rounded border border-zinc-300 text-xs outline-none focus:ring-1 focus:ring-indigo-500 bg-white"
+                              disabled={isPR || isPO}
+                              value={step.approverRole}
+                              onChange={(e) => {
+                                const newSteps = [...editData.steps];
+                                newSteps[idx] = { ...newSteps[idx], approverRole: e.target.value };
+                                setEditData({ ...editData, steps: newSteps });
+                              }}
+                            >
+                              <option value="Preparer">Preparer</option>
+                              <option value="Checker">Checker</option>
+                              <option value="Approver">Approver</option>
+                              <option value="Director">Director</option>
+                              {availableRoles.filter(r => !['admin', 'user', 'preparer', 'checker', 'approver', 'director'].includes(r.name.toLowerCase())).map(r => (
+                                <option key={r.id} value={r.name}>{r.name}</option>
+                              ))}
+                            </select>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 bg-zinc-50 p-3 rounded-lg border border-zinc-200">
+                      <input
+                        type="checkbox"
+                        id="edit_attachments_required"
+                        className="w-4 h-4 text-indigo-600 rounded border-zinc-300 focus:ring-indigo-500"
+                        checked={editData.attachments_required}
+                        onChange={(e) => setEditData({ ...editData, attachments_required: e.target.checked })}
+                      />
+                      <label htmlFor="edit_attachments_required" className="text-sm font-medium text-zinc-700 cursor-pointer">
+                        Require attachments when submitting requests
+                      </label>
+                    </div>
+                    <div className="flex gap-3 pt-4">
+                      <button
+                        onClick={() => setIsEditing(false)}
+                        className="flex-1 px-4 py-2 rounded-lg border border-zinc-200 text-zinc-600 font-bold hover:bg-zinc-50 transition-all"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleSaveEdit}
+                        disabled={loading}
+                        className="flex-1 px-4 py-2 rounded-lg bg-indigo-600 text-white font-bold hover:bg-indigo-700 transition-all disabled:opacity-50"
+                      >
+                        {loading ? 'Saving...' : 'Save Changes'}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                {selectedWorkflow.table_columns && selectedWorkflow.table_columns.length > 0 && (
+                  <section>
+                    <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Data Table Columns</h4>
+                    <div className="flex flex-wrap gap-2">
+                      {selectedWorkflow.table_columns.map((col, i) => (
+                        <span key={`${col}-${i}`} className="bg-zinc-100 px-3 py-1 rounded-full text-xs text-zinc-600 border border-zinc-200">
+                          {col}
+                        </span>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                <section>
+                  <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-3">Approval Chain</h4>
+                  <div className="space-y-3">
+                    {selectedWorkflow.steps.map((step, i) => (
+                      <div key={step.id} className="flex items-center gap-4">
+                        <div className="w-8 h-8 rounded-full bg-indigo-600 text-white flex items-center justify-center text-xs font-bold shrink-0">
+                          {i + 1}
+                        </div>
+                        <div className="flex-1 bg-zinc-50 p-3 rounded-lg border border-zinc-200">
+                          <p className="font-semibold text-zinc-900 text-sm">{step.label}</p>
+                          <p className="text-xs text-zinc-500">Approver: {step.approverRole}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+
+                <section>
+                  <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Requirements</h4>
+                  <div className="flex items-center gap-2 text-sm text-zinc-600">
+                    <div className={cn(
+                      "w-4 h-4 rounded-full flex items-center justify-center",
+                      selectedWorkflow.attachments_required ? "bg-indigo-100 text-indigo-600" : "bg-zinc-100 text-zinc-400"
+                    )}>
+                      {selectedWorkflow.attachments_required ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
+                    </div>
+                    {selectedWorkflow.attachments_required ? "Attachments are required for requests" : "Attachments are optional"}
+                  </div>
+                </section>
+              </>
+            )}
+          </div>
+              <div className="p-6 bg-zinc-50 border-t border-zinc-100 flex gap-3">
+                {(isAdmin || canApproveTemplates) && selectedWorkflow.status === 'pending' && (
+                  <>
+                    <button
+                      onClick={() => handleStatusUpdate(selectedWorkflow.id, 'approved')}
+                      className="flex-1 bg-emerald-600 text-white py-2 rounded-lg font-bold hover:bg-emerald-700 transition-colors flex items-center justify-center gap-2"
+                    >
+                      <CheckCircle2 className="w-4 h-4" />
+                      Approve Template
+                    </button>
+                    <button
+                      onClick={() => handleStatusUpdate(selectedWorkflow.id, 'rejected')}
+                      className="flex-1 bg-red-600 text-white py-2 rounded-lg font-bold hover:bg-red-700 transition-colors flex items-center justify-center gap-2"
+                    >
+                      <XCircle className="w-4 h-4" />
+                      Reject
+                    </button>
+                  </>
+                )}
+                {selectedWorkflow.status === 'approved' && (
+                  <button
+                    onClick={() => {
+                      onStartRequest(selectedWorkflow);
+                      setSelectedWorkflow(null);
+                    }}
+                    className="flex-1 bg-indigo-600 text-white py-2 rounded-lg font-bold hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2"
+                  >
+                    <Send className="w-4 h-4" />
+                    Start Request from this Template
+                  </button>
+                )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+const AVAILABLE_PERMISSIONS = [
+  { key: 'admin', label: 'Full Admin Access', description: 'Can perform all actions in the system' },
+  { key: 'manage_users', label: 'Manage Users', description: 'Can create and edit users' },
+  { key: 'create_templates', label: 'Create Templates', description: 'Can create and manage workflow templates' },
+  { key: 'approve_templates', label: 'Approve Templates', description: 'Can approve or reject new workflow templates' },
+  { key: 'view_history', label: 'View All History', description: 'Can view all workflow requests across departments' },
+  { key: 'edit_requests', label: 'Edit Requests', description: 'Can edit pending requests during approval' },
+];
+
+const RoleManager = ({ roles, onRefresh }: { roles: Role[], onRefresh: () => void }) => {
+  const [newRoleName, setNewRoleName] = useState('');
+  const [newRolePermissions, setNewRolePermissions] = useState<string[]>([]);
+  const [editingRole, setEditingRole] = useState<Role | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleCreate = async () => {
+    if (!newRoleName.trim()) return;
+    setLoading(true);
+    try {
+      await api.request('/api/roles', {
+        method: 'POST',
+        body: JSON.stringify({ 
+          name: newRoleName.trim(),
+          permissions: newRolePermissions
+        }),
+      });
+      setNewRoleName('');
+      setNewRolePermissions([]);
+      onRefresh();
+      toast.success('Role created');
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleUpdate = async () => {
+    if (!editingRole || !editingRole.name.trim()) return;
+    setLoading(true);
+    try {
+      await api.request(`/api/roles/${editingRole.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ 
+          name: editingRole.name.trim(),
+          permissions: editingRole.permissions
+        }),
+      });
+      setEditingRole(null);
+      onRefresh();
+      toast.success('Role updated');
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const togglePermission = (role: 'new' | 'editing', permKey: string) => {
+    if (role === 'new') {
+      setNewRolePermissions(prev => 
+        prev.includes(permKey) ? prev.filter(p => p !== permKey) : [...prev, permKey]
+      );
+    } else if (editingRole) {
+      const currentPerms = editingRole.permissions || [];
+      const newPerms = currentPerms.includes(permKey)
+        ? currentPerms.filter(p => p !== permKey)
+        : [...currentPerms, permKey];
+      setEditingRole({ ...editingRole, permissions: newPerms });
+    }
+  };
+
+  return (
+    <div className="bg-white rounded-xl border border-zinc-200 p-6 shadow-sm mb-6">
+      <h3 className="text-lg font-bold text-zinc-900 mb-4 flex items-center gap-2">
+        <Shield className="w-5 h-5 text-indigo-600" />
+        Manage Custom Roles
+      </h3>
+      
+      <div className="space-y-4 mb-6">
+        <div className="flex gap-2">
+          <input
+            type="text"
+            placeholder="New role name..."
+            className="flex-1 px-4 py-2 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+            value={newRoleName}
+            onChange={(e) => setNewRoleName(e.target.value)}
+            onKeyPress={(e) => e.key === 'Enter' && handleCreate()}
+          />
+          <button
+            onClick={handleCreate}
+            disabled={loading || !newRoleName.trim()}
+            className="bg-indigo-600 text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-indigo-700 transition-colors disabled:opacity-50"
+          >
+            Add Role
+          </button>
+        </div>
+        
+        <div className="bg-zinc-50 p-4 rounded-lg border border-zinc-200">
+          <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Assign Permissions to New Role</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+            {AVAILABLE_PERMISSIONS.map(perm => (
+              <label key={perm.key} className="flex items-start gap-2 p-2 rounded border border-white hover:border-zinc-200 cursor-pointer transition-colors">
+                <input
+                  type="checkbox"
+                  checked={newRolePermissions.includes(perm.key)}
+                  onChange={() => togglePermission('new', perm.key)}
+                  className="mt-1 w-3 h-3 rounded text-indigo-600 focus:ring-indigo-500"
+                />
+                <div>
+                  <p className="text-xs font-bold text-zinc-700">{perm.label}</p>
+                  <p className="text-[9px] text-zinc-500 leading-tight">{perm.description}</p>
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        {roles.map((role) => (
+          <div key={role.id} className="flex flex-col p-3 bg-zinc-50 rounded-lg border border-zinc-200 group">
+            {editingRole?.id === role.id ? (
+              <div className="space-y-3">
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    className="flex-1 px-2 py-1 rounded border border-zinc-300 text-sm outline-none focus:ring-1 focus:ring-indigo-500"
+                    value={editingRole.name}
+                    onChange={(e) => setEditingRole({ ...editingRole, name: e.target.value })}
+                    autoFocus
+                  />
+                  <button onClick={handleUpdate} className="text-xs font-bold text-emerald-600 hover:underline">Save</button>
+                  <button onClick={() => setEditingRole(null)} className="text-xs font-bold text-zinc-400 hover:underline">Cancel</button>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 p-2 bg-white rounded border border-zinc-200">
+                  {AVAILABLE_PERMISSIONS.map(perm => (
+                    <label key={perm.key} className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={(editingRole.permissions || []).includes(perm.key)}
+                        onChange={() => togglePermission('editing', perm.key)}
+                        className="w-3 h-3 rounded text-indigo-600 focus:ring-indigo-500"
+                      />
+                      <span className="text-[10px] text-zinc-600">{perm.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between">
+                <div className="flex flex-col gap-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-zinc-700 uppercase tracking-wider">{role.name}</span>
+                    {['admin', 'user'].includes(role.name) && (
+                      <span className="text-[8px] bg-zinc-200 text-zinc-500 px-1.5 py-0.5 rounded font-bold uppercase">System</span>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {(role.permissions || []).map((p, i) => (
+                      <span key={`${p}-${i}`} className="text-[8px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded border border-indigo-100 font-medium">
+                        {AVAILABLE_PERMISSIONS.find(ap => ap.key === p)?.label || p}
+                      </span>
+                    ))}
+                    {(!role.permissions || role.permissions.length === 0) && (
+                      <span className="text-[8px] text-zinc-400 italic">No special permissions</span>
+                    )}
+                  </div>
+                </div>
+                {!['admin', 'user'].includes(role.name) && (
+                  <div className="flex items-center gap-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button onClick={() => setEditingRole(role)} className="text-zinc-400 hover:text-indigo-600">
+                      <Edit2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const UserModal = ({ 
+  user, 
+  availableRoles, 
+  onClose, 
+  onSuccess 
+}: { 
+  user?: User | null, 
+  availableRoles: Role[], 
+  onClose: () => void, 
+  onSuccess: () => void 
+}) => {
+  const [username, setUsername] = useState(user?.username || '');
+  const [password, setPassword] = useState('');
+  const [department, setDepartment] = useState(user?.department || 'General');
+  const [selectedRoles, setSelectedRoles] = useState<string[]>(user?.roles || ['user']);
+  const [loading, setLoading] = useState(false);
+
+  const departments = ['IT', 'HR', 'Finance', 'Sales', 'Management', 'General'];
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (selectedRoles.length === 0) {
+      toast.error('User must have at least one role');
+      return;
+    }
+    setLoading(true);
+    try {
+      const endpoint = user ? `/api/users/${user.id}` : '/api/users';
+      const method = user ? 'PATCH' : 'POST';
+      const body: any = { username, roles: selectedRoles, department };
+      if (password) body.password = password;
+
+      await api.request(endpoint, {
+        method,
+        body: JSON.stringify(body),
+      });
+      toast.success(user ? 'User updated' : 'User created');
+      onSuccess();
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleRole = (role: string) => {
+    setSelectedRoles(prev => 
+      prev.includes(role) ? prev.filter(r => r !== role) : [...prev, role]
+    );
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <motion.div 
+        initial={{ opacity: 0, scale: 0.95 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden"
+      >
+        <div className="p-6 border-b border-zinc-100 flex justify-between items-center">
+          <h3 className="text-xl font-bold text-zinc-900">{user ? 'Edit User' : 'Create New User'}</h3>
+          <button onClick={onClose} className="text-zinc-400 hover:text-zinc-600">
+            <XCircle className="w-6 h-6" />
+          </button>
+        </div>
+        <form onSubmit={handleSubmit} className="p-6 space-y-4">
+          <div>
+            <label className="block text-xs font-bold text-zinc-500 uppercase mb-1">Username</label>
+            <input
+              type="text"
+              required
+              className="w-full px-4 py-2 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-zinc-500 uppercase mb-1">
+              {user ? 'New Password (leave blank to keep current)' : 'Password'}
+            </label>
+            <input
+              type="password"
+              required={!user}
+              className="w-full px-4 py-2 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-zinc-500 uppercase mb-1">Department</label>
+            <select
+              className="w-full px-4 py-2 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+              value={department}
+              onChange={(e) => setDepartment(e.target.value)}
+            >
+              {departments.map(d => <option key={d} value={d}>{d}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-zinc-500 uppercase mb-2">Roles</label>
+            <div className="grid grid-cols-2 gap-2">
+              {availableRoles.map(role => (
+                <label key={role.id} className="flex items-center gap-2 p-2 rounded-lg border border-zinc-100 hover:bg-zinc-50 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selectedRoles.includes(role.name)}
+                    onChange={() => toggleRole(role.name)}
+                    className="w-4 h-4 rounded text-indigo-600 focus:ring-indigo-500"
+                  />
+                  <span className="text-sm text-zinc-700">{role.name}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+          <div className="pt-4 flex gap-3">
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex-1 px-4 py-2 rounded-lg border border-zinc-200 text-zinc-600 font-bold hover:bg-zinc-50 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={loading}
+              className="flex-1 px-4 py-2 rounded-lg bg-indigo-600 text-white font-bold hover:bg-indigo-700 transition-colors disabled:opacity-50"
+            >
+              {loading ? 'Saving...' : user ? 'Update User' : 'Create User'}
+            </button>
+          </div>
+        </form>
+      </motion.div>
+    </div>
+  );
+};
+
+const UserManagement = ({ roles: availableRoles, onRolesRefresh }: { roles: Role[], onRolesRefresh: () => void }) => {
+  const [users, setUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedUser, setSelectedUser] = useState<User | null>(null);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+
+  const fetchUsers = async () => {
+    try {
+      const data = await api.request('/api/users');
+      setUsers(data);
+    } catch (err) {
+      toast.error('Failed to load users');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchUsers();
+  }, []);
+
+  if (loading) return <div className="text-center py-12">Loading users...</div>;
+
+  return (
+    <div className="space-y-6">
+      <RoleManager roles={availableRoles} onRefresh={onRolesRefresh} />
+      
+      <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden shadow-sm">
+        <div className="p-6 border-b border-zinc-100 flex justify-between items-center">
+          <h2 className="text-xl font-bold text-zinc-900 flex items-center gap-2">
+            <Users className="w-5 h-5 text-indigo-600" />
+            User Management
+          </h2>
+          <button
+            onClick={() => {
+              setSelectedUser(null);
+              setIsModalOpen(true);
+            }}
+            className="bg-indigo-600 text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-indigo-700 transition-colors flex items-center gap-2"
+          >
+            <UserPlus className="w-4 h-4" />
+            Add User
+          </button>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left">
+            <thead className="bg-zinc-50 text-zinc-500 text-xs uppercase font-bold">
+              <tr>
+                <th className="px-6 py-3">Username</th>
+                <th className="px-6 py-3">Department</th>
+                <th className="px-6 py-3">Roles</th>
+                <th className="px-6 py-3 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-100">
+              {users.map((u) => (
+                <tr key={u.id} className="hover:bg-zinc-50 transition-colors text-sm">
+                  <td className="px-6 py-4 font-medium text-zinc-900">{u.username}</td>
+                  <td className="px-6 py-4">
+                    <span className="px-2 py-1 bg-zinc-100 text-zinc-600 rounded text-xs font-medium uppercase tracking-wider">
+                      {u.department}
+                    </span>
+                  </td>
+                  <td className="px-6 py-4">
+                    <div className="flex flex-wrap gap-1">
+                      {(u.roles || []).map((r, i) => (
+                        <span key={`${r}-${i}`} className={cn(
+                          "px-2 py-0.5 rounded-full text-[8px] font-bold uppercase",
+                          r === 'admin' ? "bg-indigo-100 text-indigo-700" : "bg-zinc-100 text-zinc-600"
+                        )}>
+                          {r}
+                        </span>
+                      ))}
+                    </div>
+                  </td>
+                  <td className="px-6 py-4 text-right">
+                    <div className="flex justify-end gap-2">
+                      <button 
+                        onClick={() => {
+                          setSelectedUser(u);
+                          setIsModalOpen(true);
+                        }}
+                        className="p-1.5 text-zinc-400 hover:text-indigo-600 transition-colors"
+                        title="Edit User"
+                      >
+                        <Edit2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <AnimatePresence>
+        {isModalOpen && (
+          <UserModal 
+            user={selectedUser}
+            availableRoles={availableRoles}
+            onClose={() => setIsModalOpen(false)}
+            onSuccess={() => {
+              setIsModalOpen(false);
+              fetchUsers();
+            }}
+          />
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: string }) => {
+  const [requests, setRequests] = useState<WorkflowRequest[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [activeSubTab, setActiveSubTab] = useState<'pr' | 'po' | 'invoice'>('pr');
+  const [filters, setFilters] = useState({
+    status: '',
+    department: '',
+    search: '',
+    entity: ''
+  });
+  const [tableSortBy, setTableSortBy] = useState<'id' | 'type' | 'entity' | 'requester' | 'items' | 'supplier' | 'total' | 'status' | 'date'>('date');
+  const [tableSortDirection, setTableSortDirection] = useState<'asc' | 'desc'>('desc');
+  const [selectedRequest, setSelectedRequest] = useState<WorkflowRequest | null>(null);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [approvals, setApprovals] = useState<RequestApproval[]>([]);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editData, setEditData] = useState({ title: '', details: '', line_items: [] as any[], tax_rate: 18, discount_rate: 0, currency: '', cost_center: '', section: '' });
+  const [viewingPdf, setViewingPdf] = useState<{ url: string; fileName: string } | null>(null);
+  const [detailsViewMode, setDetailsViewMode] = useState<'details' | 'pdf'>('details');
+  const [detailsPdfPreview, setDetailsPdfPreview] = useState<{ url: string; fileName: string } | null>(null);
+  const costCenterOptions = useCostCenterOptions();
+
+  const isPurchasing = user.roles?.some(r => r.toLowerCase() === 'purchasing');
+  const isAdmin = user.roles?.some(r => r.toLowerCase() === 'admin') || user.permissions?.includes('admin');
+  const canEdit = selectedRequest && (
+    (isWorkflowRequestPending(selectedRequest) && (user.id === selectedRequest.requester_id || user.permissions?.includes('admin'))) ||
+    (isWorkflowRequestFullyApproved(selectedRequest) && isPR_Only(selectedRequest) && isPurchasing)
+  );
+
+  const fetchProcurementRequests = async () => {
+    setLoading(true);
+    try {
+      const query = new URLSearchParams(filters).toString();
+      const data = await api.request(`/api/procurement/requests?${query}`, { skipEntity: true });
+      setRequests(data);
+    } catch (err) {
+      toast.error('Failed to fetch procurement requests');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchDetails = async (id: number) => {
+    try {
+      const [attData, appData] = await Promise.all([
+        api.request(`/api/workflow-requests/${id}/attachments`),
+        api.request(`/api/workflow-requests/${id}/approvals`)
+      ]);
+      setAttachments(attData);
+      setApprovals(appData);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleSaveEdit = async () => {
+    if (!selectedRequest) return;
+    if (
+      (isPRRequest(selectedRequest) || isPO_Only(selectedRequest) || isSRRequest(selectedRequest)) &&
+      !String(editData.currency).trim()
+    ) {
+      return toast.error('Please select a currency.');
+    }
+    if (
+      isSRRequest(selectedRequest) &&
+      !SECTION_OPTIONS.includes(String(editData.section || "").trim().toUpperCase() as (typeof SECTION_OPTIONS)[number])
+    ) {
+      return toast.error('Please select a section.');
+    }
+    setLoading(true);
+    try {
+      const detailsOut = isProcurementPRorPORequest(selectedRequest) ? '' : editData.details;
+      const taxUnit = procurementPercentToUnitRate(Number(editData.tax_rate) || 0);
+      const discUnit = procurementPercentToUnitRate(Number(editData.discount_rate) || 0);
+      const sectionOut = isSRRequest(selectedRequest) ? sectionPayloadFromSelection(editData.section) : editData.section;
+      const curOut =
+        isPRRequest(selectedRequest) || isPO_Only(selectedRequest) || isSRRequest(selectedRequest)
+          ? String(editData.currency).trim()
+          : undefined;
+      await api.request(`/api/workflow-requests/${selectedRequest.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          ...editData,
+          tax_rate: taxUnit,
+          discount_rate: discUnit,
+          details: detailsOut,
+          currency: curOut,
+          section: sectionOut,
+        }),
+      });
+      toast.success('Request updated');
+      setIsEditing(false);
+      fetchProcurementRequests();
+      // Update local selected request
+      setSelectedRequest({
+        ...selectedRequest,
+        ...editData,
+        tax_rate: taxUnit,
+        discount_rate: discUnit,
+        currency: curOut !== undefined ? curOut : selectedRequest.currency,
+        details: detailsOut,
+        section: sectionOut,
+      });
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResubmit = async (id: number) => {
+    setLoading(true);
+    try {
+      await api.request(`/api/workflow-requests/${id}/resubmit`, {
+        method: 'POST',
+      });
+      toast.success('Request resubmitted successfully!');
+      fetchProcurementRequests();
+      setSelectedRequest(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handlePrintPR = (request: WorkflowRequest) => {
+    setViewingPdf((prev) => {
+      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+      return createWorkflowRequestPdfPreview(request);
+    });
+    toast.success('PDF ready to view');
+  };
+
+  const handleShowRequestPdfInline = (request: WorkflowRequest) => {
+    setDetailsPdfPreview((prev) => {
+      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+      return createWorkflowRequestPdfPreview(request);
+    });
+    setDetailsViewMode('pdf');
+  };
+
+  const handleGeneratePODraft = (request: WorkflowRequest) => {
+    const doc = new jsPDF();
+    const margin = 20;
+    let y = 20;
+
+    // Header
+    doc.setFontSize(20);
+    doc.setTextColor(79, 70, 229); // Indigo-600
+    doc.text('PURCHASE ORDER DRAFT', margin, y);
+    y += 10;
+
+    doc.setFontSize(10);
+    doc.setTextColor(100);
+    doc.text(`Generated on: ${new Date().toLocaleString()}`, margin, y);
+    y += 15;
+
+    // Request Info
+    doc.setFontSize(12);
+    doc.setTextColor(0);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Request Information', margin, y);
+    y += 7;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.text(`PR ID: ${displayRequestSerial(request)}`, margin, y);
+    y += 5;
+    doc.text(`Title: ${request.title}`, margin, y);
+    y += 5;
+    doc.text(`Department: ${request.department}`, margin, y);
+    y += 5;
+    doc.text(`Entity: ${entityLegalDisplayName(request.entity)} (${request.entity?.trim() || '-'})`, margin, y);
+    y += 15;
+
+    // Line Items Table
+    doc.setFontSize(12);
+    doc.setFont('helvetica', 'bold');
+    doc.text('Order Items', margin, y);
+    y += 7;
+
+    const headers = ['Item', 'Qty', 'Unit Price', 'Total'];
+    const colWidths = [80, 20, 35, 35];
+    
+    // Table Header
+    doc.setFillColor(244, 244, 245);
+    doc.rect(margin, y - 5, 170, 7, 'F');
+    doc.setFontSize(9);
+    let x = margin;
+    headers.forEach((h, i) => {
+      doc.text(h, x + 2, y);
+      x += colWidths[i];
+    });
+    y += 7;
+
+    // Table Rows
+    doc.setFont('helvetica', 'normal');
+    request.line_items?.forEach((item) => {
+      const qty = parseFloat(item['Quantity'] || '0');
+      const price = parseFloat(item['Unit Price'] || '0');
+      const rowTot = qty * price;
+
+      x = margin;
+      doc.text(String(item['Item'] || '-'), x + 2, y, { maxWidth: colWidths[0] - 4 });
+      doc.text(String(qty), x + colWidths[0] + 2, y);
+      doc.text(`${procurementCurrencyPrefix(request.currency)}${price.toLocaleString()}`.trim(), x + colWidths[0] + colWidths[1] + 2, y);
+      doc.text(`${procurementCurrencyPrefix(request.currency)}${rowTot.toLocaleString()}`.trim(), x + colWidths[0] + colWidths[1] + colWidths[2] + 2, y);
+      y += 7;
+    });
+
+    y += 5;
+    const m = procurementMoneyTotals(request);
+    const curp = procurementCurrencyPrefix(request.currency);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`Subtotal: ${curp}${m.subtotal.toLocaleString()}`.trim(), 110, y);
+    y += 5;
+    doc.text(`Discount (${(m.discountRate * 100).toFixed(0)}%): ${curp}${m.discountAmount.toLocaleString()}`.trim(), 110, y);
+    y += 5;
+    doc.text(`${procurementTaxLabelForEntity(request.entity)} (${(m.taxRate * 100).toFixed(0)}%): ${curp}${m.taxAmount.toLocaleString()}`.trim(), 110, y);
+    y += 7;
+    doc.setFontSize(12);
+    doc.text(`TOTAL AMOUNT: ${curp}${m.total.toLocaleString()}`.trim(), 110, y);
+
+    doc.save(`PO_Draft_${displayRequestSerial(request)}.pdf`);
+    toast.success('PO Draft PDF generated');
+  };
+
+  const handleConvertToPO = async (id: number) => {
+    if (!window.confirm('Are you sure you want to convert this PR to a PO Request? This will create a new PO request based on this PR.')) return;
+    setLoading(true);
+    try {
+      const result = await api.request(`/api/workflow-requests/${id}/convert-to-po`, {
+        method: 'POST',
+      });
+      toast.success(`Successfully converted to PO: ${toUpperSerial(result.formatted_id)}`);
+      fetchProcurementRequests();
+      setSelectedRequest(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchProcurementRequests();
+  }, [filters, entityScope]);
+
+  const procurementEntities = Array.from(
+    new Set(
+      requests
+        .map((r) => String(r.entity || '').trim())
+        .filter((e) => !!e)
+    )
+  );
+
+  const filteredRequests = requests.filter(r => {
+    const templateName = r.template_name.toLowerCase();
+    if (activeSubTab === 'pr') return templateName.includes('purchase request') || templateName.includes('pr');
+    if (activeSubTab === 'po') return templateName.includes('purchase order') || templateName.includes('po');
+    if (activeSubTab === 'invoice') return templateName.includes('invoice');
+    return true;
+  });
+
+  const toggleProcurementSort = (
+    next: 'id' | 'type' | 'entity' | 'requester' | 'items' | 'supplier' | 'total' | 'status' | 'date'
+  ) => {
+    if (tableSortBy === next) {
+      setTableSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
+      return;
+    }
+    setTableSortBy(next);
+    setTableSortDirection(next === 'date' ? 'desc' : 'asc');
+  };
+
+  const sortedFilteredRequests = [...filteredRequests].sort((a, b) => {
+    const dir = tableSortDirection === 'asc' ? 1 : -1;
+    const byText = (x: string, y: string) => x.localeCompare(y, undefined, { sensitivity: 'base' }) * dir;
+    const supplierOf = (r: WorkflowRequest) =>
+      String(r.line_items?.[0]?.['Suggested Supplier'] || r.line_items?.[0]?.['Supplier'] || '');
+    if (tableSortBy === 'date') return (new Date(a.created_at).getTime() - new Date(b.created_at).getTime()) * dir;
+    if (tableSortBy === 'id') return byText(displayRequestSerial(a), displayRequestSerial(b));
+    if (tableSortBy === 'type') return byText(`${a.template_name} ${a.title || ''}`, `${b.template_name} ${b.title || ''}`);
+    if (tableSortBy === 'entity') return byText(String(a.entity || ''), String(b.entity || ''));
+    if (tableSortBy === 'requester') return byText(String(a.requester_name || ''), String(b.requester_name || ''));
+    if (tableSortBy === 'items') return ((a.line_items?.length || 0) - (b.line_items?.length || 0)) * dir;
+    if (tableSortBy === 'supplier') return byText(supplierOf(a), supplierOf(b));
+    if (tableSortBy === 'total') return (procurementMoneyTotals(a).total - procurementMoneyTotals(b).total) * dir;
+    return byText(formatWorkflowRequestStatusLabel(a), formatWorkflowRequestStatusLabel(b));
+  });
+
+  const procurementSortIndicator = (
+    key: 'id' | 'type' | 'entity' | 'requester' | 'items' | 'supplier' | 'total' | 'status' | 'date'
+  ) => (tableSortBy === key ? (tableSortDirection === 'asc' ? ' ↑' : ' ↓') : '');
+
+  return (
+    <div className="h-full min-h-0 flex flex-col gap-6">
+      {/* Header & Tabs */}
+      <div className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm">
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-3">
+            <div className="w-12 h-12 bg-indigo-100 rounded-xl flex items-center justify-center">
+              <ShoppingCart className="w-6 h-6 text-indigo-600" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold text-zinc-900">Procurement Center</h1>
+              <p className="text-sm text-zinc-500">Manage and monitor all procurement-related workflows</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex gap-2 p-1 bg-zinc-100 rounded-xl w-fit">
+          <button
+            onClick={() => setActiveSubTab('pr')}
+            className={cn(
+              "px-4 py-2 rounded-lg text-sm font-bold transition-all flex items-center gap-2",
+              activeSubTab === 'pr' ? "bg-white text-indigo-600 shadow-sm" : "text-zinc-500 hover:text-zinc-700"
+            )}
+          >
+            <ClipboardList className="w-4 h-4" />
+            Purchase Requests (PR)
+          </button>
+          <button
+            onClick={() => setActiveSubTab('po')}
+            className={cn(
+              "px-4 py-2 rounded-lg text-sm font-bold transition-all flex items-center gap-2",
+              activeSubTab === 'po' ? "bg-white text-indigo-600 shadow-sm" : "text-zinc-500 hover:text-zinc-700"
+            )}
+          >
+            <Package className="w-4 h-4" />
+            Purchase Orders (PO)
+          </button>
+          <button
+            onClick={() => setActiveSubTab('invoice')}
+            className={cn(
+              "px-4 py-2 rounded-lg text-sm font-bold transition-all flex items-center gap-2",
+              activeSubTab === 'invoice' ? "bg-white text-indigo-600 shadow-sm" : "text-zinc-500 hover:text-zinc-700"
+            )}
+          >
+            <Receipt className="w-4 h-4" />
+            Invoice Requests
+          </button>
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div className="bg-white p-4 rounded-2xl border border-zinc-200 shadow-sm flex flex-wrap gap-4 items-center">
+        <div className="flex-1 min-w-[200px] relative">
+          <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
+          <input
+            type="text"
+            placeholder="Search by ID or Title..."
+            className="w-full pl-10 pr-4 py-2 rounded-xl border border-zinc-200 outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+            value={filters.search}
+            onChange={(e) => setFilters({ ...filters, search: e.target.value })}
+          />
+        </div>
+        <select
+          className="px-4 py-2 rounded-xl border border-zinc-200 outline-none focus:ring-2 focus:ring-indigo-500 text-sm bg-white"
+          value={filters.status}
+          onChange={(e) => setFilters({ ...filters, status: e.target.value })}
+        >
+          <option value="">All Statuses</option>
+          <option value="pending">Pending</option>
+          <option value="approved">Approved</option>
+          <option value="rejected">Rejected</option>
+        </select>
+        <input
+          type="text"
+          placeholder="Department..."
+          className="px-4 py-2 rounded-xl border border-zinc-200 outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+          value={filters.department}
+          onChange={(e) => setFilters({ ...filters, department: e.target.value })}
+        />
+        <select
+          className="px-4 py-2 rounded-xl border border-zinc-200 outline-none focus:ring-2 focus:ring-indigo-500 text-sm bg-white"
+          value={filters.entity}
+          onChange={(e) => setFilters({ ...filters, entity: e.target.value })}
+        >
+          <option value="">All Entities</option>
+          {procurementEntities.map((ent) => (
+            <option key={ent} value={ent}>{ent}</option>
+          ))}
+        </select>
+        <button 
+          onClick={fetchProcurementRequests}
+          className="px-4 py-2 bg-zinc-900 text-white rounded-xl text-sm font-bold hover:bg-zinc-800 transition-colors"
+        >
+          Refresh
+        </button>
+      </div>
+
+      {/* Table */}
+      <div className="bg-white rounded-2xl border border-zinc-200 shadow-sm overflow-hidden flex-1 min-h-0">
+        <div className="w-full h-full overflow-auto">
+        <table className="w-full text-left border-collapse">
+          <thead>
+            <tr className="bg-zinc-50 border-b border-zinc-200 sticky top-0 z-10">
+              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                <button type="button" onClick={() => toggleProcurementSort('id')} className="hover:text-zinc-700 transition-colors">
+                  ID{procurementSortIndicator('id')}
+                </button>
+              </th>
+              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                <button type="button" onClick={() => toggleProcurementSort('type')} className="hover:text-zinc-700 transition-colors">
+                  Type/Title{procurementSortIndicator('type')}
+                </button>
+              </th>
+              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                <button type="button" onClick={() => toggleProcurementSort('entity')} className="hover:text-zinc-700 transition-colors">
+                  Entity{procurementSortIndicator('entity')}
+                </button>
+              </th>
+              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                <button type="button" onClick={() => toggleProcurementSort('requester')} className="hover:text-zinc-700 transition-colors">
+                  Requester{procurementSortIndicator('requester')}
+                </button>
+              </th>
+              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                <button type="button" onClick={() => toggleProcurementSort('items')} className="hover:text-zinc-700 transition-colors">
+                  Items{procurementSortIndicator('items')}
+                </button>
+              </th>
+              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                <button type="button" onClick={() => toggleProcurementSort('supplier')} className="hover:text-zinc-700 transition-colors">
+                  Supplier{procurementSortIndicator('supplier')}
+                </button>
+              </th>
+              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                <button type="button" onClick={() => toggleProcurementSort('total')} className="hover:text-zinc-700 transition-colors">
+                  Total{procurementSortIndicator('total')}
+                </button>
+              </th>
+              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                <button type="button" onClick={() => toggleProcurementSort('status')} className="hover:text-zinc-700 transition-colors">
+                  Status{procurementSortIndicator('status')}
+                </button>
+              </th>
+              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                <button type="button" onClick={() => toggleProcurementSort('date')} className="hover:text-zinc-700 transition-colors">
+                  Date{procurementSortIndicator('date')}
+                </button>
+              </th>
+              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider text-right">Action</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-zinc-100">
+            {loading ? (
+              <tr>
+                <td colSpan={10} className="px-6 py-12 text-center text-zinc-400 italic">Loading requests...</td>
+              </tr>
+            ) : sortedFilteredRequests.length === 0 ? (
+              <tr>
+                <td colSpan={10} className="px-6 py-12 text-center text-zinc-400 italic">No procurement requests found.</td>
+              </tr>
+            ) : (
+              sortedFilteredRequests.map((r) => {
+                const totalAmount = procurementMoneyTotals(r).total;
+
+                return (
+                  <tr 
+                    key={r.id} 
+                    className="hover:bg-zinc-50 transition-colors cursor-pointer group"
+                    onClick={() => {
+                      api.setActiveEntity(String(r.entity || '').trim() || null);
+                      setSelectedRequest(r);
+                      setDetailsViewMode('details');
+                      setDetailsPdfPreview((prev) => {
+                        if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+                        return null;
+                      });
+                      fetchDetails(r.id);
+                    }}
+                  >
+                    <td className="px-6 py-4 text-sm font-mono text-zinc-500">#{displayRequestSerial(r)}</td>
+                    <td className="px-6 py-4">
+                      <p className="text-sm font-bold text-zinc-900">{r.template_name}</p>
+                      <p className="text-xs text-zinc-500 truncate max-w-[150px]">{r.title}</p>
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-indigo-600 uppercase tracking-wide">
+                          {String(r.entity || '-')}
+                        </span>
+                        <span className="text-[11px] text-zinc-500">
+                          {entityLegalDisplayName(r.entity)}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <p className="text-sm text-zinc-700 font-medium">{r.requester_name}</p>
+                      <p className="text-[10px] text-zinc-400 font-bold uppercase">{r.department}</p>
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="space-y-1">
+                        {r.line_items?.slice(0, 2).map((item, idx) => (
+                          <div key={item.id || idx} className="text-xs text-zinc-700">
+                            <span className="font-bold text-indigo-600">{item.Quantity || item.quantity || 0}x</span> {item.Item || item.item || 'Item'}
+                          </div>
+                        ))}
+                        {r.line_items && r.line_items.length > 2 && (
+                          <p className="text-[10px] text-zinc-400 font-bold uppercase">+{r.line_items.length - 2} more items</p>
+                        )}
+                        {(!r.line_items || r.line_items.length === 0) && (
+                          <p className="text-sm text-zinc-400 italic">No items</p>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <p className="text-sm text-zinc-700 font-medium truncate max-w-[120px]">
+                        {r.line_items?.[0]?.['Suggested Supplier'] || r.line_items?.[0]?.['Supplier'] || '-'}
+                        {r.line_items?.length > 1 && '...'}
+                      </p>
+                    </td>
+                    <td className="px-6 py-4">
+                      <p className="text-sm font-bold text-zinc-900">
+                        {totalAmount > 0 ? `${procurementCurrencyPrefix(r.currency)}${totalAmount.toLocaleString()}`.trim() : '-'}
+                      </p>
+                    </td>
+                    <td className="px-6 py-4">
+                      <span className={cn(
+                        "text-[10px] uppercase font-bold px-2 py-0.5 rounded-full",
+                        workflowRequestStatusBadgeClass(r)
+                      )}>
+                        {formatWorkflowRequestStatusLabel(r)}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 text-sm text-zinc-500">{new Date(r.created_at).toLocaleDateString()}</td>
+                    <td className="px-6 py-4 text-right">
+                      <div className="flex flex-wrap items-center justify-end gap-2">
+                        {canShowConvertPRToPO(r, user) && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleConvertToPO(r.id);
+                            }}
+                            className="inline-flex items-center gap-1.5 px-3 py-2 bg-indigo-600 text-white rounded-lg font-bold text-xs hover:bg-indigo-700 transition-colors shadow-sm"
+                          >
+                            <RefreshCw className="w-3.5 h-3.5" />
+                            Convert to PO
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            api.setActiveEntity(String(r.entity || '').trim() || null);
+                            setSelectedRequest(r);
+                            setDetailsViewMode('details');
+                            setDetailsPdfPreview((prev) => {
+                              if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+                              return null;
+                            });
+                            fetchDetails(r.id);
+                          }}
+                          className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-600 rounded-lg font-bold text-xs hover:bg-indigo-100 transition-all border border-indigo-100 shadow-sm"
+                        >
+                          <FileText className="w-4 h-4" />
+                          Details
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      {/* Details Modal */}
+      <AnimatePresence>
+        {selectedRequest && (
+          <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white w-full max-w-[96vw] rounded-2xl shadow-2xl overflow-hidden flex flex-col h-[94vh]"
+            >
+              <div className="p-6 border-b border-zinc-100 flex items-center justify-between bg-zinc-50 shrink-0">
+                <div>
+                  <h2 className="text-xl font-bold text-zinc-900">
+                    {selectedRequest.formatted_id ? `[${toUpperSerial(selectedRequest.formatted_id)}] ${selectedRequest.title}` : selectedRequest.title}
+                  </h2>
+                  <p className="text-sm text-zinc-500">Template: {selectedRequest.template_name} • Dept: {selectedRequest.department} • Entity: <span className="font-bold text-indigo-600">{entityLegalDisplayName(selectedRequest.entity)}</span> <span className="text-zinc-400">({selectedRequest.entity?.trim() || '-'})</span></p>
+                </div>
+                <div className="flex items-center gap-4">
+                  {canEdit && !isEditing && (
+                    <button 
+                      onClick={() => {
+                        setEditData({ 
+                          title: selectedRequest.title, 
+                          details: selectedRequest.details, 
+                          line_items: [...(selectedRequest.line_items || [])],
+                          tax_rate: procurementUnitRateToPercent(selectedRequest.tax_rate, 0.18),
+                          discount_rate: procurementUnitRateToPercent(selectedRequest.discount_rate, 0),
+                          currency: selectedRequest.currency?.trim() ?? '',
+                          cost_center: selectedRequest.cost_center || '',
+                          section: sectionSelectionFromStored(selectedRequest.section)
+                        });
+                        setIsEditing(true);
+                      }}
+                      className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-indigo-200 text-indigo-600 text-xs font-bold hover:bg-indigo-50 transition-all"
+                    >
+                      <Edit2 className="w-3.5 h-3.5" />
+                      Edit Request
+                    </button>
+                  )}
+                  {canShowConvertPRToPO(selectedRequest, user) && !isEditing && (
+                    <>
+                      <button 
+                        onClick={() => {
+                          setEditData({ 
+                            title: selectedRequest.title, 
+                            details: selectedRequest.details, 
+                            line_items: [...(selectedRequest.line_items || [])],
+                            tax_rate: procurementUnitRateToPercent(selectedRequest.tax_rate, 0.18),
+                            discount_rate: procurementUnitRateToPercent(selectedRequest.discount_rate, 0),
+                            currency: selectedRequest.currency?.trim() ?? '',
+                            cost_center: selectedRequest.cost_center || '',
+                            section: sectionSelectionFromStored(selectedRequest.section)
+                          });
+                          setIsEditing(true);
+                        }}
+                        className="flex items-center gap-2 px-4 py-2 bg-emerald-50 border border-emerald-200 rounded-xl text-sm font-bold text-emerald-700 hover:bg-emerald-100 transition-colors"
+                      >
+                        <Edit2 className="w-4 h-4" />
+                        Edit & Add PO Info
+                      </button>
+                      <button 
+                        onClick={() => handleGeneratePODraft(selectedRequest)}
+                        className="flex items-center gap-2 px-4 py-2 bg-amber-50 border border-amber-200 rounded-xl text-sm font-bold text-amber-700 hover:bg-amber-100 transition-colors"
+                      >
+                        <Download className="w-4 h-4" />
+                        Generate PO Draft PDF
+                      </button>
+                      <button 
+                        onClick={() => handleConvertToPO(selectedRequest.id)}
+                        className="flex items-center gap-2 px-4 py-2 bg-indigo-600 rounded-xl text-sm font-bold text-white hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-100"
+                      >
+                        <RefreshCw className="w-4 h-4" />
+                        Convert PR → PO
+                      </button>
+                    </>
+                  )}
+                  <button 
+                    onClick={() => handlePrintPR(selectedRequest)} 
+                    className="flex items-center gap-2 px-4 py-2 bg-white border border-zinc-200 rounded-xl text-sm font-bold text-zinc-600 hover:bg-zinc-50 transition-colors"
+                    title={isPR_Only(selectedRequest) ? 'View PR form' : isSR_Only(selectedRequest) ? 'View SR form' : 'View PDF'}
+                  >
+                    <FileText className="w-4 h-4" />
+                    {isPR_Only(selectedRequest) ? 'View PR form' : isSR_Only(selectedRequest) ? 'View SR form' : 'View PDF'}
+                  </button>
+                  <button onClick={() => {
+                    setSelectedRequest(null);
+                    setIsEditing(false);
+                    setDetailsViewMode('details');
+                    setDetailsPdfPreview((prev) => {
+                      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+                      return null;
+                    });
+                  }} className="text-zinc-400 hover:text-zinc-600">
+                    <XCircle className="w-6 h-6" />
+                  </button>
+                </div>
+              </div>
+              
+              <div className="p-0 overflow-y-auto flex-1 bg-zinc-50/50">
+                {isEditing ? (
+                  <div className="p-8 w-full">
+                    <div className="bg-white rounded-2xl shadow-sm border border-zinc-200 p-8 space-y-8">
+                      <div className="flex items-center gap-3 mb-6">
+                        <div className="w-10 h-10 bg-indigo-100 rounded-xl flex items-center justify-center">
+                          <Edit2 className="w-5 h-5 text-indigo-600" />
+                        </div>
+                        <div>
+                          <h3 className="text-xl font-bold text-zinc-900">Edit Request</h3>
+                          <p className="text-sm text-zinc-500">Update your request details and line items</p>
+                        </div>
+                      </div>
+
+                      <div className="space-y-6">
+                        {isProcurementPRorPORequest(selectedRequest) && (
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Currency</label>
+                              <select
+                                className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                value={editData.currency}
+                                onChange={(e) => setEditData({ ...editData, currency: e.target.value })}
+                                required
+                              >
+                                <option value="">Select currency…</option>
+                                {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
+                              </select>
+                            </div>
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">{procurementTaxRateFormLabel(selectedRequest.entity)}</label>
+                              <div className="flex items-center gap-3">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0"
+                                  max="100"
+                                  className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                  value={editData.tax_rate}
+                                  onChange={(e) => setEditData({ ...editData, tax_rate: parseFloat(e.target.value) || 0 })}
+                                />
+                                <span className="text-xs text-zinc-500 font-bold uppercase tracking-tighter">%</span>
+                              </div>
+                            </div>
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Discount (%)</label>
+                              <div className="flex items-center gap-3">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0"
+                                  max="100"
+                                  className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                  value={editData.discount_rate !== undefined ? editData.discount_rate : 0}
+                                  onChange={(e) => setEditData({ ...editData, discount_rate: parseFloat(e.target.value) || 0 })}
+                                />
+                                <span className="text-xs text-zinc-500 font-bold uppercase tracking-tighter">%</span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                        {isSRRequest(selectedRequest) && (
+                          <div className="max-w-md">
+                            <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Section</label>
+                            <select
+                              className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                              value={sectionSelectionFromStored(editData.section)}
+                              onChange={(e) => setEditData({ ...editData, section: e.target.value })}
+                              required
+                            >
+                              <option value="" disabled>Select section...</option>
+                              {SECTION_OPTIONS.map((opt) => (
+                                <option key={opt} value={opt}>{opt}</option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+                        <div>
+                          <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Request Title</label>
+                          <input
+                            type="text"
+                            className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                            value={editData.title}
+                            onChange={(e) => setEditData({ ...editData, title: e.target.value })}
+                          />
+                        </div>
+                        {!isProcurementPRorPORequest(selectedRequest) && (
+                        <div>
+                          <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Details</label>
+                          <textarea
+                            className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500 min-h-[120px]"
+                            value={editData.details}
+                            onChange={(e) => setEditData({ ...editData, details: e.target.value })}
+                          />
+                        </div>
+                        )}
+
+                        <div>
+                          <div className="flex items-center justify-between mb-4">
+                            <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">
+                              {isPRRequest(selectedRequest) ? 'PR line items' : isSRRequest(selectedRequest) ? 'Stock requisition line items' : isPO_Only(selectedRequest) ? 'PO line items' : 'Line items'}
+                            </label>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const newItems = [...editData.line_items];
+                                const emptyItem: any = { [LINE_ITEM_REMARKS_KEY]: '' };
+                                procurementGridColumns(selectedRequest).forEach(col => emptyItem[col] = '');
+                                newItems.push(emptyItem);
+                                setEditData({ ...editData, line_items: newItems });
+                              }}
+                              className="flex items-center gap-1 text-[10px] font-bold text-indigo-600 hover:text-indigo-700 uppercase tracking-widest"
+                            >
+                              <Plus className="w-3 h-3" />
+                              Add Item
+                            </button>
+                          </div>
+                          <div className="border border-zinc-200 rounded-xl overflow-hidden">
+                            <table className="w-full text-sm">
+                              <thead className="bg-zinc-50 border-b border-zinc-200">
+                                <tr>
+                                  {procurementGridColumns(selectedRequest).map(col => (
+                                    <th key={col} className="px-4 py-2 font-bold text-zinc-600 text-left">{col}</th>
+                                  ))}
+                                  <th className="w-10"></th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-zinc-200">
+                                {editData.line_items.map((item, idx) => {
+                                  const cols = procurementGridColumns(selectedRequest);
+                                  return (
+                                  <React.Fragment key={idx}>
+                                  <tr>
+                                    {cols.map(col => (
+                                      <td key={col} className="px-2 py-2">
+                                        {col === 'Cost Center' ? (
+                                          <SearchableSelect
+                                            options={costCenterOptions}
+                                            value={item[col] || ''}
+                                            onChange={(val) => {
+                                              const newItems = [...editData.line_items];
+                                              newItems[idx] = { ...newItems[idx], [col]: val };
+                                              setEditData({ ...editData, line_items: newItems });
+                                            }}
+                                            placeholder="Select Cost Center..."
+                                          />
+                                        ) : (isSRRequest(selectedRequest) && isSpareLocationColumn(col)) ? (
+                                          <SearchableSelect
+                                            options={costCenterOptions}
+                                            value={item[col] || ''}
+                                            onChange={(val) => {
+                                              const newItems = [...editData.line_items];
+                                              newItems[idx] = { ...newItems[idx], [col]: val };
+                                              setEditData({ ...editData, line_items: newItems });
+                                            }}
+                                            placeholder="Select Cost Center..."
+                                          />
+                                        ) : (
+                                          <input
+                                            type={isProcurementNumericGridColumn(col) ? 'number' : 'text'}
+                                            className="w-full px-2 py-1.5 rounded border border-zinc-100 text-xs focus:ring-1 focus:ring-indigo-500 outline-none"
+                                            value={col === REMARKS_LINE_COL ? (lineItemRemarksDisplay(item) || '') : (item[col] || '')}
+                                            onChange={(e) => {
+                                              const newItems = [...editData.line_items];
+                                              newItems[idx] = col === REMARKS_LINE_COL
+                                                ? mergeLineItemRemarksWrite(newItems[idx], e.target.value)
+                                                : { ...newItems[idx], [col]: e.target.value };
+                                              setEditData({ ...editData, line_items: newItems });
+                                            }}
+                                          />
+                                        )}
+                                      </td>
+                                    ))}
+                                    <td className="px-2 py-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const newItems = editData.line_items.filter((_, i) => i !== idx);
+                                          setEditData({ ...editData, line_items: newItems });
+                                        }}
+                                        className="text-red-400 hover:text-red-600"
+                                      >
+                                        <Trash2 className="w-4 h-4" />
+                                      </button>
+                                    </td>
+                                  </tr>
+                                  <tr className="bg-zinc-50/90">
+                                    <td colSpan={cols.length + 1} className="px-4 py-2">
+                                      <label className="text-[10px] font-bold text-zinc-500 uppercase">Line remarks (optional)</label>
+                                      <textarea
+                                        rows={2}
+                                        className="w-full mt-1 px-2 py-1.5 rounded border border-zinc-200 text-xs focus:ring-1 focus:ring-indigo-500 outline-none resize-y min-h-[52px]"
+                                        value={item[LINE_ITEM_REMARKS_KEY] ?? ''}
+                                        onChange={(e) => {
+                                          const newItems = [...editData.line_items];
+                                          newItems[idx] = { ...newItems[idx], [LINE_ITEM_REMARKS_KEY]: e.target.value };
+                                          setEditData({ ...editData, line_items: newItems });
+                                        }}
+                                        placeholder="Extra notes for this line…"
+                                      />
+                                    </td>
+                                  </tr>
+                                  </React.Fragment>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex justify-end gap-3 pt-6 border-t border-zinc-100">
+                        <button
+                          onClick={() => setIsEditing(false)}
+                          className="px-6 py-2 rounded-xl border border-zinc-200 text-sm font-bold text-zinc-600 hover:bg-zinc-50 transition-colors"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={handleSaveEdit}
+                          disabled={loading}
+                          className="px-8 py-2 rounded-xl bg-indigo-600 text-white text-sm font-bold hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-200 disabled:opacity-50"
+                        >
+                          {loading ? 'Saving...' : 'Save Changes'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="w-full bg-white my-8 shadow-sm border border-zinc-200 rounded-xl overflow-hidden">
+                  {/* Document Header */}
+                  <div className="p-8 border-b border-zinc-100 bg-zinc-50/30">
+                    <div className="flex justify-between items-start mb-8">
+                      <div>
+                        <h1 className="text-2xl font-black text-zinc-900 uppercase tracking-tight">
+                          {isPRRequest(selectedRequest)
+                              ? 'Purchase Requisition Form'
+                              : isSRRequest(selectedRequest)
+                                ? 'Stock Item Requisition Form'
+                                : isPO_Only(selectedRequest)
+                                  ? 'Purchase Order'
+                                  : 'Workflow Request'}
+                        </h1>
+                        <p className="text-sm text-zinc-500 font-medium">Ref: #{selectedRequest.id.toString().padStart(6, '0')}</p>
+                      </div>
+                      <div className="text-right">
+                        <span className={cn(
+                          "px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider",
+                          workflowRequestStatusBadgeClass(selectedRequest)
+                        )}>
+                          {formatWorkflowRequestStatusLabel(selectedRequest)}
+                        </span>
+                        <p className="text-[10px] text-zinc-400 mt-2 font-bold uppercase tracking-widest">
+                          {new Date(selectedRequest.created_at).toLocaleDateString()}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Summary Cards */}
+                    <div className="grid grid-cols-4 gap-4 mb-8">
+                      <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
+                        <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Total Amount</p>
+                        <p className="text-xl font-black text-indigo-600">
+                          {procurementCurrencyPrefix(selectedRequest.currency)}{(isProcurementPRorPORequest(selectedRequest)
+                            ? procurementMoneyTotals(selectedRequest).total
+                            : (selectedRequest.line_items?.reduce((sum, item) => sum + (parseFloat(item['Quantity'] || '0') * parseFloat(item['Unit Price'] || '0')), 0) || 0) * (1 + (selectedRequest.tax_rate !== undefined ? selectedRequest.tax_rate : 0.18))
+                          ).toLocaleString()}
+                        </p>
+                      </div>
+                      <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
+                        <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Items Count</p>
+                        <p className="text-xl font-black text-zinc-900">{selectedRequest.line_items?.length || 0} Items</p>
+                      </div>
+                      <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
+                        <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Requester</p>
+                        <p className="text-sm font-bold text-zinc-900 truncate">{selectedRequest.requester_name}</p>
+                        <p className="text-[10px] text-zinc-400 font-bold uppercase">{selectedRequest.department}</p>
+                      </div>
+                      <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
+                        <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Current Step</p>
+                        <p className="text-sm font-bold text-zinc-900">
+                          {isWorkflowRequestPending(selectedRequest) 
+                            ? selectedRequest.template_steps[selectedRequest.current_step_index]?.label || 'Processing'
+                            : formatWorkflowRequestStatusLabel(selectedRequest)}
+                        </p>
+                        <p className="text-[10px] text-zinc-400 font-bold uppercase">Workflow Progress</p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-8">
+                      <div>
+                        <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Requester Information</label>
+                        <p className="font-bold text-zinc-900">{selectedRequest.requester_name}</p>
+                        <p className="text-sm text-zinc-500">{selectedRequest.department}</p>
+                      </div>
+                      <div className="text-right">
+                        <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Template Type</label>
+                        <p className="font-bold text-zinc-900">{selectedRequest.template_name}</p>
+                        <p className="text-sm text-zinc-500">Category: {selectedRequest.category || 'General'}</p>
+                      </div>
+                    </div>
+
+                    {isProcurementPRorPORequest(selectedRequest) && (
+                      <div className="grid grid-cols-2 gap-8 mt-8 pt-8 border-t border-zinc-100">
+                        <div>
+                          <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Currency</label>
+                          <p className="font-bold text-zinc-900">{procurementCurrencyLabel(selectedRequest.currency)}</p>
+                        </div>
+                        <div className="text-right">
+                          <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Cost Center</label>
+                          <p className="font-bold text-zinc-900">{selectedRequest.cost_center || 'Not Specified'}</p>
+                          {isSRRequest(selectedRequest) && (
+                            <>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mt-3 mb-1">Section</label>
+                              <p className="font-bold text-zinc-900">{selectedRequest.section || 'Not Specified'}</p>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="p-8 space-y-10">
+                    <section>
+                      <div className="flex items-center justify-between gap-3 mb-3 border-b border-zinc-100 pb-2">
+                        <h4 className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Details</h4>
+                        <div className="inline-flex rounded-lg border border-zinc-200 overflow-hidden">
+                          <button
+                            type="button"
+                            onClick={() => setDetailsViewMode('details')}
+                            className={cn(
+                              "px-3 py-1.5 text-[10px] font-black uppercase tracking-widest transition-colors",
+                              detailsViewMode === 'details'
+                                ? "bg-indigo-600 text-white"
+                                : "bg-white text-zinc-500 hover:bg-zinc-50"
+                            )}
+                          >
+                            Details
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleShowRequestPdfInline(selectedRequest)}
+                            className={cn(
+                              "px-3 py-1.5 text-[10px] font-black uppercase tracking-widest transition-colors border-l border-zinc-200 inline-flex items-center gap-1.5",
+                              detailsViewMode === 'pdf'
+                                ? "bg-indigo-600 text-white"
+                                : "bg-white text-zinc-500 hover:bg-zinc-50"
+                            )}
+                          >
+                            <FileText className="w-3 h-3" />
+                            PDF
+                          </button>
+                        </div>
+                      </div>
+                      {detailsViewMode === 'pdf' ? (
+                        <div className="w-full h-[72vh] border border-zinc-200 rounded-xl overflow-hidden bg-zinc-100">
+                          {detailsPdfPreview ? (
+                            <iframe
+                              src={`${detailsPdfPreview.url}#view=FitH`}
+                              className="w-full h-full border-none"
+                              title="Request PDF Preview"
+                            />
+                          ) : (
+                            <div className="h-full flex items-center justify-center text-sm text-zinc-500">
+                              PDF is not ready.
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        !isProcurementPRorPORequest(selectedRequest) ? (
+                          <p className="text-zinc-700 whitespace-pre-wrap leading-relaxed">{selectedRequest.details}</p>
+                        ) : (
+                          <p className="text-zinc-500 text-sm">Switch to PDF to view the full form layout.</p>
+                        )
+                      )}
+                    </section>
+
+                    {/* Line Items */}
+                    {selectedRequest.line_items && selectedRequest.line_items.length > 0 && (
+                      <section>
+                        <h4 className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-3 border-b border-zinc-100 pb-2">
+                          {isPRRequest(selectedRequest) ? 'PR line items' : isSRRequest(selectedRequest) ? 'Stock requisition line items' : isPO_Only(selectedRequest) ? 'PO line items' : 'Line items'}
+                        </h4>
+                        <div className="border border-zinc-200 rounded-lg overflow-hidden">
+                          <table className="w-full text-sm">
+                            <thead className="bg-zinc-50 border-b border-zinc-200">
+                              <tr>
+                                <th className="px-4 py-2 font-bold text-zinc-600 w-12 text-center">No</th>
+                                {procurementGridColumns(selectedRequest).map(col => (
+                                  <th key={col} className="px-4 py-2 font-bold text-zinc-600 text-left">{col}</th>
+                                ))}
+                                {procurementRowShowsLineTotal(selectedRequest) && <th className="px-4 py-2 font-bold text-zinc-600 text-right">Total</th>}
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-zinc-200">
+                              {selectedRequest.line_items.map((item, idx) => {
+                                const cols = procurementGridColumns(selectedRequest);
+                                const showLineTotal = procurementRowShowsLineTotal(selectedRequest);
+                                const qty = lineItemQtyForDisplay(item);
+                                const price = parseFloat(item['Unit Price'] || '0');
+                                const total = qty * price;
+                                const lineRem = item[LINE_ITEM_REMARKS_KEY] && String(item[LINE_ITEM_REMARKS_KEY]).trim();
+                                return (
+                                  <React.Fragment key={item.id || idx}>
+                                  <tr className={idx % 2 === 0 ? 'bg-white' : 'bg-zinc-50/30'}>
+                                    <td className="px-4 py-3 text-center text-zinc-500 font-medium">{idx + 1}</td>
+                                    {cols.map(col => (
+                                      <td key={col} className="px-4 py-3 text-zinc-700">
+                                        {(col === 'Unit Price' || col === 'Price' || col === 'Amount')
+                                          ? `${procurementCurrencyPrefix(selectedRequest.currency)}${Number(item[col] || 0).toLocaleString()}`.trim()
+                                          : (col === REMARKS_LINE_COL ? (lineItemRemarksDisplay(item) || '-') : (item[col] || '-'))}
+                                      </td>
+                                    ))}
+                                    {showLineTotal && (
+                                      <td className="px-4 py-3 text-right font-bold text-zinc-900">
+                                        {`${procurementCurrencyPrefix(selectedRequest.currency)}${total.toLocaleString()}`.trim()}
+                                      </td>
+                                    )}
+                                  </tr>
+                                  {lineRem && (
+                                    <tr className="bg-indigo-50/40 border-t border-indigo-100/80">
+                                      <td colSpan={cols.length + 1 + (showLineTotal ? 1 : 0)} className="px-4 py-2.5 text-xs text-zinc-700">
+                                        <span className="font-bold text-zinc-500 uppercase tracking-wide text-[10px]">Line remarks: </span>
+                                        <span className="whitespace-pre-wrap">{lineRem}</span>
+                                      </td>
+                                    </tr>
+                                  )}
+                                  </React.Fragment>
+                                );
+                              })}
+                            </tbody>
+                            {procurementRowShowsLineTotal(selectedRequest) && (() => {
+                              const m = procurementMoneyTotals(selectedRequest);
+                              const gc = procurementGridColumns(selectedRequest);
+                              return (
+                              <tfoot className="bg-zinc-50/50 font-bold">
+                                <tr>
+                                  <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">Subtotal</td>
+                                  <td className="px-4 py-2 text-right text-zinc-900">
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.subtotal.toLocaleString()}`.trim()}
+                                  </td>
+                                </tr>
+                                <tr>
+                                  <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">Discount ({(m.discountRate * 100).toFixed(0)}%)</td>
+                                  <td className="px-4 py-2 text-right text-zinc-900">
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.discountAmount.toLocaleString()}`.trim()}
+                                  </td>
+                                </tr>
+                                <tr>
+                                  <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">{procurementTaxLabelForEntity(selectedRequest.entity)} ({(m.taxRate * 100).toFixed(0)}%)</td>
+                                  <td className="px-4 py-2 text-right text-zinc-900">
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.taxAmount.toLocaleString()}`.trim()}
+                                  </td>
+                                </tr>
+                                <tr className="bg-zinc-100/50 text-lg">
+                                  <td colSpan={gc.length + 1} className="px-4 py-4 text-right text-zinc-900 uppercase tracking-tight">Total Amount</td>
+                                  <td className="px-4 py-4 text-right text-indigo-600 font-black">
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.total.toLocaleString()}`.trim()}
+                                  </td>
+                                </tr>
+                              </tfoot>
+                              );
+                            })()}
+                          </table>
+                        </div>
+                      </section>
+                    )}
+
+                    {/* Attachments */}
+                    {attachments.length > 0 && (
+                      <section>
+                        <h4 className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-3 border-b border-zinc-100 pb-2">Attachments</h4>
+                        <div className="grid grid-cols-2 gap-3">
+                          {attachments.map((att) => (
+                            <div
+                              key={att.id}
+                              onClick={() => {
+                                void openWorkflowRequestAttachment(selectedRequest.id, att, setViewingPdf);
+                              }}
+                              className="flex items-center gap-3 p-3 bg-zinc-50 rounded-xl border border-zinc-200 hover:border-indigo-300 transition-all group cursor-pointer"
+                            >
+                              <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center border border-zinc-100 group-hover:bg-indigo-50 transition-colors">
+                                <FileText className="w-4 h-4 text-indigo-500" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <p className="text-xs font-bold text-zinc-700 truncate">{att.file_name}</p>
+                                <p className="text-[10px] text-zinc-400 uppercase font-bold">
+                                  {(att.file_type === 'application/pdf' || att.file_name.toLowerCase().endsWith('.pdf')) ? 'View PDF' : 'Download File'}
+                                </p>
+                              </div>
+                              {(att.file_type === 'application/pdf' || att.file_name.toLowerCase().endsWith('.pdf')) ? (
+                                <Eye className="w-3 h-3 text-zinc-300 group-hover:text-indigo-500" />
+                              ) : (
+                                <Download className="w-3 h-3 text-zinc-300 group-hover:text-indigo-500" />
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </section>
+                    )}
+
+                    {/* Signatures & Approvals */}
+                    <section className="pt-8 border-t-2 border-dashed border-zinc-100">
+                      <div className="grid grid-cols-2 gap-12">
+                        {/* Requester Signature */}
+                        <div>
+                          <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-4">Requested By</p>
+                          {hasRequesterSignatureProof(selectedRequest) ? (
+                            <div className="space-y-2">
+                              {isSignatureImageDataUrl(selectedRequest.requester_signature) ? (
+                                <img src={selectedRequest.requester_signature!} alt="Requester Signature" className="h-16 object-contain" referrerPolicy="no-referrer" />
+                              ) : (
+                                <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 px-3 py-2">
+                                  <p className="text-xs font-semibold text-emerald-800">Electronic signature</p>
+                                  {selectedRequest.requester_signed_at && (
+                                    <p className="text-[10px] text-emerald-700/90 mt-0.5">{formatSignatureProofTimestamp(selectedRequest.requester_signed_at)}</p>
+                                  )}
+                                </div>
+                              )}
+                              <div className="pt-2 border-t border-zinc-200">
+                                <p className="text-sm font-bold text-zinc-900">{selectedRequest.requester_name}</p>
+                                <p className="text-xs text-zinc-500">{selectedRequest.department}</p>
+                                <p className="text-[10px] text-zinc-400 mt-1">{new Date(selectedRequest.created_at).toLocaleDateString()}</p>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="h-24 border-2 border-dashed border-zinc-100 rounded-xl flex items-center justify-center">
+                              <p className="text-xs text-zinc-300 italic">No signature</p>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Approvals */}
+                        <div className="space-y-8">
+                          <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-4">Approval Workflow</p>
+                          {selectedRequest.template_steps.map((step, i) => {
+                            const approval = approvals.find(a => a.step_index === i);
+                            const isCurrent = isWorkflowRequestPending(selectedRequest) && selectedRequest.current_step_index === i;
+                            
+                            return (
+                              <div key={step.id} className="relative pl-8 border-l-2 border-zinc-100 pb-8 last:pb-0">
+                                <div className={cn(
+                                  "absolute -left-[9px] top-0 w-4 h-4 rounded-full border-2 border-white",
+                                  approval ? (approval.status === 'approved' ? "bg-emerald-500" : "bg-red-500") :
+                                  isCurrent ? "bg-amber-500 animate-pulse" : "bg-zinc-200"
+                                )} />
+                                
+                                <div className="space-y-2">
+                                  <div className="flex justify-between items-start">
+                                    <div>
+                                      <p className="text-xs font-black text-zinc-900 uppercase tracking-tight">{step.label}</p>
+                                      <p className="text-[10px] text-zinc-400 font-bold uppercase">Role: {step.approverRole}</p>
+                                    </div>
+                                    {approval && (
+                                      <span className={cn(
+                                        "text-[10px] font-black uppercase px-2 py-0.5 rounded",
+                                        approval.status === 'approved' ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
+                                      )}>
+                                        {approval.status}
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {approval && (
+                                    <div className="mt-4 p-4 bg-zinc-50 rounded-xl border border-zinc-100">
+                                      {approval.comment && <p className="text-xs text-zinc-600 italic mb-3">"{approval.comment}"</p>}
+                                      <div className="flex items-center gap-3">
+                                        {isSignatureImageDataUrl(approval.approver_signature) ? (
+                                          <img src={approval.approver_signature!} alt="Approver Signature" className="h-10 object-contain" referrerPolicy="no-referrer" />
+                                        ) : approval.status.toLowerCase() === 'approved' ? (
+                                          <div className="shrink-0 rounded-lg border border-emerald-200 bg-emerald-50/80 px-2 py-1.5">
+                                            <p className="text-[10px] font-semibold text-emerald-800">E-signed</p>
+                                            <p className="text-[9px] text-emerald-700/90">{formatSignatureProofTimestamp(approval.created_at)}</p>
+                                          </div>
+                                        ) : null}
+                                        <div>
+                                          <p className="text-xs font-bold text-zinc-900">{approval.approver_name}</p>
+                                          <p className="text-[10px] text-zinc-400">{new Date(approval.created_at).toLocaleDateString()}</p>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {isCurrent && (
+                                    <div className="mt-4 p-4 bg-amber-50 border border-amber-200 rounded-xl">
+                                      <p className="text-xs font-bold text-amber-700 flex items-center gap-2">
+                                        <Clock className="w-3 h-3" />
+                                        Awaiting decision...
+                                      </p>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </section>
+
+                    {isWorkflowRequestRejected(selectedRequest) && user.id === selectedRequest.requester_id && (
+                      <section className="pt-12 border-t-2 border-zinc-100">
+                        <div className="bg-red-50 p-8 rounded-2xl border border-red-100">
+                          <div className="flex items-center gap-3 mb-6">
+                            <div className="w-10 h-10 bg-red-600 rounded-xl flex items-center justify-center shadow-lg shadow-red-200">
+                              <RefreshCw className="w-5 h-5 text-white" />
+                            </div>
+                            <div>
+                              <h3 className="text-lg font-black text-zinc-900 uppercase tracking-tight">Resubmit Request</h3>
+                              <p className="text-xs text-zinc-500">This request was rejected. You can resubmit it to restart the workflow.</p>
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => handleResubmit(selectedRequest.id)}
+                            disabled={loading}
+                            className="w-full bg-indigo-600 text-white py-4 rounded-xl font-black uppercase tracking-widest hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 flex items-center justify-center gap-2 disabled:opacity-50"
+                          >
+                            <Send className="w-5 h-5" />
+                            Resubmit Now
+                          </button>
+                        </div>
+                      </section>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </motion.div>
+          </div>
+        )}
+        {viewingPdf && (
+          <PdfViewer
+            url={viewingPdf.url}
+            fileName={viewingPdf.fileName}
+            onDownload={() => downloadFileFromUrl(viewingPdf.url, viewingPdf.fileName)}
+            onClose={() => {
+              if (viewingPdf.url.startsWith("blob:")) URL.revokeObjectURL(viewingPdf.url);
+              setViewingPdf(null);
+            }}
+          />
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+// --- Main App ---
+
+export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [selectedEntity, setSelectedEntity] = useState<string | null>(null);
+  const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  const [requests, setRequests] = useState<WorkflowRequest[]>([]);
+  const [roles, setRoles] = useState<Role[]>([]);
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'create' |'templates'| 'submit' | 'requests' | 'admin' | 'procurement'>('dashboard');
+  const [selectedTemplateForRequest, setSelectedTemplateForRequest] = useState<Workflow | null>(null);
+  const [preSelectedRequestId, setPreSelectedRequestId] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const fetchWorkflows = async () => {
+    try {
+      const data = await api.request('/api/workflows');
+      setWorkflows(data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const fetchRequests = async () => {
+    try {
+      const data = await api.request('/api/workflow-requests', { skipEntity: true });
+      setRequests(data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const applyEntityForUser = (userData: User) => {
+    const ents = userData.entities || [];
+    const stored = localStorage.getItem(FLOWMASTER_ENTITY_KEY);
+    if (ents.length === 1) {
+      setSelectedEntity(ents[0]);
+      api.setActiveEntity(ents[0]);
+      return;
+    }
+    if (ents.length > 1 && stored && ents.includes(stored)) {
+      setSelectedEntity(stored);
+      api.setActiveEntity(stored);
+      return;
+    }
+    const fallback = ents[0] || null;
+    api.setActiveEntity(fallback);
+    setSelectedEntity(fallback);
+  };
+
+  const fetchRoles = async () => {
+    try {
+      const data = await api.request('/api/roles');
+      setRoles(data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const hasPermission = (permission: string) => {
+    if (!user) return false;
+    if (user.permissions?.includes('admin')) return true;
+    return user.permissions?.includes(permission);
+  };
+
+  const init = async () => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      api.setToken(token);
+      try {
+        const userData = await api.request('/api/me');
+        // Ensure roles is always an array
+        if (userData && !userData.roles) {
+          userData.roles = userData.role ? [userData.role] : ['user'];
+        }
+        setUser(userData);
+        applyEntityForUser(userData);
+        await Promise.all([fetchWorkflows(), fetchRoles()]);
+      } catch (err) {
+        api.setToken(null);
+      }
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    init();
+  }, []);
+
+  useEffect(() => {
+    if (!user || loading) return;
+    const ents = user.entities || [];
+    if (ents.length === 0) return;
+    fetchRequests();
+  }, [user, selectedEntity, loading]);
+
+  const handleLogout = () => {
+    api.setToken(null);
+    setUser(null);
+    setSelectedEntity(null);
+    toast.success('Logged out');
+  };
+
+  if (loading) return <div className="min-h-screen flex items-center justify-center">Loading...</div>;
+
+  if (!user) return <Login onLogin={(u) => { 
+    const userData = { ...u };
+    if (!userData.roles) {
+      userData.roles = (userData as any).role ? [(userData as any).role] : ['user'];
+    }
+    setUser(userData);
+    applyEntityForUser(userData);
+    fetchWorkflows();
+    fetchRoles();
+  }} />;
+
+  if (user.entities && user.entities.length === 0) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-zinc-50 p-4">
+        <div className="max-w-md bg-white rounded-2xl border border-zinc-200 p-8 text-center shadow-sm">
+          <Building2 className="w-12 h-12 text-amber-500 mx-auto mb-4" />
+          <h1 className="text-lg font-bold text-zinc-900 mb-2">No entity access</h1>
+          <p className="text-sm text-zinc-600">Your account is not assigned to any entity. Ask an administrator to assign entities before you can use workflows.</p>
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="mt-6 w-full bg-zinc-900 text-white py-2 rounded-lg font-semibold hover:bg-zinc-800"
+          >
+            Log out
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-zinc-50 flex">
+      <Toaster position="top-right" />
+      
+      {/* Sidebar */}
+      <aside className="w-64 bg-white border-r border-zinc-200 flex flex-col shrink-0">
+        <div className="p-6 border-b border-zinc-100">
+          <div className="flex items-center gap-3 mb-1">
+            <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-100">
+              <Shield className="text-white w-4 h-4" />
+            </div>
+            <span className="font-bold text-lg text-zinc-900">FlowMaster</span>
+          </div>
+          <p className="text-[10px] text-zinc-400 uppercase font-bold tracking-widest">Workflow Engine</p>
+        </div>
+
+        <nav className="flex-1 p-4 space-y-1">
+          <button
+            onClick={() => { setActiveTab('dashboard'); setSelectedTemplateForRequest(null); }}
+            className={cn(
+              "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
+              activeTab === 'dashboard' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+            )}
+          >
+            <LayoutDashboard className="w-4 h-4" />
+            Dashboard
+          </button>
+          {hasPermission('create_templates') && (
+            <button
+              onClick={() => { setActiveTab('create'); setSelectedTemplateForRequest(null); }}
+              className={cn(
+                "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
+                activeTab === 'create' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+              )}
+            >
+              <PlusCircle className="w-4 h-4" />
+              Design Template
+            </button>
+          )}
+          {(hasPermission('create_templates') || hasPermission('approve_templates')) && (
+            <button
+              onClick={() => { setActiveTab('templates'); setSelectedTemplateForRequest(null); }}
+              className={cn(
+                "w-full flex items-center justify-between px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
+                activeTab === 'templates' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+              )}
+            >
+              <div className="flex items-center gap-3">
+                <ClipboardList className="w-4 h-4" />
+                Workflow Templates
+              </div>
+              {workflows.filter(w => w.status === 'pending').length > 0 && (
+                <span className="bg-amber-500 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full min-w-[18px] text-center">
+                  {workflows.filter(w => w.status === 'pending').length}
+                </span>
+              )}
+            </button>
+          )}
+          <button
+            onClick={() => { setActiveTab('submit'); setSelectedTemplateForRequest(null); }}
+            className={cn(
+              "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
+              activeTab === 'submit' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+            )}
+          >
+            <Send className="w-4 h-4" />
+            Submit Request
+          </button>
+          <button
+            onClick={() => { setActiveTab('requests'); setSelectedTemplateForRequest(null); }}
+            className={cn(
+              "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
+              activeTab === 'requests' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+            )}
+          >
+            <Inbox className="w-4 h-4" />
+            Approvals & Requests
+          </button>
+          {hasPermission('view_procurement_center') && (
+            <button
+              onClick={() => { setActiveTab('procurement'); setSelectedTemplateForRequest(null); }}
+              className={cn(
+                "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
+                activeTab === 'procurement' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+              )}
+            >
+              <ShoppingCart className="w-4 h-4" />
+              Procurement Center
+            </button>
+          )}
+
+          {hasPermission('manage_users') && (
+            <button
+              onClick={() => { setActiveTab('admin'); setSelectedTemplateForRequest(null); }}
+              className={cn(
+                "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
+                activeTab === 'admin' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+              )}
+            >
+              <Users className="w-4 h-4" />
+              Role Management
+            </button>
+          )}
+        </nav>
+
+        {user.entities && user.entities.length > 1 && (
+          <div className="px-4 pb-2">
+            <label className="text-[10px] text-zinc-400 uppercase font-bold tracking-wider">Entity</label>
+            <select
+              value={selectedEntity || ''}
+              onChange={(e) => {
+                const v = e.target.value;
+                api.setActiveEntity(v);
+                setSelectedEntity(v);
+              }}
+              className="w-full mt-1 px-2 py-2 text-sm border border-zinc-200 rounded-xl bg-white text-zinc-800 font-medium"
+            >
+              {user.entities.map((ent) => (
+                <option key={ent} value={ent}>{ent}</option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        <div className="p-4 border-t border-zinc-100">
+        <div className="flex items-center gap-3 px-4 py-3 mb-2">
+          <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center font-bold text-xs">
+            {user.username[0].toUpperCase()}
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-bold text-zinc-900 truncate">{user.username}</p>
+            <p className="text-[10px] text-zinc-400 uppercase font-bold truncate">{selectedEntity} • {(user.roles || []).join(', ')}</p>
+          </div>
+        </div>
+          <button
+            onClick={handleLogout}
+            className="w-full flex items-center gap-3 px-4 py-2 rounded-xl text-sm font-medium text-red-500 hover:bg-red-50 transition-all"
+          >
+            <LogOut className="w-4 h-4" />
+            Logout
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Content */}
+      <main className="flex-1 overflow-y-auto">
+        <header className="h-16 bg-white border-b border-zinc-200 flex items-center justify-between px-8 sticky top-0 z-10">
+          <h2 className="text-sm font-bold text-zinc-900 uppercase tracking-wider">
+            {activeTab === 'dashboard' ? 'Overview' : 
+             activeTab === 'create' ? 'Template Designer' : 
+             activeTab === 'templates' ? 'Workflow Templates' :
+             activeTab === 'submit' ? 'Submit New Request' :
+             activeTab === 'requests' ? 'Approvals & Requests' : 
+             activeTab === 'procurement' ? 'Procurement Center' : 'Administration'}
+          </h2>
+          <div className="flex items-center gap-4">
+            <div className="h-8 w-px bg-zinc-200" />
+            <span className="text-xs text-zinc-400 font-medium">{new Date().toLocaleDateString()}</span>
+          </div>
+        </header>
+
+        <div
+          className={cn(
+            "mx-auto w-full min-h-0",
+            activeTab === 'procurement' || activeTab === 'requests' || activeTab === 'admin'
+              ? "px-4 sm:px-6 lg:px-8 py-4 max-w-none h-[calc(100vh-4rem)] flex flex-col"
+              : activeTab === 'submit' && selectedTemplateForRequest
+              ? "flex flex-col h-[calc(100vh-4rem)] max-w-none px-4 sm:px-6 lg:px-8 py-4"
+              : "px-6 py-5 max-w-none"
+          )}
+        >
+          <AnimatePresence mode="wait">
+            {activeTab === 'dashboard' && !selectedTemplateForRequest && (
+              <motion.div
+                key="dashboard"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+              >
+                <Dashboard 
+                  requests={requests}
+                  workflows={workflows}
+                  user={user}
+                  onStartRequest={(w) => {
+                    setSelectedTemplateForRequest(w);
+                    setActiveTab('submit');
+                  }}
+                  onViewRequest={(r) => {
+                    setPreSelectedRequestId(r.id);
+                    setActiveTab('requests');
+                  }}
+                  onViewAllRequests={() => setActiveTab('requests')}
+                />
+              </motion.div>
+            )}
+
+            {activeTab === 'create' && (
+              <motion.div
+                key="create"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+              >
+                <WorkflowCreator 
+                  onSuccess={() => { setActiveTab('templates'); fetchWorkflows(); }} 
+                  availableRoles={roles}
+                />
+              </motion.div>
+            )}
+            
+            {activeTab === 'templates' && !selectedTemplateForRequest && (
+              <motion.div
+                key="templates"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+              >
+                <WorkflowList 
+                  workflows={workflows}
+                  user={user}
+                  roles={roles}
+                  onRefresh={fetchWorkflows}
+                  onStartRequest={(w) => {
+                    setSelectedTemplateForRequest(w);
+                    setActiveTab('submit');
+                  }}
+                />
+              </motion.div>
+            )}
+
+            {activeTab === 'submit' && (
+              <motion.div
+                key="submit"
+                className={selectedTemplateForRequest ? "flex flex-col flex-1 min-h-0 h-full" : undefined}
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+              >
+                {!selectedTemplateForRequest ? (
+                  <TemplateSelector 
+                    templates={workflows} 
+                    onSelect={(w) => setSelectedTemplateForRequest(w)} 
+                  />
+                ) : (
+                  <div className="flex flex-col flex-1 min-h-0 h-full gap-3">
+                    <button 
+                      type="button"
+                      onClick={() => setSelectedTemplateForRequest(null)}
+                      className="shrink-0 text-sm text-indigo-600 font-semibold flex items-center gap-1 hover:underline w-fit"
+                    >
+                      <ChevronRight className="w-4 h-4 rotate-180" />
+                      Change Template
+                    </button>
+                    <div className="flex-1 min-h-0 flex flex-col">
+                      <WorkflowRequestCreator 
+                        template={selectedTemplateForRequest} 
+                        entity={selectedEntity || undefined}
+                        onSuccess={() => { setSelectedTemplateForRequest(null); setActiveTab('requests'); fetchRequests(); }} 
+                      />
+                    </div>
+                  </div>
+                )}
+              </motion.div>
+            )}
+
+            {activeTab === 'requests' && (
+              <motion.div
+                key="requests"
+                className="flex flex-col flex-1 min-h-0"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+              >
+                <WorkflowRequestList 
+                  requests={requests} 
+                  user={user}
+                  onRefresh={fetchRequests} 
+                  preSelectedRequestId={preSelectedRequestId}
+                  onClearPreSelected={() => setPreSelectedRequestId(null)}
+                />
+              </motion.div>
+            )}
+
+            {activeTab === 'procurement' && hasPermission('view_procurement_center') && (
+              <motion.div
+                key="procurement"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+              >
+                <ProcurementCenter user={user} entityScope={selectedEntity || ''} />
+              </motion.div>
+            )}
+
+            {activeTab === 'admin' && user.roles?.some(r => r.toLowerCase() === 'admin') && (
+              <motion.div
+                key="admin"
+                className="flex flex-col flex-1 min-h-0"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+              >
+                <RoleManager roles={roles} onRefresh={fetchRoles} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      </main>
+    </div>
+  );
+}
