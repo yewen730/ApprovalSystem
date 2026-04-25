@@ -382,6 +382,130 @@ const refreshRolePermissionsCache = async (pool: sql.ConnectionPool) => {
   }
 };
 
+const quoteSqlServerIdent = (name: string): string => `[${String(name || "").replace(/]/g, "]]")}]`;
+
+type CostCenterTableInfo = {
+  schemaName: string;
+  tableName: string;
+  qualifiedName: string;
+  hasId: boolean;
+};
+
+/** Resolve the physical SQL table used for cost-center catalogs (strictly `cost_center`). */
+async function resolveCostCenterTableInfo(pool: sql.ConnectionPool): Promise<CostCenterTableInfo> {
+  const rs = await pool.request().query(`
+    SELECT TOP 1
+      s.name AS schema_name,
+      t.name AS table_name,
+      CASE WHEN EXISTS (
+        SELECT 1 FROM sys.columns c WHERE c.object_id = t.object_id AND c.name = N'id'
+      ) THEN 1 ELSE 0 END AS has_id
+    FROM sys.tables t
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    WHERE t.name = N'cost_center'
+    ORDER BY CASE WHEN s.name = N'dbo' THEN 0 ELSE 1 END, s.name
+  `);
+  const row = rs.recordset?.[0] as { schema_name?: unknown; table_name?: unknown; has_id?: unknown } | undefined;
+  const schemaName = String(row?.schema_name || "").trim();
+  const tableName = String(row?.table_name || "").trim();
+  if (!schemaName || !tableName) {
+    throw new Error("Required table `cost_center` was not found in this SQL Server database.");
+  }
+  return {
+    schemaName,
+    tableName,
+    qualifiedName: `${quoteSqlServerIdent(schemaName)}.${quoteSqlServerIdent(tableName)}`,
+    hasId: Number(row?.has_id ?? 0) === 1,
+  };
+}
+
+/**
+ * Ensures `cost_center` exists and has columns used by GET /api/cost-centers.
+ * Called at startup and again on each cost-centers read so a failed startup migration can self-heal.
+ */
+async function ensureCostCentersTable(pool: sql.ConnectionPool): Promise<void> {
+  await pool.request().query(`
+    IF NOT EXISTS (SELECT 1 FROM sys.tables t WHERE t.name = N'cost_center')
+    BEGIN
+      CREATE TABLE dbo.cost_center (
+        id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_cost_centers PRIMARY KEY,
+        entity NVARCHAR(32) NOT NULL,
+        code NVARCHAR(64) NOT NULL,
+        name NVARCHAR(500) NOT NULL,
+        gl_account NVARCHAR(128) NULL,
+        approval NVARCHAR(512) NULL,
+        status BIT NOT NULL CONSTRAINT DF_cost_centers_status DEFAULT (1),
+        created_at DATETIME2(3) NOT NULL CONSTRAINT DF_cost_centers_created DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_cost_centers_entity_code UNIQUE (entity, code)
+      );
+      CREATE INDEX IX_cost_centers_entity_status_code ON dbo.cost_center (entity, status, code);
+    END
+  `);
+  const tableInfo = await resolveCostCenterTableInfo(pool);
+  const colLengthTarget = `${tableInfo.schemaName}.${tableInfo.tableName}`.replace(/'/g, "''");
+  await pool.request().query(`
+    IF OBJECT_ID(N'${colLengthTarget}', N'U') IS NOT NULL
+    BEGIN
+      IF COL_LENGTH('${colLengthTarget}', 'entity') IS NULL
+        ALTER TABLE ${tableInfo.qualifiedName} ADD entity NVARCHAR(32) NULL;
+      IF COL_LENGTH('${colLengthTarget}', 'gl_account') IS NULL
+        ALTER TABLE ${tableInfo.qualifiedName} ADD gl_account NVARCHAR(128) NULL;
+      IF COL_LENGTH('${colLengthTarget}', 'approval') IS NULL
+        ALTER TABLE ${tableInfo.qualifiedName} ADD approval NVARCHAR(512) NULL;
+      IF COL_LENGTH('${colLengthTarget}', 'status') IS NULL
+        ALTER TABLE ${tableInfo.qualifiedName} ADD status BIT NOT NULL CONSTRAINT DF_cc_status_patch DEFAULT (1);
+      IF COL_LENGTH('${colLengthTarget}', 'created_at') IS NULL
+        ALTER TABLE ${tableInfo.qualifiedName} ADD created_at DATETIME2(3) NOT NULL CONSTRAINT DF_cc_created_patch DEFAULT SYSUTCDATETIME();
+      IF EXISTS (
+        SELECT 1
+        FROM sys.key_constraints kc
+        WHERE kc.parent_object_id = OBJECT_ID(N'${colLengthTarget}')
+          AND kc.name = N'UQ_cost_centers_code'
+      )
+      BEGIN
+        ALTER TABLE ${tableInfo.qualifiedName} DROP CONSTRAINT UQ_cost_centers_code;
+      END
+      IF NOT EXISTS (
+        SELECT 1
+        FROM sys.key_constraints kc
+        WHERE kc.parent_object_id = OBJECT_ID(N'${colLengthTarget}')
+          AND kc.name = N'UQ_cost_centers_entity_code'
+      )
+      BEGIN
+        ALTER TABLE ${tableInfo.qualifiedName}
+        ADD CONSTRAINT UQ_cost_centers_entity_code UNIQUE (entity, code);
+      END
+    END
+  `);
+  await pool.request().query(`
+    IF NOT EXISTS (
+      SELECT 1
+      FROM sys.indexes i
+      WHERE i.object_id = OBJECT_ID(N'${colLengthTarget}')
+        AND i.name = N'IX_cost_centers_entity_status_code'
+    )
+    BEGIN
+      CREATE INDEX IX_cost_centers_entity_status_code ON ${tableInfo.qualifiedName} (entity, status, code);
+    END
+  `);
+  const cntRs = await pool.request().query(`SELECT COUNT(*) AS c FROM ${tableInfo.qualifiedName}`);
+  const n = Number((cntRs.recordset?.[0] as any)?.c ?? 0);
+  if (n === 0) {
+    await pool.request().query(`
+      INSERT INTO ${tableInfo.qualifiedName} (entity, code, name, gl_account, approval, status) VALUES
+      (N'GCCM', N'1000', N'IT Department', NULL, NULL, 1),
+      (N'GCCM', N'2000', N'HR Department', NULL, NULL, 1),
+      (N'GCCM', N'3000', N'Finance Department', NULL, NULL, 1),
+      (N'GCCM', N'4000', N'Marketing', NULL, NULL, 1),
+      (N'GCCM', N'5000', N'Operations', NULL, NULL, 1),
+      (N'GCCM', N'6000', N'Sales', NULL, NULL, 1),
+      (N'GCCM', N'7000', N'R&D', NULL, NULL, 1),
+      (N'GCCM', N'8000', N'Legal', NULL, NULL, 1),
+      (N'GCCM', N'9000', N'Administration', NULL, NULL, 1);
+    `);
+  }
+}
+
 /** Optional columns for workflow / request tables on SQL Server (safe no-ops if already present). */
 const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
   try {
@@ -491,38 +615,7 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
     console.warn("SQL entity_approver_registry table:", e?.message || e);
   }
   try {
-    await pool.request().query(`
-      IF OBJECT_ID(N'dbo.cost_centers', N'U') IS NULL
-      BEGIN
-        CREATE TABLE dbo.cost_centers (
-          id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_cost_centers PRIMARY KEY,
-          code NVARCHAR(64) NOT NULL,
-          name NVARCHAR(500) NOT NULL,
-          gl_account NVARCHAR(128) NULL,
-          approval NVARCHAR(512) NULL,
-          status BIT NOT NULL CONSTRAINT DF_cost_centers_status DEFAULT (1),
-          created_at DATETIME2(3) NOT NULL CONSTRAINT DF_cost_centers_created DEFAULT SYSUTCDATETIME(),
-          CONSTRAINT UQ_cost_centers_code UNIQUE (code)
-        );
-        CREATE INDEX IX_cost_centers_status ON dbo.cost_centers (status);
-      END
-    `);
-    const cntRs = await pool.request().query(`SELECT COUNT(*) AS c FROM dbo.cost_centers`);
-    const n = Number((cntRs.recordset?.[0] as any)?.c ?? 0);
-    if (n === 0) {
-      await pool.request().query(`
-        INSERT INTO dbo.cost_centers (code, name, gl_account, approval, status) VALUES
-        (N'1000', N'IT Department', NULL, NULL, 1),
-        (N'2000', N'HR Department', NULL, NULL, 1),
-        (N'3000', N'Finance Department', NULL, NULL, 1),
-        (N'4000', N'Marketing', NULL, NULL, 1),
-        (N'5000', N'Operations', NULL, NULL, 1),
-        (N'6000', N'Sales', NULL, NULL, 1),
-        (N'7000', N'R&D', NULL, NULL, 1),
-        (N'8000', N'Legal', NULL, NULL, 1),
-        (N'9000', N'Administration', NULL, NULL, 1);
-      `);
-    }
+    await ensureCostCentersTable(pool);
   } catch (e: any) {
     console.warn("SQL cost_centers table:", e?.message || e);
   }
@@ -1050,33 +1143,65 @@ async function startServer() {
     }
   });
 
-  /** Cost / project centers for procurement dropdowns (`status = 1` active only unless admin passes include_inactive=1). */
-  app.get("/api/cost-centers", authenticate, async (req: any, res) => {
+  /** Rows from `cost_center` on the SQL catalog (source of truth for dropdowns). */
+  app.get("/api/cost-centers", authenticate, requireEntityContext, async (req: any, res) => {
     const canManage =
       req.user?.permissions?.includes("manage_users") || req.user?.permissions?.includes("admin");
     const includeInactive = canManage && String(req.query.include_inactive || "") === "1";
+    const ent = String(req.entityContext || "").trim().toUpperCase();
+    if (!ent) return res.status(400).json({ error: "entity is required" });
+    const exposeDetails = process.env.NODE_ENV !== "production";
     try {
+      await ensureCostCentersTable(sqlPool);
+    } catch (e: any) {
+      console.error("GET /api/cost-centers schema ensure:", e?.message || e);
+      return res.status(500).json({
+        error:
+          "Cost centers catalog is unavailable (database could not create or update dbo.cost_center). Check SQL permissions and server logs.",
+        ...(exposeDetails ? { details: String(e?.message || e) } : {}),
+      });
+    }
+    try {
+      const tableInfo = await resolveCostCenterTableInfo(sqlPool);
+      const idProjection = tableInfo.hasId ? "id" : "NULL AS id";
       const q = includeInactive
-        ? `SELECT id, code, name, gl_account, approval, status, created_at FROM dbo.cost_centers ORDER BY code ASC`
-        : `SELECT id, code, name, gl_account, approval, status, created_at FROM dbo.cost_centers WHERE status = 1 ORDER BY code ASC`;
-      const rs = await sqlPool.request().query(q);
-      const rows = (rs.recordset || []).map((r: any) => ({
-        id: r.id,
-        code: r.code,
-        name: r.name,
-        gl_account: r.gl_account ?? null,
-        approval: r.approval ?? null,
-        status: !!r.status,
-        created_at: r.created_at,
-      }));
+        ? `SELECT ${idProjection}, entity, code, name, gl_account, approval, status, created_at FROM ${tableInfo.qualifiedName}
+           WHERE UPPER(LTRIM(RTRIM(entity))) = @entity
+           ORDER BY code ASC`
+        : `SELECT ${idProjection}, entity, code, name, gl_account, approval, status, created_at FROM ${tableInfo.qualifiedName}
+           WHERE UPPER(LTRIM(RTRIM(entity))) = @entity AND status = 1
+           ORDER BY code ASC`;
+      const rs = await sqlPool.request().input("entity", sql.NVarChar, ent).query(q);
+      const rows = (rs.recordset || []).map((r: any) => {
+        const codeRaw = r.code ?? r.Code;
+        const nameRaw = r.name ?? r.Name;
+        return {
+          id: r.id,
+          entity: r.entity,
+          code: codeRaw != null ? String(codeRaw).trim() : "",
+          name: nameRaw != null ? String(nameRaw).trim() : "",
+          gl_account: r.gl_account ?? r.GL_Account ?? null,
+          approval: r.approval ?? r.Approval ?? null,
+          status: !!r.status,
+          created_at: r.created_at,
+        };
+      });
       return res.json(rows);
     } catch (e: any) {
       console.error("GET /api/cost-centers:", e?.message || e);
-      return res.status(500).json({ error: "Failed to load cost centers" });
+      return res.status(500).json({
+        error: "Failed to load cost centers",
+        ...(exposeDetails ? { details: String(e?.message || e) } : {}),
+      });
     }
   });
 
-  app.post("/api/cost-centers", authenticate, hasPermission("manage_users"), async (req: any, res) => {
+  app.post("/api/cost-centers", authenticate, requireEntityContext, hasPermission("manage_users"), async (req: any, res) => {
+    const entity = String(req.entityContext || "").trim().toUpperCase();
+    const bodyEntity = String(req.body?.entity || "").trim().toUpperCase();
+    if (bodyEntity && bodyEntity !== entity) {
+      return res.status(400).json({ error: "entity in body must match active entity (X-Entity header)" });
+    }
     const code = String(req.body?.code ?? "").trim();
     const name = String(req.body?.name ?? "").trim();
     const gl_account = req.body?.gl_account != null ? String(req.body.gl_account).trim() : "";
@@ -1087,37 +1212,52 @@ async function startServer() {
       if (s !== 0 && s !== 1) return res.status(400).json({ error: "status must be 0 or 1" });
       statusBit = s;
     }
-    if (!code || !name) return res.status(400).json({ error: "code and name are required" });
+    if (!entity || !code || !name) return res.status(400).json({ error: "entity, code and name are required" });
     try {
+      const tableInfo = await resolveCostCenterTableInfo(sqlPool);
+      const outputClause = tableInfo.hasId ? "OUTPUT INSERTED.id AS id" : "";
       const ins = await sqlPool
         .request()
+        .input("entity", sql.NVarChar, entity)
         .input("code", sql.NVarChar, code)
         .input("name", sql.NVarChar, name)
         .input("gl_account", sql.NVarChar, gl_account || null)
         .input("approval", sql.NVarChar, approval || null)
         .input("status", sql.Bit, statusBit)
         .query(`
-          INSERT INTO dbo.cost_centers (code, name, gl_account, approval, status)
-          OUTPUT INSERTED.id AS id
-          VALUES (@code, @name, @gl_account, @approval, @status)
+          INSERT INTO ${tableInfo.qualifiedName} (entity, code, name, gl_account, approval, status)
+          ${outputClause}
+          VALUES (@entity, @code, @name, @gl_account, @approval, @status)
         `);
       const id = ins.recordset?.[0]?.id;
       return res.json({ id });
     } catch (e: any) {
       const msg = String(e?.message || e || "");
       if (/UQ_cost_centers|duplicate|unique/i.test(msg)) {
-        return res.status(400).json({ error: "A cost center with this code already exists" });
+        return res.status(400).json({ error: "A cost center with this code already exists for this entity" });
       }
       return res.status(400).json({ error: msg || "Failed to create cost center" });
     }
   });
 
-  app.patch("/api/cost-centers/:id", authenticate, hasPermission("manage_users"), async (req: any, res) => {
+  app.patch("/api/cost-centers/:id", authenticate, requireEntityContext, hasPermission("manage_users"), async (req: any, res) => {
     const id = Number(req.params.id);
+    const ent = String(req.entityContext || "").trim().toUpperCase();
+    const bodyEntity = String(req.body?.entity || "").trim().toUpperCase();
     if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: "Invalid id" });
+    if (!ent) return res.status(400).json({ error: "entity is required" });
+    if (bodyEntity && bodyEntity !== ent) {
+      return res.status(400).json({ error: "entity in body must match active entity (X-Entity header)" });
+    }
     const { code, name, gl_account, approval, status } = req.body || {};
     try {
-      const cur = await sqlPool.request().input("id", sql.Int, id).query(`SELECT TOP 1 * FROM dbo.cost_centers WHERE id = @id`);
+      const tableInfo = await resolveCostCenterTableInfo(sqlPool);
+      if (!tableInfo.hasId) return res.status(400).json({ error: "Table cost_center does not expose an id column." });
+      const cur = await sqlPool
+        .request()
+        .input("id", sql.Int, id)
+        .input("entity", sql.NVarChar, ent)
+        .query(`SELECT TOP 1 * FROM ${tableInfo.qualifiedName} WHERE id = @id AND UPPER(LTRIM(RTRIM(entity))) = @entity`);
       const row = cur.recordset?.[0];
       if (!row) return res.status(404).json({ error: "Cost center not found" });
       const nextCode = code !== undefined ? String(code).trim() : String(row.code);
@@ -1134,19 +1274,22 @@ async function startServer() {
       await sqlPool
         .request()
         .input("id", sql.Int, id)
+        .input("entity", sql.NVarChar, ent)
         .input("code", sql.NVarChar, nextCode)
         .input("name", sql.NVarChar, nextName)
         .input("gl_account", sql.NVarChar, nextGl)
         .input("approval", sql.NVarChar, nextAppr)
         .input("status", sql.Bit, nextStatus ? 1 : 0)
         .query(
-          `UPDATE dbo.cost_centers SET code = @code, name = @name, gl_account = @gl_account, approval = @approval, status = @status WHERE id = @id`
+          `UPDATE ${tableInfo.qualifiedName}
+           SET code = @code, name = @name, gl_account = @gl_account, approval = @approval, status = @status
+           WHERE id = @id AND UPPER(LTRIM(RTRIM(entity))) = @entity`
         );
       return res.json({ success: true });
     } catch (e: any) {
       const msg = String(e?.message || e || "");
       if (/UQ_cost_centers|duplicate|unique/i.test(msg)) {
-        return res.status(400).json({ error: "A cost center with this code already exists" });
+        return res.status(400).json({ error: "A cost center with this code already exists for this entity" });
       }
       return res.status(400).json({ error: msg || "Update failed" });
     }
@@ -2034,10 +2177,17 @@ async function startServer() {
 
     const isPR = isPRName(request.template_name) && request.template_category === "procurement";
     const isPurchasing = req.user.roles && req.user.roles.some((r: string) => r.toLowerCase() === "purchasing");
+    const userIsRequester = req.user.id === request.requester_id;
+    const userHasEditPermission =
+      req.user.permissions && (req.user.permissions.includes("edit_requests") || req.user.permissions.includes("admin"));
+    const allowRequesterRejectedPrEdit = request.status === "rejected" && isPR && userIsRequester;
+    const allowAdminRejectedPrEdit = request.status === "rejected" && isPR && !!req.user.permissions?.includes("admin");
 
     if (request.status !== "pending") {
       if (request.status === "approved" && isPR && isPurchasing) {
         // Allow purchasing to edit approved PRs
+      } else if (allowRequesterRejectedPrEdit || allowAdminRejectedPrEdit) {
+        // Allow requester/admin to edit rejected PR before resubmission
       } else {
         return res.status(400).json({ error: "Only pending requests can be edited" });
       }
@@ -2046,8 +2196,7 @@ async function startServer() {
     const steps = JSON.parse(request.template_steps);
     const currentStep = request.status === "pending" ? steps[request.current_step_index] : null;
 
-    const userHasEditPermission =
-      req.user.permissions && (req.user.permissions.includes("edit_requests") || req.user.permissions.includes("admin"));
+    const userHasEditPermissionResolved = userHasEditPermission;
     const roleMatch =
       currentStep &&
       req.user.roles &&
@@ -2056,17 +2205,23 @@ async function startServer() {
       currentStep &&
       ((roleMatch && req.user.department === request.department) ||
         (currentStep.approverRole.toLowerCase() === "som" && isSomUser(req)));
-    const userIsRequester = req.user.id === request.requester_id;
+    const userIsRequesterResolved = userIsRequester;
 
-    if (!userHasEditPermission && !userIsRequester && !(request.status === "approved" && isPR && isPurchasing)) {
+    if (
+      !userHasEditPermissionResolved &&
+      !userIsRequesterResolved &&
+      !(request.status === "approved" && isPR && isPurchasing) &&
+      !allowRequesterRejectedPrEdit &&
+      !allowAdminRejectedPrEdit
+    ) {
       return res.status(403).json({ error: "You do not have permission to edit this request" });
     }
 
     if (
       request.status === "pending" &&
-      userHasEditPermission &&
+      userHasEditPermissionResolved &&
       !userIsCurrentApprover &&
-      !userIsRequester &&
+      !userIsRequesterResolved &&
       !req.user.permissions.includes("admin")
     ) {
       return res.status(403).json({ error: "Only the current approver or the requester can edit this request" });
@@ -2472,6 +2627,87 @@ async function startServer() {
 
     approvalEventLog(
       `REQUEST_APPROVAL ${formatActor(req)} request_id=${Number(requestId)} step_index=${request.current_step_index} decision=${approvalLogSanitize(String(status), 20)} formatted_id=${approvalLogSanitize(String(request.formatted_id || ""), 64)} title=${approvalLogSanitize(String(request.title || ""), 200)}`
+    );
+    return res.json({ success: true });
+  });
+
+  /**
+   * Purchasing final decision for approved PRs:
+   * - rejected: requester may edit + resubmit.
+   * - cancelled: terminal stop (cannot resubmit).
+   */
+  app.post("/api/workflow-requests/:id/purchasing-decision", authenticate, requireEntityContext, async (req: any, res) => {
+    const decisionRaw = String(req.body?.decision || "").trim().toLowerCase();
+    const comment = String(req.body?.comment || "").trim();
+    const requestId = Number(req.params.id);
+    if (!Number.isFinite(requestId) || requestId <= 0) return res.status(400).json({ error: "Invalid request id" });
+    if (decisionRaw !== "rejected" && decisionRaw !== "cancelled") {
+      return res.status(400).json({ error: "decision must be either rejected or cancelled" });
+    }
+    const isPurchasing = req.user.roles && req.user.roles.some((r: string) => r.toLowerCase() === "purchasing");
+    const isAdmin = req.user.permissions && req.user.permissions.includes("admin");
+    if (!isPurchasing && !isAdmin) {
+      return res.status(403).json({ error: "Only purchasing staff can take final PR decision" });
+    }
+
+    const rq = await sqlPool.request().input("id", sql.Int, requestId).query(`
+      SELECT r.*, COALESCE(r.request_steps, w.steps) AS template_steps, w.name AS template_name, w.category AS template_category
+      FROM workflow_requests r
+      INNER JOIN workflows w ON r.template_id = w.id
+      WHERE r.id = @id
+    `);
+    const request: any = rq.recordset?.[0];
+    if (!assertWorkflowRequestAccess(req, res, request, request?.template_category)) return;
+    if (!request) return res.status(404).json({ error: "Request not found" });
+    if (request.status !== "approved") return res.status(400).json({ error: "Only approved PR can be rejected/cancelled by purchasing" });
+    if (!(request.template_category === "procurement" && isPRName(String(request.template_name || "")))) {
+      return res.status(400).json({ error: "Purchasing final decision is only available for PR" });
+    }
+
+    let stepCount = 0;
+    try {
+      const arr = JSON.parse(request.template_steps || "[]");
+      stepCount = Array.isArray(arr) ? arr.length : 0;
+    } catch {
+      stepCount = 0;
+    }
+
+    const actorName = String(req.user.username || "");
+    try {
+      await sqlPool
+        .request()
+        .input("request_id", sql.Int, requestId)
+        .input("step_index", sql.Int, Math.max(0, stepCount))
+        .input("approver_id", sql.Int, Number(req.user.id))
+        .input("approver_username", sql.NVarChar, actorName)
+        .input("approver_role_snapshot", sql.NVarChar, "purchasing_final")
+        .input("request_title_snapshot", sql.NVarChar, request.title || "")
+        .input("request_formatted_id_snapshot", sql.NVarChar, request.formatted_id || null)
+        .input("status", sql.NVarChar, decisionRaw)
+        .input("comment", sql.NVarChar, comment)
+        .input("approver_signature", sql.NVarChar(sql.MAX), null)
+        .query(`
+          INSERT INTO request_approvals (
+            request_id, step_index, approver_id, approver_username, approver_role_snapshot,
+            request_title_snapshot, request_formatted_id_snapshot, status, comment, approver_signature
+          ) VALUES (
+            @request_id, @step_index, @approver_id, @approver_username, @approver_role_snapshot,
+            @request_title_snapshot, @request_formatted_id_snapshot, @status, @comment, @approver_signature
+          )
+        `);
+
+      await sqlPool
+        .request()
+        .input("id", sql.Int, requestId)
+        .input("status", sql.NVarChar, decisionRaw)
+        .query("UPDATE workflow_requests SET status = @status WHERE id = @id");
+    } catch (e: any) {
+      console.error("SQL purchasing-decision:", e?.message || e);
+      return res.status(400).json({ error: e?.message || "Purchasing final decision failed" });
+    }
+
+    approvalEventLog(
+      `REQUEST_PURCHASING_DECISION ${formatActor(req)} request_id=${requestId} decision=${approvalLogSanitize(decisionRaw, 20)} formatted_id=${approvalLogSanitize(String(request.formatted_id || ""), 64)} title=${approvalLogSanitize(String(request.title || ""), 200)}`
     );
     return res.json({ success: true });
   });

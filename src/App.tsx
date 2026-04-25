@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   LayoutDashboard, 
   PlusCircle, 
@@ -27,6 +27,7 @@ import {
   Package,
   Receipt,
   Search,
+  ChevronDown,
   Plus,
   X,
   Eye,
@@ -54,6 +55,7 @@ import { cn } from './lib/utils';
 
 // --- API Helpers ---
 const FLOWMASTER_ENTITY_KEY = 'flowmaster_entity';
+const FLOWMASTER_ENTITY_CHANGED_EVENT = 'flowmaster-entity-changed';
 
 const api = {
   token: localStorage.getItem('token'),
@@ -68,6 +70,7 @@ const api = {
   setActiveEntity(entity: string | null) {
     if (entity) localStorage.setItem(FLOWMASTER_ENTITY_KEY, entity);
     else localStorage.removeItem(FLOWMASTER_ENTITY_KEY);
+    window.dispatchEvent(new CustomEvent(FLOWMASTER_ENTITY_CHANGED_EVENT, { detail: { entity } }));
   },
   async request(path: string, options: RequestInit & { skipEntity?: boolean } = {}) {
     const { skipEntity: skipEntityOpt, ...fetchOptions } = options;
@@ -91,7 +94,9 @@ const api = {
     if (!res.ok) {
       if (isJson) {
         const err = await res.json();
-        throw new Error(err.error || 'Something went wrong');
+        const base = err.error || 'Something went wrong';
+        const detail = err.details != null && String(err.details).trim() ? ` — ${String(err.details).trim()}` : '';
+        throw new Error(base + detail);
       }
       const text = await res.text();
       throw new Error(text || `Request failed (${res.status})`);
@@ -311,7 +316,7 @@ const Login = ({ onLogin }: { onLogin: (user: User) => void }) => {
           <div className="w-12 h-12 bg-indigo-600 rounded-xl flex items-center justify-center mb-4 shadow-lg shadow-indigo-200">
             <Shield className="text-white w-6 h-6" />
           </div>
-          <h1 className="text-2xl font-bold text-zinc-900">FlowMaster</h1>
+          <h1 className="text-2xl font-bold text-zinc-900">Approval System</h1>
           <p className="text-zinc-500 text-sm mt-1">
             {isRegister ? 'Create your account' : 'Sign in to your account'}
           </p>
@@ -373,18 +378,6 @@ const Login = ({ onLogin }: { onLogin: (user: User) => void }) => {
             {isRegister ? 'Already have an account? Login' : "Don't have an account? Register"}
           </button>
         </div>
-
-        {!isRegister && (
-          <div className="mt-8 p-4 bg-zinc-50 rounded-xl border border-zinc-200">
-            <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Test Accounts (Password: password123)</h3>
-            <div className="grid grid-cols-2 gap-2 text-[10px]">
-              <div className="text-zinc-600">IT: <span className="font-mono">preparer_it, checker_it, approver_it, director_it</span></div>
-              <div className="text-zinc-600">HR: <span className="font-mono">preparer_hr, checker_hr, approver_hr</span></div>
-              <div className="text-zinc-600 col-span-2">Multi-Role (IT): <span className="font-mono">multi_role_user</span> (Prep + Check)</div>
-              <div className="text-zinc-600 col-span-2">Admin: <span className="font-mono">admin / admin123</span></div>
-            </div>
-          </div>
-        )}
       </motion.div>
     </div>
   );
@@ -1053,10 +1046,14 @@ const isWorkflowRequestPending = (r: Pick<WorkflowRequest, 'status'>) =>
 const isWorkflowRequestRejected = (r: Pick<WorkflowRequest, 'status'>) =>
   normalizeWorkflowRequestStatus(r.status) === 'rejected';
 
+const isWorkflowRequestCancelled = (r: Pick<WorkflowRequest, 'status'>) =>
+  normalizeWorkflowRequestStatus(r.status) === 'cancelled';
+
 const workflowRequestStatusBadgeClass = (r: WorkflowRequest) => {
   const n = normalizeWorkflowRequestStatus(r.status);
   if (n === 'approved') return 'bg-emerald-100 text-emerald-700 ring-1 ring-inset ring-emerald-200/70';
   if (n === 'rejected') return 'bg-red-100 text-red-700 ring-1 ring-inset ring-red-200/70';
+  if (n === 'cancelled') return 'bg-zinc-200 text-zinc-700 ring-1 ring-inset ring-zinc-300/70';
   return 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-200/70';
 };
 
@@ -1064,6 +1061,7 @@ const formatWorkflowRequestStatusLabel = (r: WorkflowRequest) => {
   const n = normalizeWorkflowRequestStatus(r.status);
   if (n === 'approved') return 'Approved';
   if (n === 'rejected') return 'Rejected';
+  if (n === 'cancelled') return 'Cancelled';
   if (n === 'pending') return 'Pending';
   return r.status ?? '—';
 };
@@ -1074,6 +1072,10 @@ const isPurchasingRole = (user: User) =>
 
 /** Show Convert to PO only for fully approved procurement PRs on the purchasing side. */
 const canShowConvertPRToPO = (r: WorkflowRequest, user: User) =>
+  isWorkflowRequestFullyApproved(r) && isPR_Only(r) && isPurchasingRole(user);
+
+/** Purchasing can still override an already-approved PR with reject/cancel. */
+const canShowPurchasingFinalDecision = (r: WorkflowRequest, user: User) =>
   isWorkflowRequestFullyApproved(r) && isPR_Only(r) && isPurchasingRole(user);
 
 /** F-PU-003 style form PDF — only for procurement Purchase Request (see isPR_Only). Landscape for wider table. */
@@ -1419,7 +1421,7 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
   const tableRight = right;
   /** Min table rows (blank lines) like paper form. */
   const SR_MIN_DATA_ROWS = 1;
-  const colWidths = [8, 44, 22, 50, 18, 18, 38, 79];
+  const colWidths = [8, 38, 20, 44, 16, 16, 26, 32, 77];
   const colXs: number[] = [];
   {
     let x = tableLeft;
@@ -1493,6 +1495,7 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
     ]);
     const minQ = getItemValue(item, ['min quantity']);
     const maxQ = getItemValue(item, ['max quantity']);
+    const cc = getItemValue(item, ['cost center', 'cost center account no.', 'cost centre']);
     const spareLoc = getItemValue(item, ['spare for (location)', 'spare for', 'location']);
     const reason = getItemValue(item, ['reason']);
     const lineOnlyRemarks = item && item[LINE_ITEM_REMARKS_KEY] ? String(item[LINE_ITEM_REMARKS_KEY]).trim() : '';
@@ -1505,8 +1508,9 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
       wrap(supplier, 3, bodyFont),
       wrap(minQ || '-', 4, bodyFont),
       wrap(maxQ || '-', 5, bodyFont),
-      wrap(spareLoc, 6, bodyFont),
-      wrap(reason || '-', 7, bodyFont),
+      wrap(cc || '-', 6, bodyFont),
+      wrap(spareLoc, 7, bodyFont),
+      wrap(reason || '-', 8, bodyFont),
     ];
     const linesPerCol = cells.map((lines) => lines.length);
     const h = Math.max(minRowH, Math.max(...linesPerCol, 1) * lineStepBody + padY * 2);
@@ -1524,6 +1528,7 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
       wrap('', 5, bodyFont),
       wrap('', 6, bodyFont),
       wrap('', 7, bodyFont),
+      wrap('', 8, bodyFont),
     ];
     dataBlocks.push({ kind: 'data', cells, h: minRowH });
   }
@@ -1963,57 +1968,196 @@ function procurementCurrencyPrefix(code: string | undefined | null): string {
   return s ? `${s} ` : '';
 }
 
-/** Used when `/api/cost-centers` is empty or unreachable; primary list comes from `cost_centers` table (SQL Server). */
-const FALLBACK_COST_CENTER_OPTIONS = [
-  '1000 - IT Department',
-  '2000 - HR Department',
-  '3000 - Finance Department',
-  '4000 - Marketing',
-  '5000 - Operations',
-  '6000 - Sales',
-  '7000 - R&D',
-  '8000 - Legal',
-  '9000 - Administration',
-];
+/** One row from GET `/api/cost-centers` → pick list (stored value is always `code` for PR/SR grids). */
+type CostCenterPickOption = {
+  value: string;
+  code: string;
+  name: string;
+  searchLower: string;
+};
 
-function costCenterRowToLabel(r: { code?: string; name?: string }): string {
-  const c = String(r.code ?? '').trim();
-  const n = String(r.name ?? '').trim();
-  if (c && n) return `${c} - ${n}`;
-  return c || n || '';
+function costCenterPickOptionsFromRows(rows: unknown): CostCenterPickOption[] {
+  if (!Array.isArray(rows)) return [];
+  const seen = new Set<string>();
+  const out: CostCenterPickOption[] = [];
+  for (const r of rows as { code?: unknown; name?: unknown }[]) {
+    const code = String(r?.code ?? '').trim();
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    const name = String(r?.name ?? '').trim();
+    const searchLower = `${code}\n${name}`.toLowerCase();
+    out.push({ value: code, code, name, searchLower });
+  }
+  out.sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true }));
+  return out;
 }
 
-function useCostCenterOptions(): string[] {
-  const [opts, setOpts] = useState<string[]>(FALLBACK_COST_CENTER_OPTIONS);
+/** Match a stored line cell to a cost_centers row (code, name, or "code — name" from older UIs). */
+function catalogPickMatch(raw: string | undefined | null, options: CostCenterPickOption[]): CostCenterPickOption | undefined {
+  const t = String(raw ?? '').trim();
+  if (!t) return undefined;
+  const lower = t.toLowerCase();
+  const byCode = options.find((o) => o.code === t);
+  if (byCode) return byCode;
+  const byName = options.find((o) => o.name && o.name.toLowerCase() === lower);
+  if (byName) return byName;
+  for (const o of options) {
+    const emDash = `${o.code} — `;
+    const hyphen = `${o.code} - `;
+    if (t.startsWith(emDash) || lower.startsWith(emDash.toLowerCase())) return o;
+    if (t.startsWith(hyphen)) return o;
+  }
+  return undefined;
+}
+
+function formatCostCenterCatalogCell(raw: string | undefined | null, options: CostCenterPickOption[]): string {
+  const t = String(raw ?? '').trim();
+  if (!t) return '-';
+  const m = catalogPickMatch(t, options);
+  if (!m) return t;
+  return m.name ? `${m.code} — ${m.name}` : m.code;
+}
+
+/** Persist only catalog `code` for Cost Center / Spare Location cells. */
+function normalizeCatalogCodeValue(raw: unknown, options: CostCenterPickOption[]): string {
+  const t = String(raw ?? '').trim();
+  if (!t) return '';
+  const m = catalogPickMatch(t, options);
+  return m?.code || t;
+}
+
+function normalizeProcurementCatalogLineItems(
+  items: any[],
+  options: CostCenterPickOption[],
+  forSR: boolean
+): any[] {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  return items.map((item) => {
+    if (!item || typeof item !== 'object') return item;
+    const next = { ...item };
+    for (const col of Object.keys(next)) {
+      if (isCostCenterGridColumn(col) || (forSR && isSpareLocationColumn(col))) {
+        next[col] = normalizeCatalogCodeValue(next[col], options);
+      }
+    }
+    return next;
+  });
+}
+
+const normalizeGridColumnName = (col: string): string =>
+  String(col || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+
+const COST_CENTER_GRID_COLUMN_KEYS = new Set(['cost center', 'cost center account no.', 'cost centre']);
+const SPARE_LOCATION_GRID_COLUMN_KEYS = new Set(['spare for (location)', 'spare for']);
+
+const isCostCenterGridColumn = (col: string) => COST_CENTER_GRID_COLUMN_KEYS.has(normalizeGridColumnName(col));
+
+/** Active rows from `dbo.cost_centers` via GET `/api/cost-centers`. */
+function useCostCenterOptions(): {
+  options: CostCenterPickOption[];
+  loading: boolean;
+  failed: boolean;
+  fetchError: string | null;
+} {
+  const [activeEntity, setActiveEntity] = useState<string>(() => String(localStorage.getItem(FLOWMASTER_ENTITY_KEY) || '').trim().toUpperCase());
+  const [opts, setOpts] = useState<CostCenterPickOption[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const syncEntity = () => setActiveEntity(String(localStorage.getItem(FLOWMASTER_ENTITY_KEY) || '').trim().toUpperCase());
+    window.addEventListener('storage', syncEntity);
+    window.addEventListener(FLOWMASTER_ENTITY_CHANGED_EVENT, syncEntity as EventListener);
+    return () => {
+      window.removeEventListener('storage', syncEntity);
+      window.removeEventListener(FLOWMASTER_ENTITY_CHANGED_EVENT, syncEntity as EventListener);
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
+        if (!activeEntity) {
+          if (!cancelled) {
+            setOpts([]);
+            setFailed(false);
+            setFetchError(null);
+            setLoading(false);
+          }
+          return;
+        }
+        setFailed(false);
+        setFetchError(null);
+        setLoading(true);
         const rows = await api.request('/api/cost-centers');
-        if (cancelled || !Array.isArray(rows)) return;
-        const labels = (rows as { code?: string; name?: string }[])
-          .map(costCenterRowToLabel)
-          .filter(Boolean);
-        setOpts(labels.length > 0 ? labels : FALLBACK_COST_CENTER_OPTIONS);
-      } catch {
-        if (!cancelled) setOpts(FALLBACK_COST_CENTER_OPTIONS);
+        if (cancelled) return;
+        setOpts(costCenterPickOptionsFromRows(rows));
+      } catch (e: unknown) {
+        if (!cancelled) {
+          setOpts([]);
+          setFailed(true);
+          const msg = e instanceof Error ? e.message : String(e);
+          setFetchError(msg);
+          console.error("GET /api/cost-centers failed:", e);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
-  return opts;
+  }, [activeEntity]);
+  return { options: opts, loading, failed, fetchError };
 }
 
-const isSpareLocationColumn = (col: string) => col.trim().toLowerCase() === 'spare for (location)';
+const isSpareLocationColumn = (col: string) => SPARE_LOCATION_GRID_COLUMN_KEYS.has(normalizeGridColumnName(col));
 
-const SearchableSelect = ({ options, value, onChange, placeholder }: { options: string[], value: string, onChange: (val: string) => void, placeholder: string }) => {
+const SearchableSelect = ({
+  options,
+  value,
+  onChange,
+  placeholder,
+  loading,
+  loadFailed,
+  loadErrorHint,
+}: {
+  options: CostCenterPickOption[];
+  value: string;
+  onChange: (val: string) => void;
+  placeholder: string;
+  loading?: boolean;
+  loadFailed?: boolean;
+  /** Full error text from the API (shown when the catalog fails to load). */
+  loadErrorHint?: string | null;
+}) => {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const filteredOptions = options.filter(opt => opt.toLowerCase().includes(search.toLowerCase()));
+  const selected = useMemo(() => {
+    const exact = options.find((o) => o.value === value);
+    if (exact) return exact;
+    return catalogPickMatch(value, options);
+  }, [options, value]);
+  const summaryText = useMemo(() => {
+    if (loading) return 'Loading list…';
+    if (loadFailed && options.length === 0) return 'Could not load list';
+    if (selected) return selected.name ? `${selected.code} — ${selected.name}` : selected.code;
+    if (value.trim()) return value;
+    return '';
+  }, [loading, loadFailed, options.length, selected, value]);
+
+  const filteredOptions = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return options;
+    return options.filter((opt) => opt.searchLower.includes(q));
+  }, [options, search]);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -2025,56 +2169,108 @@ const SearchableSelect = ({ options, value, onChange, placeholder }: { options: 
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsOpen(false);
+        setSearch('');
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [isOpen]);
+
+  const showPlaceholder = !summaryText;
+  const canOpen = !loading;
+
   return (
-    <div className="relative" ref={containerRef}>
-      <div 
-        onClick={() => setIsOpen(!isOpen)}
-        className="w-full px-4 py-2 rounded-lg border border-zinc-300 bg-white cursor-pointer flex items-center justify-between"
+    <div className="relative min-w-[12rem]" ref={containerRef}>
+      <div
+        onClick={() => canOpen && setIsOpen(!isOpen)}
+        className={cn(
+          'w-full min-h-[2.5rem] px-3 py-2 rounded-lg border bg-white flex items-center gap-2 transition-colors',
+          canOpen ? 'border-zinc-300 cursor-pointer hover:border-zinc-400' : 'border-zinc-200 cursor-wait opacity-80'
+        )}
       >
-        <span className={value ? "text-zinc-900" : "text-zinc-400"}>
-          {value || placeholder}
+        <span
+          className={cn(
+            'flex-1 text-left text-sm leading-snug line-clamp-2',
+            showPlaceholder ? 'text-zinc-400' : 'text-zinc-900'
+          )}
+        >
+          {showPlaceholder ? placeholder : summaryText}
         </span>
-        <Search className="w-4 h-4 text-zinc-400" />
+        {value && !loading ? (
+          <button
+            type="button"
+            className="shrink-0 p-0.5 rounded-md text-zinc-400 hover:text-zinc-700 hover:bg-zinc-100"
+            aria-label="Clear"
+            onClick={(e) => {
+              e.stopPropagation();
+              onChange('');
+              setSearch('');
+            }}
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        ) : null}
+        <ChevronDown className={cn('w-4 h-4 shrink-0 text-zinc-400 transition-transform', isOpen && canOpen && 'rotate-180')} />
       </div>
-      
+
       <AnimatePresence>
-        {isOpen && (
+        {isOpen && canOpen && (
           <motion.div
             initial={{ opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}
-            className="absolute z-50 w-full mt-1 bg-white border border-zinc-200 rounded-lg shadow-xl max-h-60 overflow-hidden flex flex-col"
+            className="absolute z-[100] left-0 right-0 mt-1 bg-white border border-zinc-200 rounded-xl shadow-xl max-h-80 overflow-hidden flex flex-col"
           >
-            <div className="p-2 border-b border-zinc-100">
+            <div className="p-2 border-b border-zinc-100 flex items-center gap-2">
+              <Search className="w-4 h-4 text-zinc-400 shrink-0 ml-1" />
               <input
                 type="text"
                 autoFocus
-                className="w-full px-3 py-1.5 text-sm border border-zinc-200 rounded-md outline-none focus:ring-2 focus:ring-indigo-500"
-                placeholder="Search..."
+                className="flex-1 min-w-0 px-2 py-1.5 text-sm border border-zinc-200 rounded-lg outline-none focus:ring-2 focus:ring-indigo-500"
+                placeholder="Search code or name…"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
               />
             </div>
-            <div className="overflow-y-auto">
-              {filteredOptions.length > 0 ? (
-                filteredOptions.map(opt => (
-                  <div
-                    key={opt}
+            <div className="overflow-y-auto overscroll-contain py-1">
+              {loadFailed && options.length === 0 ? (
+                <div className="px-4 py-3 text-sm text-amber-800 bg-amber-50/90 space-y-2">
+                  <p>The list could not be loaded (cost centers catalog). Refresh the page or ask an admin to check the server.</p>
+                  {loadErrorHint ? (
+                    <p className="text-xs text-amber-950/80 font-mono break-words whitespace-pre-wrap">{loadErrorHint}</p>
+                  ) : null}
+                </div>
+              ) : filteredOptions.length > 0 ? (
+                filteredOptions.map((opt) => (
+                  <button
+                    type="button"
+                    key={opt.value}
                     onClick={() => {
-                      onChange(opt);
+                      onChange(opt.value);
                       setIsOpen(false);
                       setSearch('');
                     }}
                     className={cn(
-                      "px-4 py-2 text-sm cursor-pointer hover:bg-indigo-50 transition-colors",
-                      value === opt ? "bg-indigo-50 text-indigo-600 font-bold" : "text-zinc-700"
+                      'w-full text-left px-3 py-2.5 transition-colors border-b border-zinc-50 last:border-b-0',
+                      value === opt.value ? 'bg-indigo-50' : 'hover:bg-indigo-50/60'
                     )}
                   >
-                    {opt}
-                  </div>
+                    <div className="text-sm font-semibold text-zinc-900 leading-snug">{opt.name || opt.code}</div>
+                    {opt.name ? (
+                      <div className="text-[11px] text-zinc-500 font-mono mt-0.5 tracking-tight">{opt.code}</div>
+                    ) : null}
+                  </button>
                 ))
               ) : (
-                <div className="px-4 py-3 text-sm text-zinc-400 italic">No results found</div>
+                <div className="px-4 py-3 text-sm text-zinc-400">
+                  {search.trim() ? 'No matching items' : 'No items in catalog'}
+                </div>
               )}
             </div>
           </motion.div>
@@ -2101,7 +2297,12 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
   const isPR = isPRTemplate(template);
   const isPO = isPOTemplate(template);
   const isSR = isSRTemplate(template);
-  const costCenterOptions = useCostCenterOptions();
+  const {
+    options: costCenterOptions,
+    loading: costCentersLoading,
+    failed: costCentersLoadFailed,
+    fetchError: costCentersFetchError,
+  } = useCostCenterOptions();
   const columns = getColumns(template);
   const needsGccmApproverPicker =
     (entity || '').trim().toUpperCase() === 'GCCM' &&
@@ -2207,6 +2408,7 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
           discountRateNum = procurementPercentToUnitRate(discPct);
         }
       }
+      const normalizedLineItems = normalizeProcurementCatalogLineItems(lineItems, costCenterOptions, isSR);
       setLoading(true);
       try {
         await api.request('/api/workflow-requests', {
@@ -2218,7 +2420,7 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
             entity,
             currency: isPR || isPO || isSR ? String(currency).trim() : undefined,
             section: isSR ? sectionPayloadFromSelection(section) : undefined,
-            line_items: lineItems, 
+            line_items: normalizedLineItems,
             attachments,
             requester_signed: !!((isPR || isSR) && signature),
             requester_signature: (isPR || isSR) && signature ? signature : undefined,
@@ -2433,19 +2635,25 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
                           <td className="px-3 sm:px-4 py-2.5 text-center text-zinc-500 font-medium align-top">{idx + 1}</td>
                           {columns.map(col => (
                             <td key={col} className="px-2 py-2 align-top">
-                              {col === 'Cost Center' ? (
+                              {isCostCenterGridColumn(col) ? (
                                 <SearchableSelect
                                   options={costCenterOptions}
-                                  value={item[col]}
+                                  value={item[col] ?? ''}
                                   onChange={(val) => updateLineItem(idx, col, val)}
                                   placeholder="Select Cost Center..."
+                                  loading={costCentersLoading}
+                                  loadFailed={costCentersLoadFailed}
+                                  loadErrorHint={costCentersFetchError}
                                 />
                               ) : (isSR && isSpareLocationColumn(col)) ? (
                                 <SearchableSelect
                                   options={costCenterOptions}
-                                  value={item[col]}
+                                  value={item[col] ?? ''}
                                   onChange={(val) => updateLineItem(idx, col, val)}
-                                  placeholder="Select Cost Center..."
+                                  placeholder="Select Spare for (Location)..."
+                                  loading={costCentersLoading}
+                                  loadFailed={costCentersLoadFailed}
+                                  loadErrorHint={costCentersFetchError}
                                 />
                               ) : (
                                 <input
@@ -2578,7 +2786,12 @@ const WorkflowRequestList = ({
   const [comment, setComment] = useState('');
   const [approverSignature, setApproverSignature] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const costCenterOptions = useCostCenterOptions();
+  const {
+    options: costCenterOptions,
+    loading: costCentersLoading,
+    failed: costCentersLoadFailed,
+    fetchError: costCentersFetchError,
+  } = useCostCenterOptions();
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [filterDept, setFilterDept] = useState<string>('all');
   const [filterEntity, setFilterEntity] = useState<string>('all');
@@ -2728,6 +2941,11 @@ const WorkflowRequestList = ({
       const taxUnit = procurementPercentToUnitRate(Number(editData.tax_rate) || 0);
       const discUnit = procurementPercentToUnitRate(Number(editData.discount_rate) || 0);
       const sectionOut = isSRRequest(selectedRequest) ? sectionPayloadFromSelection(editData.section) : editData.section;
+      const normalizedLineItems = normalizeProcurementCatalogLineItems(
+        editData.line_items,
+        costCenterOptions,
+        isSRRequest(selectedRequest)
+      );
       const curOut =
         isPRRequest(selectedRequest) || isPO_Only(selectedRequest) || isSRRequest(selectedRequest)
           ? String(editData.currency).trim()
@@ -2736,6 +2954,7 @@ const WorkflowRequestList = ({
         method: 'PATCH',
         body: JSON.stringify({
           ...editData,
+          line_items: normalizedLineItems,
           tax_rate: taxUnit,
           discount_rate: discUnit,
           details: detailsOut,
@@ -2750,6 +2969,7 @@ const WorkflowRequestList = ({
       setSelectedRequest({
         ...selectedRequest,
         ...editData,
+        line_items: normalizedLineItems,
         tax_rate: taxUnit,
         discount_rate: discUnit,
         currency: curOut !== undefined ? curOut : selectedRequest.currency,
@@ -2910,6 +3130,33 @@ const WorkflowRequestList = ({
     }
   };
 
+  const handlePurchasingFinalDecision = async (id: number, decision: 'rejected' | 'cancelled') => {
+    const decisionComment =
+      window.prompt(
+        decision === 'cancelled'
+          ? 'Cancellation reason (optional, recommended for audit):'
+          : 'Rejection reason (optional):',
+        ''
+      ) ?? '';
+    setLoading(true);
+    try {
+      await api.request(`/api/workflow-requests/${id}/purchasing-decision`, {
+        method: 'POST',
+        body: JSON.stringify({
+          decision,
+          comment: decisionComment,
+        }),
+      });
+      toast.success(decision === 'cancelled' ? 'PR cancelled' : 'PR rejected by purchasing');
+      onRefresh();
+      setSelectedRequest(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const currentStep = selectedRequest ? selectedRequest.template_steps[selectedRequest.current_step_index] : null;
   const canApprove =
     selectedRequest &&
@@ -2943,6 +3190,7 @@ const WorkflowRequestList = ({
               <option value="pending">Pending</option>
               <option value="approved">Approved</option>
               <option value="rejected">Rejected</option>
+              <option value="cancelled">Cancelled</option>
             </select>
           </div>
 
@@ -3162,6 +3410,25 @@ const WorkflowRequestList = ({
                       </button>
                     </>
                   )}
+                  {canShowPurchasingFinalDecision(selectedRequest, user) && !isEditing && (
+                    <>
+                      <button
+                        onClick={() => handlePurchasingFinalDecision(selectedRequest.id, 'rejected')}
+                        className="flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 rounded-xl text-sm font-bold text-red-700 hover:bg-red-100 transition-colors"
+                      >
+                        <XCircle className="w-4 h-4" />
+                        Reject PR (Resubmittable)
+                      </button>
+                      <button
+                        onClick={() => handlePurchasingFinalDecision(selectedRequest.id, 'cancelled')}
+                        className="flex items-center gap-2 px-4 py-2 bg-zinc-200 border border-zinc-300 rounded-xl text-sm font-bold text-zinc-800 hover:bg-zinc-300 transition-colors"
+                        title="Cancellation is final and cannot be resubmitted"
+                      >
+                        <X className="w-4 h-4" />
+                        Cancel PR (Final)
+                      </button>
+                    </>
+                  )}
                   <button onClick={() => {
                     setSelectedRequest(null);
                     setIsEditing(false);
@@ -3311,7 +3578,7 @@ const WorkflowRequestList = ({
                                     <td className="px-3 py-2 text-center text-zinc-400 font-bold">{idx + 1}</td>
                                     {cols.map(col => (
                                       <td key={col} className="px-3 py-2">
-                                        {col === 'Cost Center' ? (
+                                        {isCostCenterGridColumn(col) ? (
                                           <SearchableSelect
                                             options={costCenterOptions}
                                             value={item[col] || ''}
@@ -3321,6 +3588,9 @@ const WorkflowRequestList = ({
                                               setEditData({ ...editData, line_items: newItems });
                                             }}
                                             placeholder="Select Cost Center..."
+                                            loading={costCentersLoading}
+                                            loadFailed={costCentersLoadFailed}
+                                            loadErrorHint={costCentersFetchError}
                                           />
                                         ) : (isSRRequest(selectedRequest) && isSpareLocationColumn(col)) ? (
                                           <SearchableSelect
@@ -3331,7 +3601,10 @@ const WorkflowRequestList = ({
                                               newItems[idx] = { ...newItems[idx], [col]: val };
                                               setEditData({ ...editData, line_items: newItems });
                                             }}
-                                            placeholder="Select Cost Center..."
+                                            placeholder="Select Spare for (Location)..."
+                                            loading={costCentersLoading}
+                                            loadFailed={costCentersLoadFailed}
+                                            loadErrorHint={costCentersFetchError}
                                           />
                                         ) : (
                                           <input
@@ -3497,7 +3770,11 @@ const WorkflowRequestList = ({
                         </div>
                         <div className="text-right">
                           <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Cost Center</label>
-                          <p className="font-bold text-zinc-900">{selectedRequest.cost_center || 'Not Specified'}</p>
+                          <p className="font-bold text-zinc-900">
+                            {String(selectedRequest.cost_center || '').trim()
+                              ? formatCostCenterCatalogCell(selectedRequest.cost_center, costCenterOptions)
+                              : 'Not Specified'}
+                          </p>
                           {isSRRequest(selectedRequest) && (
                             <>
                               <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mt-3 mb-1">Section</label>
@@ -3597,7 +3874,11 @@ const WorkflowRequestList = ({
                                       <td key={col} className="px-4 py-3 text-zinc-700">
                                         {(col === 'Unit Price' || col === 'Price' || col === 'Amount')
                                           ? `${procurementCurrencyPrefix(selectedRequest.currency)}${Number(item[col] || 0).toLocaleString()}`.trim()
-                                          : (col === REMARKS_LINE_COL ? (lineItemRemarksDisplay(item) || '-') : (item[col] || '-'))}
+                                          : (col === REMARKS_LINE_COL
+                                            ? (lineItemRemarksDisplay(item) || '-')
+                                            : (isCostCenterGridColumn(col) || (isSRRequest(selectedRequest) && isSpareLocationColumn(col)))
+                                              ? formatCostCenterCatalogCell(item[col], costCenterOptions)
+                                              : (item[col] || '-'))}
                                       </td>
                                     ))}
                                     {showLineTotal && (
@@ -3873,6 +4154,13 @@ const WorkflowRequestList = ({
                             <Send className="w-5 h-5" />
                             Resubmit Now
                           </button>
+                        </div>
+                      </section>
+                    )}
+                    {isWorkflowRequestCancelled(selectedRequest) && (
+                      <section className="pt-12 border-t-2 border-zinc-100">
+                        <div className="bg-zinc-100 p-6 rounded-2xl border border-zinc-200">
+                          <p className="text-sm font-bold text-zinc-700">This PR was cancelled by purchasing and is final (cannot be resubmitted).</p>
                         </div>
                       </section>
                     )}
@@ -5087,7 +5375,12 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   const [viewingPdf, setViewingPdf] = useState<{ url: string; fileName: string } | null>(null);
   const [detailsViewMode, setDetailsViewMode] = useState<'details' | 'pdf'>('details');
   const [detailsPdfPreview, setDetailsPdfPreview] = useState<{ url: string; fileName: string } | null>(null);
-  const costCenterOptions = useCostCenterOptions();
+  const {
+    options: costCenterOptions,
+    loading: costCentersLoading,
+    failed: costCentersLoadFailed,
+    fetchError: costCentersFetchError,
+  } = useCostCenterOptions();
 
   const isPurchasing = user.roles?.some(r => r.toLowerCase() === 'purchasing');
   const isAdmin = user.roles?.some(r => r.toLowerCase() === 'admin') || user.permissions?.includes('admin');
@@ -5142,6 +5435,11 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
       const taxUnit = procurementPercentToUnitRate(Number(editData.tax_rate) || 0);
       const discUnit = procurementPercentToUnitRate(Number(editData.discount_rate) || 0);
       const sectionOut = isSRRequest(selectedRequest) ? sectionPayloadFromSelection(editData.section) : editData.section;
+      const normalizedLineItems = normalizeProcurementCatalogLineItems(
+        editData.line_items,
+        costCenterOptions,
+        isSRRequest(selectedRequest)
+      );
       const curOut =
         isPRRequest(selectedRequest) || isPO_Only(selectedRequest) || isSRRequest(selectedRequest)
           ? String(editData.currency).trim()
@@ -5150,6 +5448,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
         method: 'PATCH',
         body: JSON.stringify({
           ...editData,
+          line_items: normalizedLineItems,
           tax_rate: taxUnit,
           discount_rate: discUnit,
           details: detailsOut,
@@ -5164,6 +5463,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
       setSelectedRequest({
         ...selectedRequest,
         ...editData,
+        line_items: normalizedLineItems,
         tax_rate: taxUnit,
         discount_rate: discUnit,
         currency: curOut !== undefined ? curOut : selectedRequest.currency,
@@ -5311,6 +5611,33 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     }
   };
 
+  const handlePurchasingFinalDecision = async (id: number, decision: 'rejected' | 'cancelled') => {
+    const decisionComment =
+      window.prompt(
+        decision === 'cancelled'
+          ? 'Cancellation reason (optional, recommended for audit):'
+          : 'Rejection reason (optional):',
+        ''
+      ) ?? '';
+    setLoading(true);
+    try {
+      await api.request(`/api/workflow-requests/${id}/purchasing-decision`, {
+        method: 'POST',
+        body: JSON.stringify({
+          decision,
+          comment: decisionComment,
+        }),
+      });
+      toast.success(decision === 'cancelled' ? 'PR cancelled' : 'PR rejected by purchasing');
+      fetchProcurementRequests();
+      setSelectedRequest(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
     fetchProcurementRequests();
   }, [filters, entityScope]);
@@ -5433,6 +5760,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           <option value="pending">Pending</option>
           <option value="approved">Approved</option>
           <option value="rejected">Rejected</option>
+          <option value="cancelled">Cancelled</option>
         </select>
         <input
           type="text"
@@ -5715,6 +6043,25 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                       </button>
                     </>
                   )}
+                  {canShowPurchasingFinalDecision(selectedRequest, user) && !isEditing && (
+                    <>
+                      <button
+                        onClick={() => handlePurchasingFinalDecision(selectedRequest.id, 'rejected')}
+                        className="flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 rounded-xl text-sm font-bold text-red-700 hover:bg-red-100 transition-colors"
+                      >
+                        <XCircle className="w-4 h-4" />
+                        Reject PR (Resubmittable)
+                      </button>
+                      <button
+                        onClick={() => handlePurchasingFinalDecision(selectedRequest.id, 'cancelled')}
+                        className="flex items-center gap-2 px-4 py-2 bg-zinc-200 border border-zinc-300 rounded-xl text-sm font-bold text-zinc-800 hover:bg-zinc-300 transition-colors"
+                        title="Cancellation is final and cannot be resubmitted"
+                      >
+                        <X className="w-4 h-4" />
+                        Cancel PR (Final)
+                      </button>
+                    </>
+                  )}
                   <button 
                     onClick={() => handlePrintPR(selectedRequest)} 
                     className="flex items-center gap-2 px-4 py-2 bg-white border border-zinc-200 rounded-xl text-sm font-bold text-zinc-600 hover:bg-zinc-50 transition-colors"
@@ -5872,7 +6219,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                   <tr>
                                     {cols.map(col => (
                                       <td key={col} className="px-2 py-2">
-                                        {col === 'Cost Center' ? (
+                                        {isCostCenterGridColumn(col) ? (
                                           <SearchableSelect
                                             options={costCenterOptions}
                                             value={item[col] || ''}
@@ -5882,6 +6229,9 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                               setEditData({ ...editData, line_items: newItems });
                                             }}
                                             placeholder="Select Cost Center..."
+                                            loading={costCentersLoading}
+                                            loadFailed={costCentersLoadFailed}
+                                            loadErrorHint={costCentersFetchError}
                                           />
                                         ) : (isSRRequest(selectedRequest) && isSpareLocationColumn(col)) ? (
                                           <SearchableSelect
@@ -5892,7 +6242,10 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                               newItems[idx] = { ...newItems[idx], [col]: val };
                                               setEditData({ ...editData, line_items: newItems });
                                             }}
-                                            placeholder="Select Cost Center..."
+                                            placeholder="Select Spare for (Location)..."
+                                            loading={costCentersLoading}
+                                            loadFailed={costCentersLoadFailed}
+                                            loadErrorHint={costCentersFetchError}
                                           />
                                         ) : (
                                           <input
@@ -6047,7 +6400,11 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                         </div>
                         <div className="text-right">
                           <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Cost Center</label>
-                          <p className="font-bold text-zinc-900">{selectedRequest.cost_center || 'Not Specified'}</p>
+                          <p className="font-bold text-zinc-900">
+                            {String(selectedRequest.cost_center || '').trim()
+                              ? formatCostCenterCatalogCell(selectedRequest.cost_center, costCenterOptions)
+                              : 'Not Specified'}
+                          </p>
                           {isSRRequest(selectedRequest) && (
                             <>
                               <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mt-3 mb-1">Section</label>
@@ -6147,7 +6504,11 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                       <td key={col} className="px-4 py-3 text-zinc-700">
                                         {(col === 'Unit Price' || col === 'Price' || col === 'Amount')
                                           ? `${procurementCurrencyPrefix(selectedRequest.currency)}${Number(item[col] || 0).toLocaleString()}`.trim()
-                                          : (col === REMARKS_LINE_COL ? (lineItemRemarksDisplay(item) || '-') : (item[col] || '-'))}
+                                          : (col === REMARKS_LINE_COL
+                                            ? (lineItemRemarksDisplay(item) || '-')
+                                            : (isCostCenterGridColumn(col) || (isSRRequest(selectedRequest) && isSpareLocationColumn(col)))
+                                              ? formatCostCenterCatalogCell(item[col], costCenterOptions)
+                                              : (item[col] || '-'))}
                                       </td>
                                     ))}
                                     {showLineTotal && (
@@ -6356,6 +6717,13 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                             <Send className="w-5 h-5" />
                             Resubmit Now
                           </button>
+                        </div>
+                      </section>
+                    )}
+                    {isWorkflowRequestCancelled(selectedRequest) && (
+                      <section className="pt-12 border-t-2 border-zinc-100">
+                        <div className="bg-zinc-100 p-6 rounded-2xl border border-zinc-200">
+                          <p className="text-sm font-bold text-zinc-700">This PR was cancelled by purchasing and is final (cannot be resubmitted).</p>
                         </div>
                       </section>
                     )}

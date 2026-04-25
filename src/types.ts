@@ -71,7 +71,7 @@ export interface WorkflowRequest {
   tax_rate?: number;
   /** Document-level discount 0–1 (e.g. 0.05 = 5% off subtotal before tax). PR-focused; PO may carry from PR convert. */
   discount_rate?: number | null;
-  status: 'Pending' | 'Approved' | 'Rejected';
+  status: 'Pending' | 'Approved' | 'Rejected' | 'Cancelled';
   current_step_index: number;
   /** Requester pad image as data URL; persisted in SQL as NVARCHAR(MAX) for PDFs. */
   requester_signature?: string;
@@ -87,7 +87,7 @@ export interface RequestApproval {
   step_index: number;
   approver_id: number;
   approver_name: string;
-  status: 'Approved' | 'Rejected';
+  status: 'Approved' | 'Rejected' | 'Cancelled';
   comment: string;
   /** Approver pad image as data URL; NVARCHAR(MAX) for PDFs. */
   approver_signature?: string;
