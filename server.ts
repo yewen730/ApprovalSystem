@@ -18,6 +18,43 @@ import jwt from "jsonwebtoken";
 import { fileURLToPath } from "url";
 import "dotenv/config";
 
+function formatSqlError(e: any): string {
+  const msg = String(e?.message || e || "");
+  const preceding = Array.isArray(e?.precedingErrors)
+    ? e.precedingErrors.map((p: any) => String(p?.message || p || "").trim()).filter(Boolean)
+    : [];
+  const detail = preceding.length ? ` | precedingErrors: ${preceding.join(" | ")}` : "";
+  return `${msg}${detail}`.trim();
+}
+
+const SIGNATURE_STORAGE_PATH =
+  process.env.SIGNATURE_STORAGE_PATH ||
+  "\\\\10.128.3.10\\data\\E_IVOICING\\Approval System\\Signature";
+
+function sanitizeFileComponent(s: string, maxLen = 80): string {
+  const raw = String(s || "").trim();
+  const safe = raw.replace(/[^\w.\-]+/g, "_").replace(/^_+|_+$/g, "");
+  if (!safe) return "user";
+  return safe.length > maxLen ? safe.slice(0, maxLen) : safe;
+}
+
+function signatureFilePathForUser(user: any): string {
+  const id = Number(user?.id);
+  const uname = sanitizeFileComponent(user?.username || "user");
+  const file = Number.isFinite(id) && id > 0 ? `${id}-${uname}.png` : `${uname}.png`;
+  return path.join(SIGNATURE_STORAGE_PATH, file);
+}
+
+function parsePngDataUrl(dataUrl: string): Buffer {
+  const s = String(dataUrl || "").trim();
+  if (!/^data:image\/png;base64,/i.test(s)) {
+    throw new Error("Signature must be a PNG data URL");
+  }
+  const b64 = s.split(",", 2)[1] || "";
+  if (!b64) throw new Error("Signature payload is empty");
+  return Buffer.from(b64, "base64");
+}
+
 function getLanIPv4Addresses(): string[] {
   const nets = os.networkInterfaces();
   const out = new Set<string>();
@@ -468,6 +505,34 @@ async function ensureCostCentersTable(pool: sql.ConnectionPool): Promise<void> {
       BEGIN
         ALTER TABLE ${tableInfo.qualifiedName} DROP CONSTRAINT UQ_cost_centers_code;
       END
+    END
+  `);
+
+  // If the table existed before this app version, it may contain duplicates that prevent
+  // adding the (entity, code) unique constraint. We dedupe safely by keeping the lowest id.
+  if (tableInfo.hasId) {
+    try {
+      await pool.request().query(`
+        WITH d AS (
+          SELECT
+            id,
+            ROW_NUMBER() OVER (
+              PARTITION BY UPPER(LTRIM(RTRIM(entity))), UPPER(LTRIM(RTRIM(code)))
+              ORDER BY id ASC
+            ) AS rn
+          FROM ${tableInfo.qualifiedName}
+          WHERE entity IS NOT NULL AND LTRIM(RTRIM(entity)) <> N'' AND code IS NOT NULL AND LTRIM(RTRIM(code)) <> N''
+        )
+        DELETE FROM d WHERE rn > 1;
+      `);
+    } catch (e: any) {
+      console.warn("SQL cost_centers dedupe skipped:", formatSqlError(e));
+    }
+  }
+
+  // Add entity+code uniqueness if possible; if it fails, keep serving the catalog.
+  try {
+    await pool.request().query(`
       IF NOT EXISTS (
         SELECT 1
         FROM sys.key_constraints kc
@@ -478,8 +543,11 @@ async function ensureCostCentersTable(pool: sql.ConnectionPool): Promise<void> {
         ALTER TABLE ${tableInfo.qualifiedName}
         ADD CONSTRAINT UQ_cost_centers_entity_code UNIQUE (entity, code);
       END
-    END
-  `);
+    `);
+  } catch (e: any) {
+    console.warn("SQL cost_centers unique(entity,code) skipped:", formatSqlError(e));
+  }
+
   await pool.request().query(`
     IF NOT EXISTS (
       SELECT 1
@@ -638,7 +706,7 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
   try {
     await ensureCostCentersTable(pool);
   } catch (e: any) {
-    console.warn("SQL cost_centers table:", e?.message || e);
+    console.warn("SQL cost_centers table:", formatSqlError(e));
   }
   try {
     await pool.request().query(`
@@ -1012,6 +1080,47 @@ async function startServer() {
     res.json(req.user);
   });
 
+  // Saved signature for the current user (stored on network path as PNG)
+  app.get("/api/me/signature", authenticate, async (req: any, res) => {
+    try {
+      const filePath = signatureFilePathForUser(req.user);
+      const exists = fs.existsSync(filePath);
+      if (!exists) return res.json({ exists: false });
+      const buf = await fs.promises.readFile(filePath);
+      const dataUrl = `data:image/png;base64,${buf.toString("base64")}`;
+      return res.json({ exists: true, dataUrl });
+    } catch (e: any) {
+      return res.status(500).json({ error: "Failed to load saved signature", details: String(e?.message || e) });
+    }
+  });
+
+  app.put("/api/me/signature", authenticate, async (req: any, res) => {
+    try {
+      const dataUrl = String(req.body?.dataUrl || "").trim();
+      const buf = parsePngDataUrl(dataUrl);
+      // Basic safety cap (~350KB) so we don't store huge blobs by accident.
+      if (buf.length > 350_000) return res.status(400).json({ error: "Signature image is too large" });
+      await fs.promises.mkdir(SIGNATURE_STORAGE_PATH, { recursive: true });
+      const filePath = signatureFilePathForUser(req.user);
+      await fs.promises.writeFile(filePath, buf);
+      return res.json({ success: true });
+    } catch (e: any) {
+      return res.status(400).json({ error: String(e?.message || e || "Failed to save signature") });
+    }
+  });
+
+  app.delete("/api/me/signature", authenticate, async (req: any, res) => {
+    try {
+      const filePath = signatureFilePathForUser(req.user);
+      if (fs.existsSync(filePath)) {
+        await fs.promises.unlink(filePath);
+      }
+      return res.json({ success: true });
+    } catch (e: any) {
+      return res.status(500).json({ error: "Failed to delete saved signature", details: String(e?.message || e) });
+    }
+  });
+
   // User Management (list; primary source = SQL Server `usersetting` when connected)
   app.get("/api/users", authenticate, async (req: any, res) => {
     const canViewUsers = req.user.permissions && (req.user.permissions.includes('manage_users') || req.user.permissions.includes('create_templates') || req.user.permissions.includes('admin'));
@@ -1190,11 +1299,11 @@ async function startServer() {
     try {
       await ensureCostCentersTable(sqlPool);
     } catch (e: any) {
-      console.error("GET /api/cost-centers schema ensure:", e?.message || e);
+      console.error("GET /api/cost-centers schema ensure:", formatSqlError(e));
       return res.status(500).json({
         error:
           "Cost centers catalog is unavailable (database could not create or update dbo.cost_center). Check SQL permissions and server logs.",
-        ...(exposeDetails ? { details: String(e?.message || e) } : {}),
+        ...(exposeDetails ? { details: formatSqlError(e) } : {}),
       });
     }
     try {
@@ -2373,6 +2482,18 @@ async function startServer() {
     if (request.requester_id !== req.user.id) return res.status(403).json({ error: "Only the requester can resubmit this request" });
 
     const rid = Number(requestId);
+    // Clear prior approval chain so a resubmission requires fresh signatures/approvals.
+    // Keep purchasing_final decisions for audit trail (they don't map to a workflow step index).
+    try {
+      await sqlPool
+        .request()
+        .input("request_id", sql.Int, rid)
+        .query(
+          "DELETE FROM request_approvals WHERE request_id = @request_id AND ISNULL(approver_role_snapshot, N'') <> N'purchasing_final'"
+        );
+    } catch (e: any) {
+      console.warn("SQL resubmit clear approvals:", e?.message || e);
+    }
     if (isPOName(request.template_name) && request.template_category === "procurement") {
       let lineItems: any[] = [];
       try {
@@ -2763,6 +2884,13 @@ async function startServer() {
 
     const actorName = String(req.user.username || "");
     try {
+      if (decisionRaw === "rejected") {
+        // Remove existing approvals/signatures from the prior "approved" cycle.
+        // This ensures the approver must sign again after requester edits + resubmits.
+        await sqlPool.request().input("request_id", sql.Int, requestId).query(
+          "DELETE FROM request_approvals WHERE request_id = @request_id"
+        );
+      }
       await sqlPool
         .request()
         .input("request_id", sql.Int, requestId)

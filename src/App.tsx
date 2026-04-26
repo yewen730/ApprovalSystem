@@ -247,6 +247,120 @@ type ConvertPoModalTarget = {
   entityCode: string;
 };
 
+type PurchasingDecisionModalTarget = {
+  id: number;
+  decision: 'cancelled' | 'rejected';
+  prSerial: string;
+  title: string;
+  entity: string;
+};
+
+const PurchasingDecisionModal = ({
+  target,
+  loading,
+  onClose,
+  onConfirm,
+}: {
+  target: PurchasingDecisionModalTarget | null;
+  loading: boolean;
+  onClose: () => void;
+  onConfirm: (comment: string) => void;
+}) => {
+  const [comment, setComment] = useState('');
+  useEffect(() => {
+    if (target) setComment('');
+  }, [target?.id, target?.decision]);
+
+  if (!target) return null;
+  const isCancel = target.decision === 'cancelled';
+  return (
+    <div
+      className="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="purchasing-decision-title"
+      onClick={loading ? undefined : onClose}
+    >
+      <motion.div
+        initial={{ opacity: 0, scale: 0.96 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className="bg-white rounded-2xl shadow-2xl border border-zinc-200 w-full max-w-lg overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className={cn("px-6 py-5 border-b", isCancel ? "bg-rose-50 border-rose-100" : "bg-rose-50 border-rose-100")}>
+          <div className="flex items-start gap-3">
+            <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center shrink-0",
+              isCancel ? "bg-rose-600 shadow-lg shadow-rose-200" : "bg-rose-600 shadow-lg shadow-rose-200"
+            )}>
+              <XCircle className="w-5 h-5 text-white" />
+            </div>
+            <div className="min-w-0">
+              <h3 id="purchasing-decision-title" className="text-lg font-black text-zinc-900">
+                {isCancel ? 'Cancel PR (Final)' : 'Reject PR'}
+              </h3>
+              <p className="text-sm text-zinc-600 mt-1">
+                PR <span className="font-mono font-semibold text-zinc-900">{target.prSerial}</span>
+                {target.title ? ` — ${target.title}` : ''}
+              </p>
+              <p className="text-xs text-zinc-500 mt-1">
+                {isCancel
+                  ? 'Cancellation is final (cannot be resubmitted). A reason is required for audit.'
+                  : 'Rejection returns the PR to the requester. They may edit and resubmit.'}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="p-6 space-y-2">
+          <label className="text-sm font-medium text-zinc-700">
+            {isCancel ? 'Cancellation reason' : 'Rejection reason'}
+          </label>
+          <textarea
+            rows={4}
+            className={cn(
+              "w-full px-4 py-3 rounded-xl border text-sm outline-none focus:ring-2 bg-white resize-none",
+              isCancel ? "border-rose-200 focus:ring-rose-500" : "border-rose-200 focus:ring-rose-500"
+            )}
+            placeholder={isCancel ? 'Please describe why this PR is cancelled…' : 'Optional…'}
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+            disabled={loading}
+          />
+        </div>
+
+        <div className="px-6 pb-6 flex justify-end gap-2">
+          <button
+            type="button"
+            disabled={loading}
+            onClick={onClose}
+            className="px-4 py-2 rounded-xl text-sm font-semibold text-zinc-600 hover:bg-zinc-100"
+          >
+            Back
+          </button>
+          <button
+            type="button"
+            disabled={loading}
+            onClick={() => {
+              const t = comment.trim();
+              if (isCancel && !t) {
+                toast.error('Please enter a cancellation reason.');
+                return;
+              }
+              onConfirm(t);
+            }}
+            className={cn(
+              "px-4 py-2 rounded-xl text-sm font-bold text-white disabled:opacity-50",
+              isCancel ? "bg-rose-600 hover:bg-rose-700" : "bg-rose-600 hover:bg-rose-700"
+            )}
+          >
+            {loading ? 'Saving…' : isCancel ? 'Confirm cancellation' : 'Confirm rejection'}
+          </button>
+        </div>
+      </motion.div>
+    </div>
+  );
+};
+
 /** Purchasing enters the official PO number; server enforces uniqueness per entity. */
 const ConvertPrToPoModal = ({
   target,
@@ -951,7 +1065,24 @@ function requiresProcurementApproverSignaturePad(req: WorkflowRequest): boolean 
   return req.template_name.toLowerCase().includes('invoice');
 }
 
-const SignaturePad = ({ onSave, onClear }: { onSave: (data: string) => void, onClear: () => void }) => {
+const SignaturePad = ({
+  onSave,
+  onClear,
+  value,
+  savedSignature,
+  onUseSaved,
+  onSaveDefault,
+  onClearSaved,
+}: {
+  onSave: (data: string) => void;
+  onClear: () => void;
+  /** Current signature image to display (data URL). */
+  value?: string | null;
+  savedSignature?: string | null;
+  onUseSaved?: () => void;
+  onSaveDefault?: () => void;
+  onClearSaved?: () => void;
+}) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const isDrawingRef = useRef(false);
 
@@ -964,6 +1095,36 @@ const SignaturePad = ({ onSave, onClear }: { onSave: (data: string) => void, onC
     ctx.lineWidth = 2;
     ctx.lineCap = 'round';
   }, []);
+
+  // When caller sets a signature value (e.g. "Use saved"), render it into the canvas.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const v = String(value ?? '').trim();
+    if (!v) return;
+    const img = new Image();
+    img.onload = () => {
+      // Fit image into canvas with padding, keep aspect ratio.
+      const pad = 8;
+      const maxW = Math.max(1, canvas.width - pad * 2);
+      const maxH = Math.max(1, canvas.height - pad * 2);
+      const iw = img.naturalWidth || 1;
+      const ih = img.naturalHeight || 1;
+      let w = maxW;
+      let h = (w * ih) / iw;
+      if (h > maxH) {
+        h = maxH;
+        w = (h * iw) / ih;
+      }
+      const x = (canvas.width - w) / 2;
+      const y = (canvas.height - h) / 2;
+      ctx.drawImage(img, x, y, w, h);
+    };
+    img.src = v;
+  }, [value]);
 
   const getCanvasCoords = (e: React.MouseEvent | React.TouchEvent, canvas: HTMLCanvasElement) => {
     const rect = canvas.getBoundingClientRect();
@@ -1041,14 +1202,58 @@ const SignaturePad = ({ onSave, onClear }: { onSave: (data: string) => void, onC
           onTouchEnd={stopDrawing}
         />
       </div>
-      <button
-        type="button"
-        onClick={clear}
-        className="text-xs text-zinc-500 hover:text-zinc-700 font-medium flex items-center gap-1"
-      >
-        <RotateCcw className="w-3 h-3" />
-        Clear Signature
-      </button>
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={clear}
+          className="text-xs text-zinc-500 hover:text-zinc-700 font-medium flex items-center gap-1"
+        >
+          <RotateCcw className="w-3 h-3" />
+          Clear
+        </button>
+        {onUseSaved ? (
+          <button
+            type="button"
+            onClick={onUseSaved}
+            disabled={!savedSignature}
+            className={cn(
+              "text-xs font-medium flex items-center gap-1 px-2 py-1 rounded-md border",
+              savedSignature
+                ? "border-zinc-200 text-zinc-600 hover:bg-zinc-50 hover:text-zinc-800"
+                : "border-zinc-100 text-zinc-300 cursor-not-allowed"
+            )}
+            title={savedSignature ? "Use your saved signature" : "No saved signature yet"}
+          >
+            Use saved
+          </button>
+        ) : null}
+        {onSaveDefault ? (
+          <button
+            type="button"
+            onClick={onSaveDefault}
+            className="text-xs font-medium flex items-center gap-1 px-2 py-1 rounded-md border border-indigo-200 text-indigo-700 hover:bg-indigo-50"
+            title="Save this signature for future use"
+          >
+            Save as default
+          </button>
+        ) : null}
+        {onClearSaved ? (
+          <button
+            type="button"
+            onClick={onClearSaved}
+            disabled={!savedSignature}
+            className={cn(
+              "text-xs font-medium flex items-center gap-1 px-2 py-1 rounded-md border",
+              savedSignature
+                ? "border-amber-200 text-amber-800 hover:bg-amber-50"
+                : "border-zinc-100 text-zinc-300 cursor-not-allowed"
+            )}
+            title="Remove saved signature from server"
+          >
+            Remove saved
+          </button>
+        ) : null}
+      </div>
     </div>
   );
 };
@@ -1159,11 +1364,35 @@ const isWorkflowRequestRejected = (r: Pick<WorkflowRequest, 'status'>) =>
 const isWorkflowRequestCancelled = (r: Pick<WorkflowRequest, 'status'>) =>
   normalizeWorkflowRequestStatus(r.status) === 'cancelled';
 
+function purchasingCancelApprovalForRequest(req: WorkflowRequest | null | undefined): RequestApproval | undefined {
+  if (!req) return undefined;
+  const list = (req.approvals || []).filter((a) => normalizeWorkflowRequestStatus(a.status) === 'cancelled');
+  if (list.length === 0) return undefined;
+  // Prefer purchasing_final snapshot if present; else last cancelled approval.
+  const byPurchasing =
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (list as any).findLast?.((a: RequestApproval) => String(a.approver_role_snapshot || '').toLowerCase() === 'purchasing_final') ??
+    undefined;
+  return byPurchasing || list[list.length - 1];
+}
+
+function purchasingRejectApprovalForRequest(req: WorkflowRequest | null | undefined): RequestApproval | undefined {
+  if (!req) return undefined;
+  const list = (req.approvals || []).filter((a) => normalizeWorkflowRequestStatus(a.status) === 'rejected');
+  if (list.length === 0) return undefined;
+  // Prefer purchasing_final snapshot if present; else last rejected approval.
+  const byPurchasing =
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (list as any).findLast?.((a: RequestApproval) => String(a.approver_role_snapshot || '').toLowerCase() === 'purchasing_final') ??
+    undefined;
+  return byPurchasing || list[list.length - 1];
+}
+
 const workflowRequestStatusBadgeClass = (r: WorkflowRequest) => {
   const n = normalizeWorkflowRequestStatus(r.status);
   if (n === 'approved') return 'bg-emerald-100 text-emerald-700 ring-1 ring-inset ring-emerald-200/70';
   if (n === 'rejected') return 'bg-red-100 text-red-700 ring-1 ring-inset ring-red-200/70';
-  if (n === 'cancelled') return 'bg-zinc-200 text-zinc-700 ring-1 ring-inset ring-zinc-300/70';
+  if (n === 'cancelled') return 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-200/70';
   return 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-200/70';
 };
 
@@ -1179,6 +1408,8 @@ const formatWorkflowRequestStatusLabel = (r: WorkflowRequest) => {
 /** Purchasing users only; used for PR → PO actions. */
 const isPurchasingRole = (user: User) =>
   !!user.roles?.some((role) => role.toLowerCase() === 'purchasing');
+
+const isAdminPermission = (user: User) => !!user.permissions?.includes('admin');
 
 /** PR already has a PO request created from it (one PR → one PO). */
 const prHasLinkedPoRequest = (r: WorkflowRequest) =>
@@ -1197,7 +1428,7 @@ const canShowPurchasingApprovedPRHeaderActions = (r: WorkflowRequest, user: User
 
 /** Purchasing can still override an already-approved PR with reject/cancel. */
 const canShowPurchasingFinalDecision = (r: WorkflowRequest, user: User) =>
-  isWorkflowRequestFullyApproved(r) && isPR_Only(r) && isPurchasingRole(user);
+  isWorkflowRequestFullyApproved(r) && isPR_Only(r) && (isPurchasingRole(user) || isAdminPermission(user));
 
 const stepApproverRoleLowerAt = (steps: WorkflowStep[] | undefined, stepIndex: number): string =>
   (steps?.[stepIndex]?.approverRole ?? '').toString().trim().toLowerCase();
@@ -1209,8 +1440,22 @@ const approvalStepRoleLower = (a: RequestApproval, steps: WorkflowStep[] | undef
   return stepApproverRoleLowerAt(steps, a.step_index);
 };
 
-const workflowApprovedApprovals = (request: WorkflowRequest): RequestApproval[] =>
-  (request.approvals || []).filter((a) => a.status.toLowerCase() === 'approved');
+const workflowApprovedApprovals = (request: WorkflowRequest): RequestApproval[] => {
+  const list = (request.approvals || []).filter((a) => normalizeWorkflowRequestStatus(a.status) === 'approved');
+  // Always prefer the most recent approval record per step_index.
+  // (Reject/resubmit cycles can leave multiple rows for a step; UI/PDF should show latest signature.)
+  const seen = new Set<number>();
+  const out: RequestApproval[] = [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const a = list[i];
+    const idx = Number(a.step_index);
+    if (!Number.isFinite(idx)) continue;
+    if (seen.has(idx)) continue;
+    seen.add(idx);
+    out.push(a);
+  }
+  return out.reverse();
+};
 
 /**
  * PR form (two columns): preparer + HOD/approver only — never the checker in the right column.
@@ -1218,7 +1463,7 @@ const workflowApprovedApprovals = (request: WorkflowRequest): RequestApproval[] 
 const prHodApprovalForPdf = (request: WorkflowRequest): RequestApproval | undefined => {
   const steps = request.template_steps || [];
   const list = workflowApprovedApprovals(request);
-  const hod = list.find((a) => approvalStepRoleLower(a, steps) === 'approver');
+  const hod = [...list].reverse().find((a) => approvalStepRoleLower(a, steps) === 'approver');
   if (hod) return hod;
   const nonChecker = list.filter((a) => approvalStepRoleLower(a, steps) !== 'checker');
   if (nonChecker.length) return nonChecker[nonChecker.length - 1];
@@ -1233,7 +1478,7 @@ const srSignatureColumnsForPdf = (
 ): { mid: RequestApproval | undefined; senior: RequestApproval | undefined } => {
   const steps = request.template_steps || [];
   const list = workflowApprovedApprovals(request);
-  const byRole = (role: string) => list.find((a) => approvalStepRoleLower(a, steps) === role);
+  const byRole = (role: string) => [...list].reverse().find((a) => approvalStepRoleLower(a, steps) === role);
   const templateHasChecker = (steps || []).some((s) => (s.approverRole || '').toLowerCase() === 'checker');
   if (templateHasChecker) {
     return { mid: byRole('checker'), senior: byRole('som') ?? byRole('approver') };
@@ -1264,6 +1509,7 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
   const right = pageW - 10;
   const tableLeft = left;
   const tableRight = right;
+  const pageBottomSafe = pageH - 12;
   /** Column widths (mm); sum === tableRight − tableLeft (277mm). Supplier is in header, not grid. */
   const colWidths = [10, 108, 16, 36, 36, 71];
   const colXs: number[] = [];
@@ -1284,10 +1530,16 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
   const lineStepBody = 2.75;
   const minRowH = 6.5;
   const totalsBlockH = 26;
-  const pageBottomSafe = pageH - 12;
   /** Below chrome (incl. suggested supplier line). */
   const tableTopY = 42;
   const taxLabel = procurementTaxLabelForEntity(request.entity);
+  const PR_MAX_ROWS_PER_PAGE = 5;
+
+  /** Footer signature box is always drawn on every page. */
+  const signatureBlockH = 56;
+  const signatureBoxInnerH = 52;
+  const signTopFixed = pageBottomSafe - signatureBoxInnerH;
+  const tableBottomSafe = signTopFixed - 4;
 
   const getItemValue = (item: any, keys: string[]) => {
     const foundKey = Object.keys(item || {}).find((k) => keys.includes(k.toLowerCase()));
@@ -1323,7 +1575,6 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
   type RowBlock = { kind: 'data'; cells: string[][]; h: number } | { kind: 'totals'; h: number };
 
   const dataBlocks: RowBlock[] = [];
-  const approvedApprovals = (request.approvals || []).filter((a) => a.status.toLowerCase() === 'approved');
 
   lineItems.forEach((item, idx) => {
     doc.setFontSize(bodyFont);
@@ -1348,7 +1599,6 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
     const h = Math.max(minRowH, Math.max(...linesPerCol, 1) * lineStepBody + padY * 2);
     dataBlocks.push({ kind: 'data', cells, h });
   });
-  dataBlocks.push({ kind: 'totals', h: totalsBlockH });
 
   const drawPageChrome = (tableTop: number) => {
     doc.setLineWidth(0.3);
@@ -1410,95 +1660,6 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
     return yBot;
   };
 
-  const drawTotalsBlock = (yTop: number) => {
-    const yBot = yTop + totalsBlockH;
-    doc.line(tableLeft, yBot, tableRight, yBot);
-    const splitAt = colWidths.length - 2;
-    const lastColStart = colXs[colWidths.length - 1];
-    doc.line(colXs[splitAt], yTop, colXs[splitAt], yBot);
-    doc.line(lastColStart, yTop + 20, tableRight, yTop + 20);
-    doc.setFontSize(8);
-    doc.text('Subtotal', colXs[splitAt] + padX, yTop + 5);
-    doc.text(subtotal.toFixed(2), tableRight - padX, yTop + 5, { align: 'right' });
-    doc.text(`Discount (${(discountRate * 100).toFixed(0)}%)`, colXs[splitAt] + padX, yTop + 11);
-    doc.text(discountAmount.toFixed(2), tableRight - padX, yTop + 11, { align: 'right' });
-    doc.text(`${taxLabel} ${(taxRate * 100).toFixed(0)}%`, colXs[splitAt] + padX, yTop + 17);
-    doc.text(`${(tax || 0).toFixed(2)}`, tableRight - padX, yTop + 17, { align: 'right' });
-    doc.text((request.currency?.trim() || '—').toUpperCase(), lastColStart + padX, yBot - 3);
-    doc.text(total.toFixed(2), tableRight - padX, yBot - 3, { align: 'right' });
-    return yBot;
-  };
-
-  let tableTop = tableTopY;
-  let y = tableTop;
-  drawPageChrome(tableTop);
-  let headerBottom = drawHeaderRow(y);
-  y = headerBottom;
-  drawVerticalRules(tableTop, headerBottom);
-
-  let blockIndex = 0;
-  while (blockIndex < dataBlocks.length) {
-    const block = dataBlocks[blockIndex];
-    if (block.kind === 'data') {
-      if (y + block.h > pageBottomSafe) {
-        doc.addPage('a4', 'l');
-        tableTop = tableTopY;
-        y = tableTop;
-        drawPageChrome(tableTop);
-        headerBottom = drawHeaderRow(y);
-        y = headerBottom;
-        drawVerticalRules(tableTop, y);
-      }
-      y = drawDataRow(y, block.h, block.cells);
-      drawVerticalRules(tableTop, y);
-    } else {
-      if (y + block.h > pageBottomSafe) {
-        doc.addPage('a4', 'l');
-        tableTop = tableTopY;
-        y = tableTop;
-        drawPageChrome(tableTop);
-        headerBottom = drawHeaderRow(y);
-        y = headerBottom;
-        drawVerticalRules(tableTop, y);
-      }
-      y = drawTotalsBlock(y);
-      drawVerticalRules(tableTop, y);
-    }
-    blockIndex += 1;
-  }
-
-  const tableBottom = y;
-  drawVerticalRules(tableTop, tableBottom);
-
-  const prDisclaimerText =
-    'Details of request items/services such as model no., grades/quality, date of delivery, and other requirements as appropriate to ensure the correct purchase shall be Clearly stated or attached.';
-  doc.setFont('helvetica', 'italic');
-  doc.setFontSize(7);
-  const discMaxW = tableRight - tableLeft - 4;
-  const discLines = doc.splitTextToSize(prDisclaimerText, discMaxW);
-  const discLineH = 3.35;
-  const discBlockH = discLines.length * discLineH + 2;
-
-  /** Taller box so signatures are not squeezed; image area uses max height below labels. */
-  const signatureBlockH = 56;
-  const signatureBoxInnerH = 52;
-  const footerGap = 2;
-  const footerTotalH = discBlockH + footerGap + signatureBlockH;
-  let discY = tableBottom + 3;
-  if (discY + footerTotalH > pageBottomSafe) {
-    doc.addPage('a4', 'l');
-    drawPageChrome(tableTopY);
-    discY = tableTopY + 4;
-  }
-  discLines.forEach((ln) => {
-    doc.text(ln, left + 2, discY);
-    discY += discLineH;
-  });
-  doc.setFont('helvetica', 'normal');
-  const signTop = discY + footerGap;
-  const signBottom = signTop + signatureBoxInnerH;
-  const hodApproval = prHodApprovalForPdf(request);
-
   const addSignatureImageFit = (dataUrl: string, xMm: number, yTopMm: number, maxW: number, maxH: number) => {
     if (!dataUrl) return;
     const lower = dataUrl.toLowerCase();
@@ -1538,63 +1699,134 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
     }
   };
 
-  doc.rect(left, signTop, right - left, signBottom - signTop);
-  const mid = (left + right) / 2;
-  doc.line(mid, signTop, mid, signBottom);
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(8);
-  doc.text('Requested By:', left + 2, signTop + 6);
-  doc.text('Approved By:', mid + 2, signTop + 6);
-  const sigPadX = 3;
-  const sigMaxW = mid - left - sigPadX * 2;
-  const sigMaxH = 22;
-  const sigImgY = signTop + 8;
-  const reqSigUrl = isSignatureImageDataUrl(request.requester_signature) ? request.requester_signature! : '';
-  if (reqSigUrl) {
-    addSignatureImageFit(reqSigUrl, left + sigPadX, sigImgY, sigMaxW, sigMaxH);
-  } else if (request.requester_signed_at) {
-    doc.setFontSize(7);
-    doc.text('Electronic signature', left + sigPadX, sigImgY + 5);
-    doc.text(formatSignatureProofTimestamp(request.requester_signed_at), left + sigPadX, sigImgY + 11);
+  const drawSignatureBlock = (signTop: number) => {
+    const signBottom = signTop + signatureBoxInnerH;
+    const hodApproval = prHodApprovalForPdf(request);
+
+    doc.rect(left, signTop, right - left, signBottom - signTop);
+    const mid = (left + right) / 2;
+    doc.line(mid, signTop, mid, signBottom);
+    doc.setFont('helvetica', 'normal');
     doc.setFontSize(8);
-  }
-  const apprSigUrl =
-    hodApproval?.approver_signature && isSignatureImageDataUrl(hodApproval.approver_signature)
-      ? hodApproval.approver_signature!
-      : '';
-  if (apprSigUrl) {
-    addSignatureImageFit(apprSigUrl, mid + sigPadX, sigImgY, sigMaxW, sigMaxH);
-  } else if (hodApproval && hodApproval.status.toLowerCase() === 'approved') {
-    doc.setFontSize(7);
-    doc.text('Electronic signature', mid + sigPadX, sigImgY + 5);
-    doc.text(formatSignatureProofTimestamp(hodApproval.created_at), mid + sigPadX, sigImgY + 11);
+    doc.text('Requested By:', left + 2, signTop + 6);
+    doc.text('Approved By:', mid + 2, signTop + 6);
+
+    const sigPadX = 3;
+    const sigMaxW = mid - left - sigPadX * 2;
+    const sigMaxH = 22;
+    const sigImgY = signTop + 8;
+
+    const reqSigUrl = isSignatureImageDataUrl(request.requester_signature) ? request.requester_signature! : '';
+    if (reqSigUrl) {
+      addSignatureImageFit(reqSigUrl, left + sigPadX, sigImgY, sigMaxW, sigMaxH);
+    } else if (request.requester_signed_at) {
+      doc.setFontSize(7);
+      doc.text('Electronic signature', left + sigPadX, sigImgY + 5);
+      doc.text(formatSignatureProofTimestamp(request.requester_signed_at), left + sigPadX, sigImgY + 11);
+      doc.setFontSize(8);
+    }
+
+    const apprSigUrl =
+      hodApproval?.approver_signature && isSignatureImageDataUrl(hodApproval.approver_signature)
+        ? hodApproval.approver_signature!
+        : '';
+    if (apprSigUrl) {
+      addSignatureImageFit(apprSigUrl, mid + sigPadX, sigImgY, sigMaxW, sigMaxH);
+    } else if (hodApproval && hodApproval.status.toLowerCase() === 'approved') {
+      doc.setFontSize(7);
+      doc.text('Electronic signature', mid + sigPadX, sigImgY + 5);
+      doc.text(formatSignatureProofTimestamp(hodApproval.created_at), mid + sigPadX, sigImgY + 11);
+      doc.setFontSize(8);
+    }
+
+    doc.setFont('helvetica', 'normal');
     doc.setFontSize(8);
+    doc.text(`Name : ${request.requester_name || ''}`, left + 2, signBottom - 15);
+    let yDesPr = signBottom - 11;
+    pdfDesignationLines(doc, 'Designation: ', request.requester_designation, sigMaxW - 2, 6.5).forEach((ln) => {
+      doc.text(ln, left + 2, yDesPr);
+      yDesPr += 3.2;
+    });
+    doc.setFontSize(8);
+    doc.text(`Name: ${hodApproval?.approver_name || ''}`, mid + 2, signBottom - 15);
+    yDesPr = signBottom - 11;
+    pdfDesignationLines(doc, 'Designation: ', hodApproval?.approver_designation ?? null, sigMaxW - 2, 6.5).forEach((ln) => {
+      doc.text(ln, mid + 2, yDesPr);
+      yDesPr += 3.2;
+    });
+    doc.setFontSize(8);
+    doc.text(new Date(request.created_at).toLocaleDateString(), left + 2, signBottom - 2);
+    doc.text(
+      hodApproval?.created_at
+        ? new Date(hodApproval.created_at).toLocaleDateString()
+        : new Date().toLocaleDateString(),
+      mid + 2,
+      signBottom - 2
+    );
+  };
+
+  const drawTotalsBlock = (yTop: number) => {
+    const yBot = yTop + totalsBlockH;
+    doc.line(tableLeft, yBot, tableRight, yBot);
+    const splitAt = colWidths.length - 2;
+    const lastColStart = colXs[colWidths.length - 1];
+    doc.line(colXs[splitAt], yTop, colXs[splitAt], yBot);
+    doc.line(lastColStart, yTop + 20, tableRight, yTop + 20);
+    doc.setFontSize(8);
+    doc.text('Subtotal', colXs[splitAt] + padX, yTop + 5);
+    doc.text(subtotal.toFixed(2), tableRight - padX, yTop + 5, { align: 'right' });
+    doc.text(`Discount (${(discountRate * 100).toFixed(0)}%)`, colXs[splitAt] + padX, yTop + 11);
+    doc.text(discountAmount.toFixed(2), tableRight - padX, yTop + 11, { align: 'right' });
+    doc.text(`${taxLabel} ${(taxRate * 100).toFixed(0)}%`, colXs[splitAt] + padX, yTop + 17);
+    doc.text(`${(tax || 0).toFixed(2)}`, tableRight - padX, yTop + 17, { align: 'right' });
+    doc.text((request.currency?.trim() || '—').toUpperCase(), lastColStart + padX, yBot - 3);
+    doc.text(total.toFixed(2), tableRight - padX, yBot - 3, { align: 'right' });
+    return yBot;
+  };
+
+  const drawNewPage = () => {
+    drawPageChrome(tableTopY);
+    const headerBottom = drawHeaderRow(tableTopY);
+    drawVerticalRules(tableTopY, headerBottom);
+    return headerBottom;
+  };
+
+  let pageIndex = 0;
+  let rowOnPage = 0;
+  let y = tableTopY;
+  y = drawNewPage();
+
+  for (let i = 0; i < dataBlocks.length; i++) {
+    const block = dataBlocks[i];
+    if (block.kind !== 'data') continue;
+
+    const needNewPage =
+      rowOnPage >= PR_MAX_ROWS_PER_PAGE || (y + block.h > tableBottomSafe);
+    if (needNewPage) {
+      // Close previous page with signature before continuing.
+      drawSignatureBlock(signTopFixed);
+      doc.addPage('a4', 'l');
+      pageIndex += 1;
+      rowOnPage = 0;
+      y = drawNewPage();
+    }
+
+    y = drawDataRow(y, block.h, block.cells);
+    drawVerticalRules(tableTopY, y);
+    rowOnPage += 1;
   }
 
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(8);
-  doc.text(`Name : ${request.requester_name || ''}`, left + 2, signBottom - 15);
-  let yDesPr = signBottom - 11;
-  pdfDesignationLines(doc, 'Designation: ', request.requester_designation, sigMaxW - 2, 6.5).forEach((ln) => {
-    doc.text(ln, left + 2, yDesPr);
-    yDesPr += 3.2;
-  });
-  doc.setFontSize(8);
-  doc.text(`Name: ${hodApproval?.approver_name || ''}`, mid + 2, signBottom - 15);
-  yDesPr = signBottom - 11;
-  pdfDesignationLines(doc, 'Designation: ', hodApproval?.approver_designation ?? null, sigMaxW - 2, 6.5).forEach((ln) => {
-    doc.text(ln, mid + 2, yDesPr);
-    yDesPr += 3.2;
-  });
-  doc.setFontSize(8);
-  doc.text(new Date(request.created_at).toLocaleDateString(), left + 2, signBottom - 2);
-  doc.text(
-    hodApproval?.created_at
-      ? new Date(hodApproval.created_at).toLocaleDateString()
-      : new Date().toLocaleDateString(),
-    mid + 2,
-    signBottom - 2
-  );
+  // Totals: place on the last page above signatures; if it doesn't fit, move totals to a new page.
+  const totalsNeedNewPage = y + totalsBlockH > tableBottomSafe;
+  if (totalsNeedNewPage) {
+    drawSignatureBlock(signTopFixed);
+    doc.addPage('a4', 'l');
+    pageIndex += 1;
+    y = drawNewPage();
+  }
+  y = drawTotalsBlock(y);
+  drawVerticalRules(tableTopY, y);
+  drawSignatureBlock(signTopFixed);
 
   return buildPdfPreview(doc, `PR_${displayRequestSerial(request)}.pdf`);
 };
@@ -2189,6 +2421,7 @@ type CostCenterPickOption = {
   value: string;
   code: string;
   name: string;
+  glAccount: string;
   searchLower: string;
 };
 
@@ -2196,13 +2429,14 @@ function costCenterPickOptionsFromRows(rows: unknown): CostCenterPickOption[] {
   if (!Array.isArray(rows)) return [];
   const seen = new Set<string>();
   const out: CostCenterPickOption[] = [];
-  for (const r of rows as { code?: unknown; name?: unknown }[]) {
+  for (const r of rows as { code?: unknown; name?: unknown; gl_account?: unknown; glAccount?: unknown }[]) {
     const code = String(r?.code ?? '').trim();
     if (!code || seen.has(code)) continue;
     seen.add(code);
     const name = String(r?.name ?? '').trim();
-    const searchLower = `${code}\n${name}`.toLowerCase();
-    out.push({ value: code, code, name, searchLower });
+    const glAccount = String((r as any)?.gl_account ?? (r as any)?.glAccount ?? '').trim();
+    const searchLower = `${code}\n${name}\n${glAccount}`.toLowerCase();
+    out.push({ value: code, code, name, glAccount, searchLower });
   }
   out.sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true }));
   return out;
@@ -2364,7 +2598,10 @@ const SearchableSelect = ({
   const summaryText = useMemo(() => {
     if (loading) return 'Loading list…';
     if (loadFailed && options.length === 0) return 'Could not load list';
-    if (selected) return selected.name ? `${selected.code} — ${selected.name}` : selected.code;
+    if (selected) {
+      const base = selected.name ? `${selected.code} — ${selected.name}` : selected.code;
+      return selected.glAccount ? `${base} (G/L ${selected.glAccount})` : base;
+    }
     if (value.trim()) return value;
     return '';
   }, [loading, loadFailed, options.length, selected, value]);
@@ -2478,9 +2715,10 @@ const SearchableSelect = ({
                     )}
                   >
                     <div className="text-sm font-semibold text-zinc-900 leading-snug">{opt.name || opt.code}</div>
-                    {opt.name ? (
-                      <div className="text-[11px] text-zinc-500 font-mono mt-0.5 tracking-tight">{opt.code}</div>
-                    ) : null}
+                    <div className="text-[11px] text-zinc-500 font-mono mt-0.5 tracking-tight">
+                      {opt.code}
+                      {opt.glAccount ? ` · G/L ${opt.glAccount}` : ''}
+                    </div>
                   </button>
                 ))
               ) : (
@@ -2505,6 +2743,8 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
   const [lineItems, setLineItems] = useState<any[]>([]);
   const [attachments, setAttachments] = useState<{ name: string; type: string; data: string }[]>([]);
   const [signature, setSignature] = useState<string | null>(null);
+  const [savedSignature, setSavedSignature] = useState<string | null>(null);
+  const [savedSignatureLoading, setSavedSignatureLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [taxRateInput, setTaxRateInput] = useState('');
   const [discountRateInput, setDiscountRateInput] = useState('');
@@ -2544,6 +2784,78 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
       cancelled = true;
     };
   }, [needsGccmApproverPicker, entity]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        setSavedSignatureLoading(true);
+        const r = await api.request("/api/me/signature", { skipEntity: true });
+        if (cancelled) return;
+        setSavedSignature(r?.exists && typeof r?.dataUrl === "string" ? r.dataUrl : null);
+      } catch {
+        if (!cancelled) setSavedSignature(null);
+      } finally {
+        if (!cancelled) setSavedSignatureLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const useSavedSignature = async () => {
+    try {
+      setSavedSignatureLoading(true);
+      const r = await api.request("/api/me/signature", { skipEntity: true });
+      const next = r?.exists && typeof r?.dataUrl === "string" ? r.dataUrl : null;
+      setSavedSignature(next);
+      if (!next) {
+        toast.error("No saved signature found.");
+        return;
+      }
+      setSignature(next);
+      toast.success("Using saved signature.");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to load saved signature");
+    } finally {
+      setSavedSignatureLoading(false);
+    }
+  };
+
+  const saveSignatureAsDefault = async () => {
+    if (!signature || !isSignatureImageDataUrl(signature)) {
+      toast.error("Please draw a signature first.");
+      return;
+    }
+    try {
+      setSavedSignatureLoading(true);
+      await api.request("/api/me/signature", {
+        method: "PUT",
+        skipEntity: true,
+        body: JSON.stringify({ dataUrl: signature }),
+      });
+      setSavedSignature(signature);
+      toast.success("Saved signature.");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to save signature");
+    } finally {
+      setSavedSignatureLoading(false);
+    }
+  };
+
+  const removeSavedSignature = async () => {
+    try {
+      setSavedSignatureLoading(true);
+      await api.request("/api/me/signature", { method: "DELETE", skipEntity: true });
+      setSavedSignature(null);
+      toast.success("Removed saved signature.");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to remove saved signature");
+    } finally {
+      setSavedSignatureLoading(false);
+    }
+  };
 
   const addLineItem = () => {
     const newItem: any = { id: Math.random().toString(36).substr(2, 9), [LINE_ITEM_REMARKS_KEY]: '' };
@@ -2962,7 +3274,18 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
                   Signature (Preparer)
                   <span className="text-[10px] bg-red-100 text-red-600 px-1.5 py-0.5 rounded uppercase font-bold">Mandatory</span>
                 </label>
-                <SignaturePad onSave={setSignature} onClear={() => setSignature(null)} />
+                <SignaturePad
+                  onSave={setSignature}
+                  onClear={() => setSignature(null)}
+                  value={signature}
+                  savedSignature={savedSignature}
+                  onUseSaved={useSavedSignature}
+                  onSaveDefault={savedSignatureLoading ? undefined : saveSignatureAsDefault}
+                  onClearSaved={savedSignatureLoading ? undefined : removeSavedSignature}
+                />
+                {savedSignatureLoading ? (
+                  <p className="text-[11px] text-zinc-400">Syncing saved signature…</p>
+                ) : null}
               </div>
             )}
 
@@ -3406,6 +3729,9 @@ const WorkflowRequestList = ({
           : 'Rejection reason (optional):',
         ''
       ) ?? '';
+    if (decision === 'cancelled' && !String(decisionComment || '').trim()) {
+      return toast.error('Please enter a cancellation reason.');
+    }
     setLoading(true);
     try {
       await api.request(`/api/workflow-requests/${id}/purchasing-decision`, {
@@ -3436,6 +3762,8 @@ const WorkflowRequestList = ({
       user.id === selectedRequest.requester_id || 
       (canApprove && hasPermission('edit_requests'))
     )) ||
+    // Requester may edit rejected PRs before resubmitting.
+    (isWorkflowRequestRejected(selectedRequest) && isPR_Only(selectedRequest) && user.id === selectedRequest.requester_id) ||
     (isWorkflowRequestFullyApproved(selectedRequest) && isPR_Only(selectedRequest) && isPurchasing)
   );
 
@@ -4299,7 +4627,7 @@ const WorkflowRequestList = ({
                         <div className="space-y-8">
                           <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-4">Approval Workflow</p>
                           {selectedRequest.template_steps.map((step, i) => {
-                            const approval = approvals.find(a => a.step_index === i);
+                            const approval = [...approvals].reverse().find((a) => a.step_index === i);
                             const isCurrent = isWorkflowRequestPending(selectedRequest) && selectedRequest.current_step_index === i;
                             
                             return (
@@ -4431,9 +4759,9 @@ const WorkflowRequestList = ({
 
                     {isWorkflowRequestRejected(selectedRequest) && user.id === selectedRequest.requester_id && (
                       <section className="pt-12 border-t-2 border-zinc-100">
-                        <div className="bg-red-50 p-8 rounded-2xl border border-red-100">
+                        <div className="bg-rose-50 p-8 rounded-2xl border border-rose-200">
                           <div className="flex items-center gap-3 mb-6">
-                            <div className="w-10 h-10 bg-red-600 rounded-xl flex items-center justify-center shadow-lg shadow-red-200">
+                            <div className="w-10 h-10 bg-rose-600 rounded-xl flex items-center justify-center shadow-lg shadow-rose-200">
                               <RefreshCw className="w-5 h-5 text-white" />
                             </div>
                             <div>
@@ -4441,6 +4769,27 @@ const WorkflowRequestList = ({
                               <p className="text-xs text-zinc-500">This request was rejected. You can resubmit it to restart the workflow.</p>
                             </div>
                           </div>
+                          {(() => {
+                            const ra = purchasingRejectApprovalForRequest({ ...selectedRequest, approvals });
+                            const reason = String(ra?.comment || '').trim();
+                            const who = String(ra?.approver_name || '').trim();
+                            const when = ra?.created_at ? new Date(ra.created_at).toLocaleString() : '';
+                            if (!reason && !who && !when) return null;
+                            return (
+                              <div className="mb-6 bg-rose-100 border border-rose-300 rounded-xl p-4">
+                                <div className="text-[10px] font-black text-rose-900 uppercase tracking-widest mb-1">
+                                  Rejected by purchasing
+                                </div>
+                                <div className="text-xs text-rose-900">
+                                  {who ? <span className="font-bold">{who}</span> : null}
+                                  {when ? <span className="text-rose-800/80">{who ? ` • ${when}` : when}</span> : null}
+                                </div>
+                                {reason ? (
+                                  <div className="mt-2 text-sm text-rose-950 whitespace-pre-wrap break-words">“{reason}”</div>
+                                ) : null}
+                              </div>
+                            );
+                          })()}
                           <button
                             onClick={() => handleResubmit(selectedRequest.id)}
                             disabled={loading}
@@ -4454,8 +4803,26 @@ const WorkflowRequestList = ({
                     )}
                     {isWorkflowRequestCancelled(selectedRequest) && (
                       <section className="pt-12 border-t-2 border-zinc-100">
-                        <div className="bg-zinc-100 p-6 rounded-2xl border border-zinc-200">
-                          <p className="text-sm font-bold text-zinc-700">This PR was cancelled by purchasing and is final (cannot be resubmitted).</p>
+                        <div className="bg-rose-50 p-6 rounded-2xl border border-rose-200">
+                          {(() => {
+                            const ca = purchasingCancelApprovalForRequest({ ...selectedRequest, approvals });
+                            const reason = String(ca?.comment || '').trim();
+                            const who = String(ca?.approver_name || '').trim();
+                            const when = ca?.created_at ? new Date(ca.created_at).toLocaleString() : '';
+                            return (
+                              <div className="space-y-2">
+                                <p className="text-sm font-bold text-rose-800">
+                                  Cancelled by purchasing team{who ? ` — ${who}` : ''}{when ? ` (${when})` : ''}. This is final (cannot be resubmitted).
+                                </p>
+                                {reason ? (
+                                  <div className="text-sm text-rose-950 bg-rose-100 border border-rose-300 rounded-xl p-3">
+                                    <div className="text-[10px] font-black text-rose-900 uppercase tracking-widest mb-1">Cancellation reason</div>
+                                    <div className="whitespace-pre-wrap break-words">{reason}</div>
+                                  </div>
+                                ) : null}
+                              </div>
+                            );
+                          })()}
                         </div>
                       </section>
                     )}
@@ -5798,6 +6165,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   const [detailsViewMode, setDetailsViewMode] = useState<'details' | 'pdf'>('details');
   const [detailsPdfPreview, setDetailsPdfPreview] = useState<{ url: string; fileName: string } | null>(null);
   const [convertPoModal, setConvertPoModal] = useState<ConvertPoModalTarget | null>(null);
+  const [purchasingDecisionModal, setPurchasingDecisionModal] = useState<PurchasingDecisionModalTarget | null>(null);
   const {
     options: costCenterOptions,
     loading: costCentersLoading,
@@ -6056,26 +6424,34 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     }
   };
 
-  const handlePurchasingFinalDecision = async (id: number, decision: 'rejected' | 'cancelled') => {
-    const decisionComment =
-      window.prompt(
-        decision === 'cancelled'
-          ? 'Cancellation reason (optional, recommended for audit):'
-          : 'Rejection reason (optional):',
-        ''
-      ) ?? '';
+  const openPurchasingDecisionModal = (r: WorkflowRequest, decision: 'rejected' | 'cancelled') => {
+    const ent = String(r.entity || '').trim();
+    if (ent) api.setActiveEntity(ent);
+    setPurchasingDecisionModal({
+      id: r.id,
+      decision,
+      prSerial: r.formatted_id ? toUpperSerial(r.formatted_id) : `#${r.id}`,
+      title: r.title || '',
+      entity: ent,
+    });
+  };
+
+  const handlePurchasingFinalDecision = async (id: number, decision: 'rejected' | 'cancelled', comment: string, entity: string) => {
     setLoading(true);
     try {
+      const ent = String(entity || '').trim();
+      if (ent) api.setActiveEntity(ent);
       await api.request(`/api/workflow-requests/${id}/purchasing-decision`, {
         method: 'POST',
         body: JSON.stringify({
           decision,
-          comment: decisionComment,
+          comment,
         }),
       });
       toast.success(decision === 'cancelled' ? 'PR cancelled' : 'PR rejected by purchasing');
       fetchProcurementRequests();
       setSelectedRequest(null);
+      setPurchasingDecisionModal(null);
     } catch (err: any) {
       toast.error(err.message);
     } finally {
@@ -6435,6 +6811,34 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                             Convert to PO
                           </button>
                         )}
+                        {canShowPurchasingFinalDecision(r, user) && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openPurchasingDecisionModal(r, 'rejected');
+                            }}
+                            className="flex items-center gap-2 px-4 py-2 bg-rose-50 text-rose-700 rounded-lg font-bold text-xs hover:bg-rose-100 transition-all border border-rose-200 shadow-sm"
+                            title="Reject returns PR to requester for edit + resubmit"
+                          >
+                            <XCircle className="w-4 h-4" />
+                            Reject PR
+                          </button>
+                        )}
+                        {canShowPurchasingFinalDecision(r, user) && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openPurchasingDecisionModal(r, 'cancelled');
+                            }}
+                            title="Cancellation is final and cannot be resubmitted"
+                            className="flex items-center gap-2 px-4 py-2 bg-rose-50 text-rose-700 rounded-lg font-bold text-xs hover:bg-rose-100 transition-all border border-rose-200 shadow-sm"
+                          >
+                            <XCircle className="w-4 h-4" />
+                            Cancel PR
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={(e) => {
@@ -6549,14 +6953,14 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                   {canShowPurchasingFinalDecision(selectedRequest, user) && !isEditing && (
                     <>
                       <button
-                        onClick={() => handlePurchasingFinalDecision(selectedRequest.id, 'rejected')}
+                        onClick={() => openPurchasingDecisionModal(selectedRequest, 'rejected')}
                         className="flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 rounded-xl text-sm font-bold text-red-700 hover:bg-red-100 transition-colors"
                       >
                         <XCircle className="w-4 h-4" />
                         Reject PR (Resubmittable)
                       </button>
                       <button
-                        onClick={() => handlePurchasingFinalDecision(selectedRequest.id, 'cancelled')}
+                        onClick={() => openPurchasingDecisionModal(selectedRequest, 'cancelled')}
                         className="flex items-center gap-2 px-4 py-2 bg-zinc-200 border border-zinc-300 rounded-xl text-sm font-bold text-zinc-800 hover:bg-zinc-300 transition-colors"
                         title="Cancellation is final and cannot be resubmitted"
                       >
@@ -7161,7 +7565,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                         <div className="space-y-8">
                           <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-4">Approval Workflow</p>
                           {selectedRequest.template_steps.map((step, i) => {
-                            const approval = approvals.find(a => a.step_index === i);
+                            const approval = [...approvals].reverse().find((a) => a.step_index === i);
                             const isCurrent = isWorkflowRequestPending(selectedRequest) && selectedRequest.current_step_index === i;
                             
                             return (
@@ -7226,9 +7630,9 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
 
                     {isWorkflowRequestRejected(selectedRequest) && user.id === selectedRequest.requester_id && (
                       <section className="pt-12 border-t-2 border-zinc-100">
-                        <div className="bg-red-50 p-8 rounded-2xl border border-red-100">
+                        <div className="bg-rose-50 p-8 rounded-2xl border border-rose-200">
                           <div className="flex items-center gap-3 mb-6">
-                            <div className="w-10 h-10 bg-red-600 rounded-xl flex items-center justify-center shadow-lg shadow-red-200">
+                            <div className="w-10 h-10 bg-rose-600 rounded-xl flex items-center justify-center shadow-lg shadow-rose-200">
                               <RefreshCw className="w-5 h-5 text-white" />
                             </div>
                             <div>
@@ -7236,6 +7640,27 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                               <p className="text-xs text-zinc-500">This request was rejected. You can resubmit it to restart the workflow.</p>
                             </div>
                           </div>
+                          {(() => {
+                            const ra = purchasingRejectApprovalForRequest({ ...selectedRequest, approvals });
+                            const reason = String(ra?.comment || '').trim();
+                            const who = String(ra?.approver_name || '').trim();
+                            const when = ra?.created_at ? new Date(ra.created_at).toLocaleString() : '';
+                            if (!reason && !who && !when) return null;
+                            return (
+                              <div className="mb-6 bg-rose-100 border border-rose-300 rounded-xl p-4">
+                                <div className="text-[10px] font-black text-rose-900 uppercase tracking-widest mb-1">
+                                  Rejected by purchasing
+                                </div>
+                                <div className="text-xs text-rose-900">
+                                  {who ? <span className="font-bold">{who}</span> : null}
+                                  {when ? <span className="text-rose-800/80">{who ? ` • ${when}` : when}</span> : null}
+                                </div>
+                                {reason ? (
+                                  <div className="mt-2 text-sm text-rose-950 whitespace-pre-wrap break-words">“{reason}”</div>
+                                ) : null}
+                              </div>
+                            );
+                          })()}
                           <button
                             onClick={() => handleResubmit(selectedRequest.id)}
                             disabled={loading}
@@ -7249,8 +7674,28 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                     )}
                     {isWorkflowRequestCancelled(selectedRequest) && (
                       <section className="pt-12 border-t-2 border-zinc-100">
-                        <div className="bg-zinc-100 p-6 rounded-2xl border border-zinc-200">
-                          <p className="text-sm font-bold text-zinc-700">This PR was cancelled by purchasing and is final (cannot be resubmitted).</p>
+                        <div className="bg-rose-50 p-6 rounded-2xl border border-rose-200">
+                          {(() => {
+                            const ca = purchasingCancelApprovalForRequest({ ...selectedRequest, approvals });
+                            const reason = String(ca?.comment || '').trim();
+                            const who = String(ca?.approver_name || '').trim();
+                            const when = ca?.created_at ? new Date(ca.created_at).toLocaleString() : '';
+                            return (
+                              <div className="space-y-2">
+                                <p className="text-sm font-bold text-rose-800">
+                                  Cancelled by purchasing team{who ? ` — ${who}` : ''}{when ? ` (${when})` : ''}. This is final (cannot be resubmitted).
+                                </p>
+                                {reason ? (
+                                  <div className="text-sm text-rose-950 bg-rose-100 border border-rose-300 rounded-xl p-3">
+                                    <div className="text-[10px] font-black text-rose-900 uppercase tracking-widest mb-1">Cancellation reason</div>
+                                    <div className="whitespace-pre-wrap break-words">{reason}</div>
+                                  </div>
+                                ) : (
+                                  <p className="text-xs text-rose-700/80 italic">No cancellation reason was provided.</p>
+                                )}
+                              </div>
+                            );
+                          })()}
                         </div>
                       </section>
                     )}
@@ -7278,6 +7723,20 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
         loading={loading}
         onClose={() => !loading && setConvertPoModal(null)}
         onConfirm={handleConvertToPOConfirm}
+      />
+      <PurchasingDecisionModal
+        target={purchasingDecisionModal}
+        loading={loading}
+        onClose={() => !loading && setPurchasingDecisionModal(null)}
+        onConfirm={(comment) => {
+          if (!purchasingDecisionModal) return;
+          handlePurchasingFinalDecision(
+            purchasingDecisionModal.id,
+            purchasingDecisionModal.decision,
+            comment,
+            purchasingDecisionModal.entity
+          );
+        }}
       />
     </div>
   );
