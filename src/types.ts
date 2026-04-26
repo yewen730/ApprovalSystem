@@ -11,6 +11,8 @@ export interface User {
   roles: string[];
   permissions: string[];
   department: string;
+  /** Job title / designation from `usersetting.designation` (optional). */
+  designation?: string | null;
   entities: string[]; // List of entities the user belongs to
   /** Max request total (MYR equivalent) this user may approve as "approver"; null/undefined = no per-user cap */
   approval_limit_myr?: number | null;
@@ -67,6 +69,10 @@ export interface WorkflowRequest {
   currency?: string;
   cost_center?: string;
   section?: string;
+  /** One supplier for the whole PR (not per line). */
+  suggested_supplier?: string | null;
+  /** Set when this PR has been converted to a PO (server); one PR → one PO. */
+  converted_po_request_id?: number | null;
   line_items?: any[];
   tax_rate?: number;
   /** Document-level discount 0–1 (e.g. 0.05 = 5% off subtotal before tax). PR-focused; PO may carry from PR convert. */
@@ -77,6 +83,8 @@ export interface WorkflowRequest {
   requester_signature?: string;
   /** Timestamp when the requester completed the signature pad (image also in requester_signature when stored). */
   requester_signed_at?: string | null;
+  /** From `usersetting.designation` join (PDF / display). */
+  requester_designation?: string | null;
   created_at: string;
   approvals?: RequestApproval[];
 }
@@ -87,6 +95,10 @@ export interface RequestApproval {
   step_index: number;
   approver_id: number;
   approver_name: string;
+  /** Workflow step role when this approval was recorded (e.g. checker, approver). */
+  approver_role_snapshot?: string | null;
+  /** From `usersetting.designation` at approval time (PDF / display). */
+  approver_designation?: string | null;
   status: 'Approved' | 'Rejected' | 'Cancelled';
   comment: string;
   /** Approver pad image as data URL; NVARCHAR(MAX) for PDFs. */

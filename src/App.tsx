@@ -25,6 +25,7 @@ import {
   UserPlus,
   ShoppingCart,
   Package,
+  Warehouse,
   Receipt,
   Search,
   ChevronDown,
@@ -33,7 +34,8 @@ import {
   Eye,
   RefreshCw,
   TrendingUp,
-  Activity
+  Activity,
+  FileSpreadsheet
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Toaster, toast } from 'react-hot-toast';
@@ -237,6 +239,102 @@ function sectionPayloadFromSelection(value: string | null | undefined): string {
   const normalized = String(value ?? "").trim().toUpperCase();
   return normalized === SECTION_NA ? "" : normalized;
 }
+
+type ConvertPoModalTarget = {
+  id: number;
+  title: string;
+  prSerial: string;
+  entityCode: string;
+};
+
+/** Purchasing enters the official PO number; server enforces uniqueness per entity. */
+const ConvertPrToPoModal = ({
+  target,
+  loading,
+  onClose,
+  onConfirm,
+}: {
+  target: ConvertPoModalTarget | null;
+  loading: boolean;
+  onClose: () => void;
+  onConfirm: (poNumber: string) => void;
+}) => {
+  const [poNumber, setPoNumber] = useState('');
+  useEffect(() => {
+    if (target) setPoNumber('');
+  }, [target?.id]);
+
+  if (!target) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="convert-po-title"
+      onClick={loading ? undefined : onClose}
+    >
+      <motion.div
+        initial={{ opacity: 0, scale: 0.96 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className="bg-white rounded-2xl shadow-2xl border border-zinc-200 w-full max-w-md p-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 id="convert-po-title" className="text-lg font-bold text-zinc-900">
+          Record PO number
+        </h3>
+        <p className="text-sm text-zinc-600 mt-2">
+          Converting PR <span className="font-mono font-semibold text-zinc-900">{target.prSerial}</span>
+          {target.title ? ` — ${target.title}` : ''}
+        </p>
+        <p className="text-xs text-zinc-500 mt-1">
+          Entity: <span className="font-semibold">{target.entityCode || '—'}</span>
+        </p>
+        <label htmlFor="official-po-number" className="block text-sm font-medium text-zinc-700 mt-5">
+          Official PO number
+        </label>
+        <input
+          id="official-po-number"
+          type="text"
+          autoComplete="off"
+          className="mt-1.5 w-full px-4 py-2.5 rounded-xl border border-zinc-300 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+          placeholder="e.g. POGC26-00042"
+          value={poNumber}
+          onChange={(e) => setPoNumber(e.target.value)}
+          disabled={loading}
+        />
+        <p className="text-xs text-zinc-500 mt-2">
+          Required. The system will not create the PO if this number already exists for the same entity.
+        </p>
+        <div className="flex justify-end gap-2 mt-6">
+          <button
+            type="button"
+            disabled={loading}
+            onClick={onClose}
+            className="px-4 py-2 rounded-xl text-sm font-semibold text-zinc-600 hover:bg-zinc-100"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={loading}
+            onClick={() => {
+              const t = poNumber.trim();
+              if (!t) {
+                toast.error('Enter the official PO number.');
+                return;
+              }
+              onConfirm(t);
+            }}
+            className="px-4 py-2 rounded-xl text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {loading ? 'Creating…' : 'Create PO request'}
+          </button>
+        </div>
+      </motion.div>
+    </div>
+  );
+};
 
 const EntitySelection = ({ entities, onSelect }: { entities: string[]; onSelect: (entity: string) => void }) => {
   return (
@@ -760,13 +858,25 @@ function procurementMoneyTotals(req: Pick<WorkflowRequest, 'line_items' | 'tax_r
 
 const PR_COLUMNS = [
   'Item',
-  'Suggested Supplier',
   'Quantity',
   'Unit Price',
   'Cost Center',
   'Request to be delivered on',
   REMARKS_LINE_COL,
 ];
+
+/** One supplier for the whole PR; falls back to legacy per-line "Suggested Supplier". */
+function prSuggestedSupplierDisplay(request: Pick<WorkflowRequest, 'suggested_supplier' | 'line_items'>): string {
+  const docLevel = (request.suggested_supplier ?? '').toString().trim();
+  if (docLevel) return docLevel;
+  for (const item of request.line_items || []) {
+    const v = String(
+      item?.['Suggested Supplier'] ?? item?.['suggested supplier'] ?? item?.Supplier ?? ''
+    ).trim();
+    if (v) return v;
+  }
+  return '';
+}
 
 const PO_COLUMNS = [
   'Item',
@@ -1070,13 +1180,80 @@ const formatWorkflowRequestStatusLabel = (r: WorkflowRequest) => {
 const isPurchasingRole = (user: User) =>
   !!user.roles?.some((role) => role.toLowerCase() === 'purchasing');
 
-/** Show Convert to PO only for fully approved procurement PRs on the purchasing side. */
+/** PR already has a PO request created from it (one PR → one PO). */
+const prHasLinkedPoRequest = (r: WorkflowRequest) =>
+  r.converted_po_request_id != null && Number(r.converted_po_request_id) > 0;
+
+/** Show Convert to PO only for fully approved procurement PRs on the purchasing side, and only once per PR. */
 const canShowConvertPRToPO = (r: WorkflowRequest, user: User) =>
+  isWorkflowRequestFullyApproved(r) &&
+  isPR_Only(r) &&
+  isPurchasingRole(user) &&
+  !prHasLinkedPoRequest(r);
+
+/** Purchasing: approved PR tools in header (draft PDF may still run after a PO is linked). */
+const canShowPurchasingApprovedPRHeaderActions = (r: WorkflowRequest, user: User) =>
   isWorkflowRequestFullyApproved(r) && isPR_Only(r) && isPurchasingRole(user);
 
 /** Purchasing can still override an already-approved PR with reject/cancel. */
 const canShowPurchasingFinalDecision = (r: WorkflowRequest, user: User) =>
   isWorkflowRequestFullyApproved(r) && isPR_Only(r) && isPurchasingRole(user);
+
+const stepApproverRoleLowerAt = (steps: WorkflowStep[] | undefined, stepIndex: number): string =>
+  (steps?.[stepIndex]?.approverRole ?? '').toString().trim().toLowerCase();
+
+/** Prefer `approver_role_snapshot` from DB at sign-off; fall back to template step role. */
+const approvalStepRoleLower = (a: RequestApproval, steps: WorkflowStep[] | undefined): string => {
+  const snap = (a.approver_role_snapshot ?? '').toString().trim().toLowerCase();
+  if (snap) return snap;
+  return stepApproverRoleLowerAt(steps, a.step_index);
+};
+
+const workflowApprovedApprovals = (request: WorkflowRequest): RequestApproval[] =>
+  (request.approvals || []).filter((a) => a.status.toLowerCase() === 'approved');
+
+/**
+ * PR form (two columns): preparer + HOD/approver only — never the checker in the right column.
+ */
+const prHodApprovalForPdf = (request: WorkflowRequest): RequestApproval | undefined => {
+  const steps = request.template_steps || [];
+  const list = workflowApprovedApprovals(request);
+  const hod = list.find((a) => approvalStepRoleLower(a, steps) === 'approver');
+  if (hod) return hod;
+  const nonChecker = list.filter((a) => approvalStepRoleLower(a, steps) !== 'checker');
+  if (nonChecker.length) return nonChecker[nonChecker.length - 1];
+  return undefined;
+};
+
+/**
+ * SR form (three columns): map signatures to existing boxes — checker → middle, else approver → middle; som → right, else approver when middle is checker.
+ */
+const srSignatureColumnsForPdf = (
+  request: WorkflowRequest
+): { mid: RequestApproval | undefined; senior: RequestApproval | undefined } => {
+  const steps = request.template_steps || [];
+  const list = workflowApprovedApprovals(request);
+  const byRole = (role: string) => list.find((a) => approvalStepRoleLower(a, steps) === role);
+  const templateHasChecker = (steps || []).some((s) => (s.approverRole || '').toLowerCase() === 'checker');
+  if (templateHasChecker) {
+    return { mid: byRole('checker'), senior: byRole('som') ?? byRole('approver') };
+  }
+  return { mid: byRole('approver'), senior: byRole('som') };
+};
+
+const pdfDesignationLines = (
+  doc: jsPDF,
+  prefix: string,
+  designation: string | null | undefined,
+  maxW: number,
+  fontSize = 7
+) => {
+  const d = (designation ?? '').toString().trim();
+  const s = d ? `${prefix}${d}` : `${prefix}—`;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(fontSize);
+  return doc.splitTextToSize(s, maxW);
+};
 
 /** F-PU-003 style form PDF — only for procurement Purchase Request (see isPR_Only). Landscape for wider table. */
 const printProcurementPRFormPdf = (request: WorkflowRequest) => {
@@ -1087,8 +1264,8 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
   const right = pageW - 10;
   const tableLeft = left;
   const tableRight = right;
-  /** Column widths (mm); sum === tableRight − tableLeft (277mm). */
-  const colWidths = [10, 78, 36, 14, 32, 32, 75];
+  /** Column widths (mm); sum === tableRight − tableLeft (277mm). Supplier is in header, not grid. */
+  const colWidths = [10, 108, 16, 36, 36, 71];
   const colXs: number[] = [];
   {
     let x = tableLeft;
@@ -1108,6 +1285,8 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
   const minRowH = 6.5;
   const totalsBlockH = 26;
   const pageBottomSafe = pageH - 12;
+  /** Below chrome (incl. suggested supplier line). */
+  const tableTopY = 42;
   const taxLabel = procurementTaxLabelForEntity(request.entity);
 
   const getItemValue = (item: any, keys: string[]) => {
@@ -1123,7 +1302,6 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
   const headerLabels = [
     'No',
     'Item',
-    'Suggested Supplier',
     'Qty',
     'Cost Center Account No.',
     'Request to be delivered on',
@@ -1146,16 +1324,11 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
 
   const dataBlocks: RowBlock[] = [];
   const approvedApprovals = (request.approvals || []).filter((a) => a.status.toLowerCase() === 'approved');
-  const finalApproval =
-    approvedApprovals.length > 0
-      ? approvedApprovals.reduce((a, b) => (a.step_index >= b.step_index ? a : b))
-      : undefined;
 
   lineItems.forEach((item, idx) => {
     doc.setFontSize(bodyFont);
     const qty = getItemValue(item, ['quantity', 'qty']);
     const itemName = getItemValue(item, ['item', 'description']);
-    const supplier = getItemValue(item, ['suggested supplier', 'supplier', 'vendor']);
     const cc = getItemValue(item, ['cost center', 'cost center account no.', 'cost centre']) || request.cost_center || '-';
     const eta = getItemValue(item, ['request to be delivered on', 'delivery date', 'date of delivery']);
     /** PR grid "Remarks" / "Remarks (Purpose)" only — not `_lineRemarks` line notes. */
@@ -1166,11 +1339,10 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
     const cells: string[][] = [
       wrap(String(idx + 1), 0, bodyFont),
       wrap(itemCellText, 1, bodyFont),
-      wrap(supplier, 2, bodyFont),
-      wrap(qty || '-', 3, bodyFont),
-      wrap(cc, 4, bodyFont),
-      wrap(eta, 5, bodyFont),
-      wrap(tableRemarks || '-', 6, bodyFont),
+      wrap(qty || '-', 2, bodyFont),
+      wrap(cc, 3, bodyFont),
+      wrap(eta, 4, bodyFont),
+      wrap(tableRemarks || '-', 5, bodyFont),
     ];
     const linesPerCol = cells.map((lines) => lines.length);
     const h = Math.max(minRowH, Math.max(...linesPerCol, 1) * lineStepBody + padY * 2);
@@ -1187,11 +1359,20 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
     doc.setFontSize(9);
     doc.text('PURCHASE REQUISITION FORM: F-PU-003 (REV 0)', pageW / 2, 23, { align: 'center' });
     doc.setFontSize(8);
-    doc.text('Department :', 14, 30);
+    doc.text('Department :', 14, 28);
     doc.setFont('helvetica', 'normal');
-    doc.text(request.department || '-', 34, 30);
-    doc.text(`Date: ${new Date(request.created_at).toLocaleDateString()}`, tableRight - padX, 30, { align: 'right' });
-    doc.text(`PR No: ${displayRequestSerial(request)}`, tableRight - padX, 34, { align: 'right' });
+    doc.text(request.department || '-', 34, 28);
+    doc.text(`Date: ${new Date(request.created_at).toLocaleDateString()}`, tableRight - padX, 28, { align: 'right' });
+    doc.setFont('helvetica', 'bold');
+    doc.text('Suggested supplier:', 14, 33);
+    doc.setFont('helvetica', 'normal');
+    const supLines = doc.splitTextToSize(prSuggestedSupplierDisplay(request) || '—', tableRight - 52 - padX);
+    let sy = 33;
+    for (let i = 0; i < Math.min(2, supLines.length); i++) {
+      doc.text(supLines[i], 50, sy);
+      sy += 3.5;
+    }
+    doc.text(`PR No: ${displayRequestSerial(request)}`, tableRight - padX, 38, { align: 'right' });
     doc.line(tableLeft, tableTop, tableRight, tableTop);
   };
 
@@ -1232,9 +1413,10 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
   const drawTotalsBlock = (yTop: number) => {
     const yBot = yTop + totalsBlockH;
     doc.line(tableLeft, yBot, tableRight, yBot);
-    const splitAt = 5;
+    const splitAt = colWidths.length - 2;
+    const lastColStart = colXs[colWidths.length - 1];
     doc.line(colXs[splitAt], yTop, colXs[splitAt], yBot);
-    doc.line(colXs[6], yTop + 20, tableRight, yTop + 20);
+    doc.line(lastColStart, yTop + 20, tableRight, yTop + 20);
     doc.setFontSize(8);
     doc.text('Subtotal', colXs[splitAt] + padX, yTop + 5);
     doc.text(subtotal.toFixed(2), tableRight - padX, yTop + 5, { align: 'right' });
@@ -1242,12 +1424,12 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
     doc.text(discountAmount.toFixed(2), tableRight - padX, yTop + 11, { align: 'right' });
     doc.text(`${taxLabel} ${(taxRate * 100).toFixed(0)}%`, colXs[splitAt] + padX, yTop + 17);
     doc.text(`${(tax || 0).toFixed(2)}`, tableRight - padX, yTop + 17, { align: 'right' });
-    doc.text((request.currency?.trim() || '—').toUpperCase(), colXs[6] + padX, yBot - 3);
+    doc.text((request.currency?.trim() || '—').toUpperCase(), lastColStart + padX, yBot - 3);
     doc.text(total.toFixed(2), tableRight - padX, yBot - 3, { align: 'right' });
     return yBot;
   };
 
-  let tableTop = 36;
+  let tableTop = tableTopY;
   let y = tableTop;
   drawPageChrome(tableTop);
   let headerBottom = drawHeaderRow(y);
@@ -1260,7 +1442,7 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
     if (block.kind === 'data') {
       if (y + block.h > pageBottomSafe) {
         doc.addPage('a4', 'l');
-        tableTop = 20;
+        tableTop = tableTopY;
         y = tableTop;
         drawPageChrome(tableTop);
         headerBottom = drawHeaderRow(y);
@@ -1272,7 +1454,7 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
     } else {
       if (y + block.h > pageBottomSafe) {
         doc.addPage('a4', 'l');
-        tableTop = 20;
+        tableTop = tableTopY;
         y = tableTop;
         drawPageChrome(tableTop);
         headerBottom = drawHeaderRow(y);
@@ -1305,7 +1487,8 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
   let discY = tableBottom + 3;
   if (discY + footerTotalH > pageBottomSafe) {
     doc.addPage('a4', 'l');
-    discY = 14;
+    drawPageChrome(tableTopY);
+    discY = tableTopY + 4;
   }
   discLines.forEach((ln) => {
     doc.text(ln, left + 2, discY);
@@ -1314,13 +1497,7 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
   doc.setFont('helvetica', 'normal');
   const signTop = discY + footerGap;
   const signBottom = signTop + signatureBoxInnerH;
-  const approverWithRenderableSig = approvedApprovals
-    .filter((a) => a.approver_signature && isSignatureImageDataUrl(a.approver_signature))
-    .reduce<RequestApproval | undefined>(
-      (best, a) => (!best || a.step_index > best.step_index ? a : best),
-      undefined
-    );
-  const approverForDisplay = approverWithRenderableSig || finalApproval;
+  const hodApproval = prHodApprovalForPdf(request);
 
   const addSignatureImageFit = (dataUrl: string, xMm: number, yTopMm: number, maxW: number, maxH: number) => {
     if (!dataUrl) return;
@@ -1382,26 +1559,38 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
     doc.setFontSize(8);
   }
   const apprSigUrl =
-    approverWithRenderableSig?.approver_signature && isSignatureImageDataUrl(approverWithRenderableSig.approver_signature)
-      ? approverWithRenderableSig.approver_signature!
+    hodApproval?.approver_signature && isSignatureImageDataUrl(hodApproval.approver_signature)
+      ? hodApproval.approver_signature!
       : '';
   if (apprSigUrl) {
     addSignatureImageFit(apprSigUrl, mid + sigPadX, sigImgY, sigMaxW, sigMaxH);
-  } else if (finalApproval && finalApproval.status.toLowerCase() === 'approved') {
+  } else if (hodApproval && hodApproval.status.toLowerCase() === 'approved') {
     doc.setFontSize(7);
     doc.text('Electronic signature', mid + sigPadX, sigImgY + 5);
-    doc.text(formatSignatureProofTimestamp(finalApproval.created_at), mid + sigPadX, sigImgY + 11);
+    doc.text(formatSignatureProofTimestamp(hodApproval.created_at), mid + sigPadX, sigImgY + 11);
     doc.setFontSize(8);
   }
 
-  doc.text(`Name : ${request.requester_name || ''}`, left + 2, signBottom - 14);
-  doc.text('Designation :', left + 2, signBottom - 8);
-  doc.text(`Name: ${approverForDisplay?.approver_name || ''}`, mid + 2, signBottom - 14);
-  doc.text('Designation :', mid + 2, signBottom - 8);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8);
+  doc.text(`Name : ${request.requester_name || ''}`, left + 2, signBottom - 15);
+  let yDesPr = signBottom - 11;
+  pdfDesignationLines(doc, 'Designation: ', request.requester_designation, sigMaxW - 2, 6.5).forEach((ln) => {
+    doc.text(ln, left + 2, yDesPr);
+    yDesPr += 3.2;
+  });
+  doc.setFontSize(8);
+  doc.text(`Name: ${hodApproval?.approver_name || ''}`, mid + 2, signBottom - 15);
+  yDesPr = signBottom - 11;
+  pdfDesignationLines(doc, 'Designation: ', hodApproval?.approver_designation ?? null, sigMaxW - 2, 6.5).forEach((ln) => {
+    doc.text(ln, mid + 2, yDesPr);
+    yDesPr += 3.2;
+  });
+  doc.setFontSize(8);
   doc.text(new Date(request.created_at).toLocaleDateString(), left + 2, signBottom - 2);
   doc.text(
-    approverForDisplay?.created_at
-      ? new Date(approverForDisplay.created_at).toLocaleDateString()
+    hodApproval?.created_at
+      ? new Date(hodApproval.created_at).toLocaleDateString()
       : new Date().toLocaleDateString(),
     mid + 2,
     signBottom - 2
@@ -1440,6 +1629,8 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
   const lineStepBody = 2.75;
   const minRowH = 6.5;
   const pageBottomSafe = pageH - 12;
+  /** Same table start on every page so form chrome + column headers line up on continuations. */
+  const tableTopY = 40;
 
   const getItemValue = (item: any, keys: string[]) => {
     const foundKey = Object.keys(item || {}).find((k) => keys.includes(k.toLowerCase()));
@@ -1608,7 +1799,7 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
     return yBot;
   };
 
-  let tableTop = 40;
+  let tableTop = tableTopY;
   let y = tableTop;
   drawPageChrome(tableTop);
   let headerBottom = drawHeaderRow(y);
@@ -1620,7 +1811,7 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
     const block = dataBlocks[blockIndex];
     if (y + block.h > pageBottomSafe) {
       doc.addPage('a4', 'l');
-      tableTop = 20;
+      tableTop = tableTopY;
       y = tableTop;
       drawPageChrome(tableTop);
       headerBottom = drawHeaderRow(y);
@@ -1651,12 +1842,11 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
   let signTop = tableBottom + 4;
   if (signTop + footerTotalH > pageBottomSafe) {
     doc.addPage('a4', 'l');
-    signTop = 14;
+    drawPageChrome(tableTopY);
+    signTop = tableTopY + 4;
   }
   const signBottom = signTop + signatureBoxInnerH;
-  const sortedApproved = [...approvedApprovals].sort((a, b) => a.step_index - b.step_index);
-  const opManagerApproval = sortedApproved[0];
-  const seniorApproval = sortedApproved.length > 1 ? sortedApproved[sortedApproved.length - 1] : undefined;
+  const { mid: opManagerApproval, senior: seniorApproval } = srSignatureColumnsForPdf(request);
 
   const addSignatureImageFit = (dataUrl: string, xMm: number, yTopMm: number, maxW: number, maxH: number) => {
     if (!dataUrl) return;
@@ -1748,27 +1938,37 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
     doc.text(formatSignatureProofTimestamp(opManagerApproval.created_at), xDiv1 + sigPad, sigImgY + 9);
   }
 
-  const seniorDistinct =
-    seniorApproval && opManagerApproval && seniorApproval.step_index !== opManagerApproval.step_index;
   const senSigUrl =
-    seniorDistinct &&
-    seniorApproval?.approver_signature &&
-    isSignatureImageDataUrl(seniorApproval.approver_signature)
+    seniorApproval?.approver_signature && isSignatureImageDataUrl(seniorApproval.approver_signature)
       ? seniorApproval.approver_signature!
       : '';
   if (senSigUrl) {
     addSignatureImageFit(senSigUrl, xDiv2 + sigPad, sigImgY, sigMaxW, sigMaxH);
-  } else if (seniorDistinct && seniorApproval && seniorApproval.status.toLowerCase() === 'approved') {
+  } else if (seniorApproval && seniorApproval.status.toLowerCase() === 'approved') {
     doc.text('Electronic signature', xDiv2 + sigPad, sigImgY + 4);
     doc.text(formatSignatureProofTimestamp(seniorApproval.created_at), xDiv2 + sigPad, sigImgY + 9);
   }
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(7);
-  doc.text(`Name: ${request.requester_name || ''}`, left + sigPad, signBottom - 12);
-  doc.text('Designation:', left + sigPad, signBottom - 6);
-  doc.text(`Name: ${opManagerApproval?.approver_name || ''}`, xDiv1 + sigPad, signBottom - 12);
-  doc.text(`Name: ${seniorDistinct ? seniorApproval?.approver_name || '' : ''}`, xDiv2 + sigPad, signBottom - 12);
+  doc.text(`Name: ${request.requester_name || ''}`, left + sigPad, signBottom - 13);
+  let ySrDes = signBottom - 8;
+  pdfDesignationLines(doc, 'Designation: ', request.requester_designation, sigMaxW, 6.2).forEach((ln) => {
+    doc.text(ln, left + sigPad, ySrDes);
+    ySrDes += 3.1;
+  });
+  doc.text(`Name: ${opManagerApproval?.approver_name || ''}`, xDiv1 + sigPad, signBottom - 13);
+  ySrDes = signBottom - 8;
+  pdfDesignationLines(doc, 'Designation: ', opManagerApproval?.approver_designation ?? null, sigMaxW, 6.2).forEach((ln) => {
+    doc.text(ln, xDiv1 + sigPad, ySrDes);
+    ySrDes += 3.1;
+  });
+  doc.text(`Name: ${seniorApproval?.approver_name || ''}`, xDiv2 + sigPad, signBottom - 13);
+  ySrDes = signBottom - 8;
+  pdfDesignationLines(doc, 'Designation: ', seniorApproval?.approver_designation ?? null, sigMaxW, 6.2).forEach((ln) => {
+    doc.text(ln, xDiv2 + sigPad, ySrDes);
+    ySrDes += 3.1;
+  });
 
   let noteY = signBottom + footerGap;
   doc.setFont('helvetica', 'bold');
@@ -1818,6 +2018,10 @@ const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
   y += 5;
   doc.text(`Title: ${request.title}`, margin, y);
   y += 10;
+  if (isPRRequest(request)) {
+    doc.text(`Suggested supplier: ${prSuggestedSupplierDisplay(request) || '-'}`, margin, y);
+    y += 10;
+  }
 
   if (!isPRRequest(request) && !isPO_Only(request) && !isSRRequest(request)) {
     doc.setFont('helvetica', 'bold');
@@ -1932,6 +2136,18 @@ const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
 
   return buildPdfPreview(doc, `PR_${displayRequestSerial(request)}.pdf`);
 };
+
+/** Prefer `/approvals` payload (designation + signatures) when viewing details for this request. */
+function mergeRequestApprovalsForPdf(
+  request: WorkflowRequest,
+  selectedId: number | undefined,
+  detailApprovals: RequestApproval[]
+): WorkflowRequest {
+  if (detailApprovals.length > 0 && selectedId != null && request.id === selectedId) {
+    return { ...request, approvals: detailApprovals };
+  }
+  return request;
+}
 
 function createWorkflowRequestPdfPreview(request: WorkflowRequest): { url: string; fileName: string } {
   if (isPR_Only(request)) return printProcurementPRFormPdf(request);
@@ -2285,6 +2501,7 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
   const [details, setDetails] = useState('');
   const [currency, setCurrency] = useState('');
   const [section, setSection] = useState("");
+  const [suggestedSupplier, setSuggestedSupplier] = useState('');
   const [lineItems, setLineItems] = useState<any[]>([]);
   const [attachments, setAttachments] = useState<{ name: string; type: string; data: string }[]>([]);
   const [signature, setSignature] = useState<string | null>(null);
@@ -2383,6 +2600,9 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
       if (needsGccmApproverPicker && (assignedApproverId === '' || !Number.isFinite(Number(assignedApproverId)))) {
         return toast.error('GCCM: please select who should approve this request.');
       }
+      if (isPR && !String(suggestedSupplier).trim()) {
+        return toast.error('Please enter the suggested supplier for this PR.');
+      }
       let taxRateNum = 0;
       if (isPR || isPO || isSR) {
         const trimmed = taxRateInput.trim();
@@ -2429,6 +2649,7 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
             ...(needsGccmApproverPicker && assignedApproverId !== ''
               ? { assigned_approver_id: Number(assignedApproverId) }
               : {}),
+            ...(isPR ? { suggested_supplier: String(suggestedSupplier).trim() } : {}),
           }),
         });
         toast.success('Request submitted successfully!');
@@ -2564,6 +2785,20 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
                       <option key={opt} value={opt}>{opt}</option>
                     ))}
                   </select>
+                </div>
+              )}
+              {isPR && (
+                <div className="space-y-2 max-w-2xl lg:col-span-2">
+                  <label className="text-sm font-medium text-zinc-700">Suggested supplier</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="One supplier for this entire purchase requisition"
+                    className="w-full px-4 py-2.5 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
+                    value={suggestedSupplier}
+                    onChange={(e) => setSuggestedSupplier(e.target.value)}
+                  />
+                  <p className="text-xs text-zinc-500">Applies to all line items on this PR.</p>
                 </div>
               )}
               </div>
@@ -2798,10 +3033,21 @@ const WorkflowRequestList = ({
   const [sortBy, setSortBy] = useState<'request' | 'entity' | 'department' | 'requester' | 'status' | 'date'>('date');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
   const [isEditing, setIsEditing] = useState(false);
-  const [editData, setEditData] = useState({ title: '', details: '', line_items: [] as any[], currency: '', cost_center: '', section: '', tax_rate: 18, discount_rate: 0 });
+  const [editData, setEditData] = useState({
+    title: '',
+    details: '',
+    line_items: [] as any[],
+    currency: '',
+    cost_center: '',
+    section: '',
+    suggested_supplier: '',
+    tax_rate: 18,
+    discount_rate: 0,
+  });
   const [viewingPdf, setViewingPdf] = useState<{ url: string; fileName: string } | null>(null);
   const [detailsViewMode, setDetailsViewMode] = useState<'details' | 'pdf'>('details');
   const [detailsPdfPreview, setDetailsPdfPreview] = useState<{ url: string; fileName: string } | null>(null);
+  const [convertPoModal, setConvertPoModal] = useState<ConvertPoModalTarget | null>(null);
 
   useEffect(() => {
     if (preSelectedRequestId) {
@@ -2893,17 +3139,19 @@ const WorkflowRequestList = ({
   };
 
   const handlePrintPR = (request: WorkflowRequest) => {
+    const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
     setViewingPdf((prev) => {
       if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return createWorkflowRequestPdfPreview(request);
+      return createWorkflowRequestPdfPreview(merged);
     });
     toast.success('PDF ready to view');
   };
 
   const handleShowRequestPdfInline = (request: WorkflowRequest) => {
+    const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
     setDetailsPdfPreview((prev) => {
       if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return createWorkflowRequestPdfPreview(request);
+      return createWorkflowRequestPdfPreview(merged);
     });
     setDetailsViewMode('pdf');
   };
@@ -2950,6 +3198,9 @@ const WorkflowRequestList = ({
         isPRRequest(selectedRequest) || isPO_Only(selectedRequest) || isSRRequest(selectedRequest)
           ? String(editData.currency).trim()
           : undefined;
+      if (isPRRequest(selectedRequest) && !String(editData.suggested_supplier ?? '').trim()) {
+        return toast.error('Please enter the suggested supplier for this PR.');
+      }
       await api.request(`/api/workflow-requests/${selectedRequest.id}`, {
         method: 'PATCH',
         body: JSON.stringify({
@@ -2960,6 +3211,9 @@ const WorkflowRequestList = ({
           details: detailsOut,
           currency: curOut,
           section: sectionOut,
+          ...(isPRRequest(selectedRequest)
+            ? { suggested_supplier: String(editData.suggested_supplier ?? '').trim() }
+            : {}),
         }),
       });
       toast.success('Request updated');
@@ -2975,6 +3229,9 @@ const WorkflowRequestList = ({
         currency: curOut !== undefined ? curOut : selectedRequest.currency,
         details: detailsOut,
         section: sectionOut,
+        ...(isPRRequest(selectedRequest)
+          ? { suggested_supplier: String(editData.suggested_supplier ?? '').trim() }
+          : {}),
       });
     } catch (err: any) {
       toast.error(err.message);
@@ -3113,14 +3370,25 @@ const WorkflowRequestList = ({
     toast.success('PO Draft PDF generated');
   };
 
-  const handleConvertToPO = async (id: number) => {
-    if (!window.confirm('Are you sure you want to convert this PR to a PO Request? This will create a new PO request based on this PR.')) return;
+  const openConvertPoModal = (r: WorkflowRequest) => {
+    setConvertPoModal({
+      id: r.id,
+      title: r.title || '',
+      prSerial: r.formatted_id ? toUpperSerial(r.formatted_id) : `#${r.id}`,
+      entityCode: String(r.entity || '').trim() || '—',
+    });
+  };
+
+  const handleConvertToPOConfirm = async (poNumber: string) => {
+    if (!convertPoModal) return;
     setLoading(true);
     try {
-      const result = await api.request(`/api/workflow-requests/${id}/convert-to-po`, {
+      const result = await api.request(`/api/workflow-requests/${convertPoModal.id}/convert-to-po`, {
         method: 'POST',
+        body: JSON.stringify({ po_number: poNumber }),
       });
-      toast.success(`Successfully converted to PO: ${toUpperSerial(result.formatted_id)}`);
+      toast.success(`PO created: ${toUpperSerial(result.formatted_id)}`);
+      setConvertPoModal(null);
       onRefresh();
       setSelectedRequest(null);
     } catch (err: any) {
@@ -3325,7 +3593,7 @@ const WorkflowRequestList = ({
                             type="button"
                             onClick={(e) => {
                               e.stopPropagation();
-                              handleConvertToPO(r.id);
+                              openConvertPoModal(r);
                             }}
                             className="inline-flex items-center gap-1.5 px-3 py-2 bg-indigo-600 text-white rounded-lg font-bold text-xs hover:bg-indigo-700 transition-colors shadow-sm"
                           >
@@ -3382,7 +3650,8 @@ const WorkflowRequestList = ({
                           discount_rate: procurementUnitRateToPercent(selectedRequest.discount_rate, 0),
                           currency: selectedRequest.currency?.trim() ?? '',
                           cost_center: selectedRequest.cost_center || '',
-                          section: sectionSelectionFromStored(selectedRequest.section)
+                          section: sectionSelectionFromStored(selectedRequest.section),
+                          suggested_supplier: prSuggestedSupplierDisplay(selectedRequest),
                         } as any);
                         setIsEditing(true);
                       }}
@@ -3392,7 +3661,7 @@ const WorkflowRequestList = ({
                       Edit Request
                     </button>
                   )}
-                  {canShowConvertPRToPO(selectedRequest, user) && !isEditing && (
+                  {canShowPurchasingApprovedPRHeaderActions(selectedRequest, user) && !isEditing && (
                     <>
                       <button 
                         onClick={() => handleGeneratePODraft(selectedRequest)}
@@ -3401,13 +3670,15 @@ const WorkflowRequestList = ({
                         <Download className="w-4 h-4" />
                         Generate PO Draft PDF
                       </button>
-                      <button 
-                        onClick={() => handleConvertToPO(selectedRequest.id)}
-                        className="flex items-center gap-2 px-4 py-2 bg-indigo-600 rounded-xl text-sm font-bold text-white hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-100"
-                      >
-                        <RefreshCw className="w-4 h-4" />
-                        Convert PR → PO
-                      </button>
+                      {canShowConvertPRToPO(selectedRequest, user) && (
+                        <button 
+                          onClick={() => openConvertPoModal(selectedRequest)}
+                          className="flex items-center gap-2 px-4 py-2 bg-indigo-600 rounded-xl text-sm font-bold text-white hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-100"
+                        >
+                          <RefreshCw className="w-4 h-4" />
+                          Convert PR → PO
+                        </button>
+                      )}
                     </>
                   )}
                   {canShowPurchasingFinalDecision(selectedRequest, user) && !isEditing && (
@@ -3517,6 +3788,19 @@ const WorkflowRequestList = ({
                                 <option key={opt} value={opt}>{opt}</option>
                               ))}
                             </select>
+                          </div>
+                        )}
+                        {isPRRequest(selectedRequest) && (
+                          <div className="max-w-2xl">
+                            <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Suggested supplier</label>
+                            <input
+                              type="text"
+                              className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                              value={editData.suggested_supplier ?? ''}
+                              onChange={(e) => setEditData({ ...editData, suggested_supplier: e.target.value })}
+                              required
+                            />
+                            <p className="text-xs text-zinc-500 mt-1">One supplier for the entire PR.</p>
                           </div>
                         )}
                         <div>
@@ -3840,6 +4124,17 @@ const WorkflowRequestList = ({
                         )
                       )}
                     </section>
+
+                    {isPRRequest(selectedRequest) && (
+                      <section>
+                        <h4 className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 border-b border-zinc-100 pb-2">
+                          Suggested supplier
+                        </h4>
+                        <p className="text-sm text-zinc-800 font-medium">
+                          {prSuggestedSupplierDisplay(selectedRequest) || '—'}
+                        </p>
+                      </section>
+                    )}
 
                     {/* Line Items */}
                     {selectedRequest.line_items && selectedRequest.line_items.length > 0 && (
@@ -4184,6 +4479,12 @@ const WorkflowRequestList = ({
           />
         )}
       </AnimatePresence>
+      <ConvertPrToPoModal
+        target={convertPoModal}
+        loading={loading}
+        onClose={() => !loading && setConvertPoModal(null)}
+        onConfirm={handleConvertToPOConfirm}
+      />
     </div>
   );
 };
@@ -5355,10 +5656,121 @@ const UserManagement = ({ roles: availableRoles, onRolesRefresh }: { roles: Role
   );
 };
 
+type ProcurementCenterExportTab = 'pr' | 'sr' | 'po' | 'invoice';
+
+function procurementCenterExportTabLabel(tab: ProcurementCenterExportTab): string {
+  if (tab === 'pr') return 'PR';
+  if (tab === 'sr') return 'SR';
+  if (tab === 'po') return 'PO';
+  return 'Invoice';
+}
+
+/** Workbook: Export info, Requests (summary), Line items (one row per line with parent refs). */
+async function downloadProcurementCenterExcel(
+  rows: WorkflowRequest[],
+  tab: ProcurementCenterExportTab,
+  filters: { status: string; department: string; search: string; entity: string }
+): Promise<void> {
+  const XLSX = await import('xlsx');
+  const wb = XLSX.utils.book_new();
+  const tabLabel = procurementCenterExportTabLabel(tab);
+  const stamp = new Date().toISOString().slice(0, 10);
+
+  const infoRows: (string | number)[][] = [
+    ['Procurement Center export'],
+    ['Exported', new Date().toLocaleString()],
+    ['List', tabLabel],
+    ['Search', filters.search.trim() || '—'],
+    ['Status', filters.status.trim() || 'All'],
+    ['Department', filters.department.trim() || '—'],
+    ['Entity filter', filters.entity.trim() || 'All'],
+    ['Row count', rows.length],
+  ];
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(infoRows), 'Export info');
+
+  const summaryRows = rows.map((r) => {
+    const m = procurementMoneyTotals(r);
+    const curp = procurementCurrencyPrefix(r.currency);
+    const lines = (r.line_items || []).map((item: Record<string, unknown>) => {
+      const qty =
+        item?.Quantity ?? item?.quantity ?? item?.['Max quantity'] ?? item?.['Min quantity'] ?? '';
+      const name = String(item?.Item ?? item?.item ?? '').trim();
+      return `${qty} × ${name}`.trim();
+    }).filter((s) => s.length > 0 && !/^×$/.test(s));
+    const linkedPo = r.converted_po_request_id;
+    return {
+      'Request ID': r.id,
+      'Document ID': displayRequestSerial(r),
+      'Formatted ID': (r.formatted_id ?? '').toString(),
+      Template: r.template_name ?? '',
+      Title: r.title ?? '',
+      Entity: String(r.entity || '').trim(),
+      'Entity name': entityLegalDisplayName(r.entity),
+      Department: r.department ?? '',
+      Requester: r.requester_name ?? '',
+      Status: formatWorkflowRequestStatusLabel(r),
+      'Created': r.created_at ?? '',
+      Currency: r.currency ?? '',
+      Subtotal: m.subtotal,
+      'Discount %': Number((m.discountRate * 100).toFixed(4)),
+      'Tax %': Number((m.taxRate * 100).toFixed(4)),
+      Total: m.total,
+      'Total (display)': m.total > 0 ? `${curp}${m.total.toLocaleString()}`.trim() : '',
+      'Item count': r.line_items?.length ?? 0,
+      'Line summary': lines.join(' | '),
+      Supplier: prSuggestedSupplierDisplay(r),
+      'Cost center': r.cost_center ?? '',
+      Section: r.section ?? '',
+      'Linked PO request ID': linkedPo != null && Number(linkedPo) > 0 ? Number(linkedPo) : '',
+      Details: (r.details ?? '').toString().slice(0, 8000),
+    };
+  });
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), 'Requests');
+
+  const lineRows: Record<string, string | number>[] = [];
+  for (const r of rows) {
+    const docId = displayRequestSerial(r);
+    const items = r.line_items || [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i] as Record<string, unknown>;
+      const flat: Record<string, string | number> = {
+        'Document ID': docId,
+        'Request ID': r.id,
+        'Request title': (r.title ?? '').toString(),
+        'Line #': i + 1,
+      };
+      if (item && typeof item === 'object') {
+        for (const [k, v] of Object.entries(item)) {
+          if (k.startsWith('_')) continue;
+          let cell: string;
+          if (v == null) cell = '';
+          else if (typeof v === 'object') cell = JSON.stringify(v);
+          else cell = String(v);
+          const kl = k.toLowerCase();
+          if ((kl.includes('signature') || kl.includes('image')) && cell.length > 120) {
+            cell = '[omitted — binary or long text]';
+          }
+          if (cell.length > 8000) cell = `${cell.slice(0, 8000)}…`;
+          flat[k] = cell;
+        }
+      }
+      lineRows.push(flat);
+    }
+  }
+  const lineSheet =
+    lineRows.length > 0
+      ? XLSX.utils.json_to_sheet(lineRows)
+      : XLSX.utils.json_to_sheet([{ Note: 'No line items in this export' }]);
+  XLSX.utils.book_append_sheet(wb, lineSheet, 'Line items');
+
+  const fname = `Procurement_${tabLabel}_${stamp}.xlsx`.replace(/[/\\?%*:|"<>]/g, '-');
+  XLSX.writeFile(wb, fname);
+}
+
 const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: string }) => {
   const [requests, setRequests] = useState<WorkflowRequest[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeSubTab, setActiveSubTab] = useState<'pr' | 'po' | 'invoice'>('pr');
+  const [activeSubTab, setActiveSubTab] = useState<'pr' | 'sr' | 'po' | 'invoice'>('pr');
   const [filters, setFilters] = useState({
     status: '',
     department: '',
@@ -5371,10 +5783,21 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [approvals, setApprovals] = useState<RequestApproval[]>([]);
   const [isEditing, setIsEditing] = useState(false);
-  const [editData, setEditData] = useState({ title: '', details: '', line_items: [] as any[], tax_rate: 18, discount_rate: 0, currency: '', cost_center: '', section: '' });
+  const [editData, setEditData] = useState({
+    title: '',
+    details: '',
+    line_items: [] as any[],
+    tax_rate: 18,
+    discount_rate: 0,
+    currency: '',
+    cost_center: '',
+    section: '',
+    suggested_supplier: '',
+  });
   const [viewingPdf, setViewingPdf] = useState<{ url: string; fileName: string } | null>(null);
   const [detailsViewMode, setDetailsViewMode] = useState<'details' | 'pdf'>('details');
   const [detailsPdfPreview, setDetailsPdfPreview] = useState<{ url: string; fileName: string } | null>(null);
+  const [convertPoModal, setConvertPoModal] = useState<ConvertPoModalTarget | null>(null);
   const {
     options: costCenterOptions,
     loading: costCentersLoading,
@@ -5429,6 +5852,9 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     ) {
       return toast.error('Please select a section.');
     }
+    if (isPRRequest(selectedRequest) && !String(editData.suggested_supplier ?? '').trim()) {
+      return toast.error('Please enter the suggested supplier for this PR.');
+    }
     setLoading(true);
     try {
       const detailsOut = isProcurementPRorPORequest(selectedRequest) ? '' : editData.details;
@@ -5454,6 +5880,9 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           details: detailsOut,
           currency: curOut,
           section: sectionOut,
+          ...(isPRRequest(selectedRequest)
+            ? { suggested_supplier: String(editData.suggested_supplier ?? '').trim() }
+            : {}),
         }),
       });
       toast.success('Request updated');
@@ -5469,6 +5898,9 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
         currency: curOut !== undefined ? curOut : selectedRequest.currency,
         details: detailsOut,
         section: sectionOut,
+        ...(isPRRequest(selectedRequest)
+          ? { suggested_supplier: String(editData.suggested_supplier ?? '').trim() }
+          : {}),
       });
     } catch (err: any) {
       toast.error(err.message);
@@ -5494,17 +5926,19 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   };
 
   const handlePrintPR = (request: WorkflowRequest) => {
+    const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
     setViewingPdf((prev) => {
       if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return createWorkflowRequestPdfPreview(request);
+      return createWorkflowRequestPdfPreview(merged);
     });
     toast.success('PDF ready to view');
   };
 
   const handleShowRequestPdfInline = (request: WorkflowRequest) => {
+    const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
     setDetailsPdfPreview((prev) => {
       if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return createWorkflowRequestPdfPreview(request);
+      return createWorkflowRequestPdfPreview(merged);
     });
     setDetailsViewMode('pdf');
   };
@@ -5594,14 +6028,25 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     toast.success('PO Draft PDF generated');
   };
 
-  const handleConvertToPO = async (id: number) => {
-    if (!window.confirm('Are you sure you want to convert this PR to a PO Request? This will create a new PO request based on this PR.')) return;
+  const openConvertPoModal = (r: WorkflowRequest) => {
+    setConvertPoModal({
+      id: r.id,
+      title: r.title || '',
+      prSerial: r.formatted_id ? toUpperSerial(r.formatted_id) : `#${r.id}`,
+      entityCode: String(r.entity || '').trim() || '—',
+    });
+  };
+
+  const handleConvertToPOConfirm = async (poNumber: string) => {
+    if (!convertPoModal) return;
     setLoading(true);
     try {
-      const result = await api.request(`/api/workflow-requests/${id}/convert-to-po`, {
+      const result = await api.request(`/api/workflow-requests/${convertPoModal.id}/convert-to-po`, {
         method: 'POST',
+        body: JSON.stringify({ po_number: poNumber }),
       });
-      toast.success(`Successfully converted to PO: ${toUpperSerial(result.formatted_id)}`);
+      toast.success(`PO created: ${toUpperSerial(result.formatted_id)}`);
+      setConvertPoModal(null);
       fetchProcurementRequests();
       setSelectedRequest(null);
     } catch (err: any) {
@@ -5650,10 +6095,17 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     )
   );
 
-  const filteredRequests = requests.filter(r => {
+  const filteredRequests = requests.filter((r) => {
     const templateName = r.template_name.toLowerCase();
-    if (activeSubTab === 'pr') return templateName.includes('purchase request') || templateName.includes('pr');
-    if (activeSubTab === 'po') return templateName.includes('purchase order') || templateName.includes('po');
+    if (activeSubTab === 'pr') {
+      return (
+        !isPO_Only(r) &&
+        !isSRRequest(r) &&
+        (templateName.includes('purchase request') || templateName.includes('pr'))
+      );
+    }
+    if (activeSubTab === 'sr') return isSRRequest(r);
+    if (activeSubTab === 'po') return isPO_Only(r);
     if (activeSubTab === 'invoice') return templateName.includes('invoice');
     return true;
   });
@@ -5672,8 +6124,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   const sortedFilteredRequests = [...filteredRequests].sort((a, b) => {
     const dir = tableSortDirection === 'asc' ? 1 : -1;
     const byText = (x: string, y: string) => x.localeCompare(y, undefined, { sensitivity: 'base' }) * dir;
-    const supplierOf = (r: WorkflowRequest) =>
-      String(r.line_items?.[0]?.['Suggested Supplier'] || r.line_items?.[0]?.['Supplier'] || '');
+    const supplierOf = (r: WorkflowRequest) => prSuggestedSupplierDisplay(r);
     if (tableSortBy === 'date') return (new Date(a.created_at).getTime() - new Date(b.created_at).getTime()) * dir;
     if (tableSortBy === 'id') return byText(displayRequestSerial(a), displayRequestSerial(b));
     if (tableSortBy === 'type') return byText(`${a.template_name} ${a.title || ''}`, `${b.template_name} ${b.title || ''}`);
@@ -5688,6 +6139,28 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   const procurementSortIndicator = (
     key: 'id' | 'type' | 'entity' | 'requester' | 'items' | 'supplier' | 'total' | 'status' | 'date'
   ) => (tableSortBy === key ? (tableSortDirection === 'asc' ? ' ↑' : ' ↓') : '');
+
+  const emptyProcurementListMessage =
+    activeSubTab === 'pr'
+      ? 'No purchase requests found.'
+      : activeSubTab === 'sr'
+        ? 'No stock requisitions found.'
+        : activeSubTab === 'po'
+          ? 'No purchase orders found.'
+          : 'No invoice requests found.';
+
+  const handleExportProcurementExcel = async () => {
+    if (sortedFilteredRequests.length === 0) {
+      toast.error('No rows to export for the current tab and filters.');
+      return;
+    }
+    try {
+      await downloadProcurementCenterExcel(sortedFilteredRequests, activeSubTab, filters);
+      toast.success('Excel file downloaded');
+    } catch (err: any) {
+      toast.error(err?.message || 'Export failed');
+    }
+  };
 
   return (
     <div className="h-full min-h-0 flex flex-col gap-6">
@@ -5715,6 +6188,16 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           >
             <ClipboardList className="w-4 h-4" />
             Purchase Requests (PR)
+          </button>
+          <button
+            onClick={() => setActiveSubTab('sr')}
+            className={cn(
+              "px-4 py-2 rounded-lg text-sm font-bold transition-all flex items-center gap-2",
+              activeSubTab === 'sr' ? "bg-white text-indigo-600 shadow-sm" : "text-zinc-500 hover:text-zinc-700"
+            )}
+          >
+            <Warehouse className="w-4 h-4" />
+            Stock Requisition (SR)
           </button>
           <button
             onClick={() => setActiveSubTab('po')}
@@ -5779,6 +6262,20 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
             <option key={ent} value={ent}>{ent}</option>
           ))}
         </select>
+        <button
+          type="button"
+          onClick={handleExportProcurementExcel}
+          disabled={loading || sortedFilteredRequests.length === 0}
+          title={
+            sortedFilteredRequests.length === 0
+              ? 'Nothing to export — adjust filters or refresh'
+              : 'Download current list as .xlsx (summary + line items)'
+          }
+          className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm font-bold hover:bg-emerald-700 transition-colors disabled:opacity-40 disabled:pointer-events-none"
+        >
+          <FileSpreadsheet className="w-4 h-4" />
+          Export to Excel
+        </button>
         <button 
           onClick={fetchProcurementRequests}
           className="px-4 py-2 bg-zinc-900 text-white rounded-xl text-sm font-bold hover:bg-zinc-800 transition-colors"
@@ -5848,7 +6345,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
               </tr>
             ) : sortedFilteredRequests.length === 0 ? (
               <tr>
-                <td colSpan={10} className="px-6 py-12 text-center text-zinc-400 italic">No procurement requests found.</td>
+                <td colSpan={10} className="px-6 py-12 text-center text-zinc-400 italic">{emptyProcurementListMessage}</td>
               </tr>
             ) : (
               sortedFilteredRequests.map((r) => {
@@ -5905,7 +6402,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                     </td>
                     <td className="px-6 py-4">
                       <p className="text-sm text-zinc-700 font-medium truncate max-w-[120px]">
-                        {r.line_items?.[0]?.['Suggested Supplier'] || r.line_items?.[0]?.['Supplier'] || '-'}
+                        {prSuggestedSupplierDisplay(r) || '-'}
                         {r.line_items?.length > 1 && '...'}
                       </p>
                     </td>
@@ -5930,7 +6427,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                             type="button"
                             onClick={(e) => {
                               e.stopPropagation();
-                              handleConvertToPO(r.id);
+                              openConvertPoModal(r);
                             }}
                             className="inline-flex items-center gap-1.5 px-3 py-2 bg-indigo-600 text-white rounded-lg font-bold text-xs hover:bg-indigo-700 transition-colors shadow-sm"
                           >
@@ -5996,7 +6493,8 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                           discount_rate: procurementUnitRateToPercent(selectedRequest.discount_rate, 0),
                           currency: selectedRequest.currency?.trim() ?? '',
                           cost_center: selectedRequest.cost_center || '',
-                          section: sectionSelectionFromStored(selectedRequest.section)
+                          section: sectionSelectionFromStored(selectedRequest.section),
+                          suggested_supplier: prSuggestedSupplierDisplay(selectedRequest),
                         });
                         setIsEditing(true);
                       }}
@@ -6006,27 +6504,30 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                       Edit Request
                     </button>
                   )}
-                  {canShowConvertPRToPO(selectedRequest, user) && !isEditing && (
+                  {canShowPurchasingApprovedPRHeaderActions(selectedRequest, user) && !isEditing && (
                     <>
-                      <button 
-                        onClick={() => {
-                          setEditData({ 
-                            title: selectedRequest.title, 
-                            details: selectedRequest.details, 
-                            line_items: [...(selectedRequest.line_items || [])],
-                            tax_rate: procurementUnitRateToPercent(selectedRequest.tax_rate, 0.18),
-                            discount_rate: procurementUnitRateToPercent(selectedRequest.discount_rate, 0),
-                            currency: selectedRequest.currency?.trim() ?? '',
-                            cost_center: selectedRequest.cost_center || '',
-                            section: sectionSelectionFromStored(selectedRequest.section)
-                          });
-                          setIsEditing(true);
-                        }}
-                        className="flex items-center gap-2 px-4 py-2 bg-emerald-50 border border-emerald-200 rounded-xl text-sm font-bold text-emerald-700 hover:bg-emerald-100 transition-colors"
-                      >
-                        <Edit2 className="w-4 h-4" />
-                        Edit & Add PO Info
-                      </button>
+                      {canShowConvertPRToPO(selectedRequest, user) && (
+                        <button 
+                          onClick={() => {
+                            setEditData({ 
+                              title: selectedRequest.title, 
+                              details: selectedRequest.details, 
+                              line_items: [...(selectedRequest.line_items || [])],
+                              tax_rate: procurementUnitRateToPercent(selectedRequest.tax_rate, 0.18),
+                              discount_rate: procurementUnitRateToPercent(selectedRequest.discount_rate, 0),
+                              currency: selectedRequest.currency?.trim() ?? '',
+                              cost_center: selectedRequest.cost_center || '',
+                              section: sectionSelectionFromStored(selectedRequest.section),
+                              suggested_supplier: prSuggestedSupplierDisplay(selectedRequest),
+                            });
+                            setIsEditing(true);
+                          }}
+                          className="flex items-center gap-2 px-4 py-2 bg-emerald-50 border border-emerald-200 rounded-xl text-sm font-bold text-emerald-700 hover:bg-emerald-100 transition-colors"
+                        >
+                          <Edit2 className="w-4 h-4" />
+                          Edit & Add PO Info
+                        </button>
+                      )}
                       <button 
                         onClick={() => handleGeneratePODraft(selectedRequest)}
                         className="flex items-center gap-2 px-4 py-2 bg-amber-50 border border-amber-200 rounded-xl text-sm font-bold text-amber-700 hover:bg-amber-100 transition-colors"
@@ -6034,13 +6535,15 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                         <Download className="w-4 h-4" />
                         Generate PO Draft PDF
                       </button>
-                      <button 
-                        onClick={() => handleConvertToPO(selectedRequest.id)}
-                        className="flex items-center gap-2 px-4 py-2 bg-indigo-600 rounded-xl text-sm font-bold text-white hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-100"
-                      >
-                        <RefreshCw className="w-4 h-4" />
-                        Convert PR → PO
-                      </button>
+                      {canShowConvertPRToPO(selectedRequest, user) && (
+                        <button 
+                          onClick={() => openConvertPoModal(selectedRequest)}
+                          className="flex items-center gap-2 px-4 py-2 bg-indigo-600 rounded-xl text-sm font-bold text-white hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-100"
+                        >
+                          <RefreshCw className="w-4 h-4" />
+                          Convert PR → PO
+                        </button>
+                      )}
                     </>
                   )}
                   {canShowPurchasingFinalDecision(selectedRequest, user) && !isEditing && (
@@ -6159,6 +6662,19 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                 <option key={opt} value={opt}>{opt}</option>
                               ))}
                             </select>
+                          </div>
+                        )}
+                        {isPRRequest(selectedRequest) && (
+                          <div className="max-w-2xl">
+                            <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Suggested supplier</label>
+                            <input
+                              type="text"
+                              className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                              value={editData.suggested_supplier ?? ''}
+                              onChange={(e) => setEditData({ ...editData, suggested_supplier: e.target.value })}
+                              required
+                            />
+                            <p className="text-xs text-zinc-500 mt-1">One supplier for the entire PR.</p>
                           </div>
                         )}
                         <div>
@@ -6471,6 +6987,17 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                       )}
                     </section>
 
+                    {isPRRequest(selectedRequest) && (
+                      <section>
+                        <h4 className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 border-b border-zinc-100 pb-2">
+                          Suggested supplier
+                        </h4>
+                        <p className="text-sm text-zinc-800 font-medium">
+                          {prSuggestedSupplierDisplay(selectedRequest) || '—'}
+                        </p>
+                      </section>
+                    )}
+
                     {/* Line Items */}
                     {selectedRequest.line_items && selectedRequest.line_items.length > 0 && (
                       <section>
@@ -6746,6 +7273,12 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           />
         )}
       </AnimatePresence>
+      <ConvertPrToPoModal
+        target={convertPoModal}
+        loading={loading}
+        onClose={() => !loading && setConvertPoModal(null)}
+        onConfirm={handleConvertToPOConfirm}
+      />
     </div>
   );
 };

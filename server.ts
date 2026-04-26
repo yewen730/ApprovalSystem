@@ -47,8 +47,11 @@ const rawSqlUsersTable = (process.env.SQLSERVER_USERS_TABLE || DEFAULT_SQL_USERS
 const SQLSERVER_USERS_TABLE =
   /^[\w\[\].]+$/.test(rawSqlUsersTable) && rawSqlUsersTable.length < 200 ? rawSqlUsersTable : DEFAULT_SQL_USERS_TABLE;
 
-/** PR: single approver step (must match client FIXED_PR_STEPS). */
-const FIXED_PR_STEPS = [{ id: "step-1", label: "Approver", approverRole: "approver" }];
+/** PR: checker then approver (must match client FIXED_PR_STEPS). */
+const FIXED_PR_STEPS = [
+  { id: "pr-step-1", label: "Checker Verification", approverRole: "checker" },
+  { id: "pr-step-2", label: "Approver", approverRole: "approver" },
+];
 
 /** PO template: full chain; director step may be omitted per request when total ≤ RM30k equivalent. */
 const FIXED_PO_STEPS_FULL = [
@@ -540,6 +543,10 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
         ALTER TABLE workflow_requests ADD discount_rate DECIMAL(10, 6) NULL;
       IF COL_LENGTH('workflow_requests', 'section') IS NULL
         ALTER TABLE workflow_requests ADD section NVARCHAR(255) NULL;
+      IF COL_LENGTH('workflow_requests', 'suggested_supplier') IS NULL
+        ALTER TABLE workflow_requests ADD suggested_supplier NVARCHAR(512) NULL;
+      IF COL_LENGTH('workflow_requests', 'converted_po_request_id') IS NULL
+        ALTER TABLE workflow_requests ADD converted_po_request_id INT NULL;
     `);
   } catch (e: any) {
     console.warn("SQL workflow column ensure skipped:", e?.message || e);
@@ -576,6 +583,20 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
     `);
   } catch (e: any) {
     console.warn("SQL assigned_approver_id column:", e?.message || e);
+  }
+  try {
+    const utEsc = SQLSERVER_USERS_TABLE.replace(/'/g, "''");
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT 1 FROM sys.columns c
+        WHERE c.object_id = OBJECT_ID(N'${utEsc}') AND c.name = N'designation'
+      )
+      BEGIN
+        ALTER TABLE ${SQLSERVER_USERS_TABLE} ADD designation NVARCHAR(255) NULL;
+      END
+    `);
+  } catch (e: any) {
+    console.warn("SQL usersetting.designation column:", e?.message || e);
   }
   try {
     await pool.request().query(`
@@ -1001,17 +1022,24 @@ async function startServer() {
       let rs;
       try {
         rs = await sqlPool.request().query(
-          `SELECT id, username, role, department, approval_limit FROM ${SQLSERVER_USERS_TABLE} ORDER BY username ASC`
+          `SELECT id, username, role, department, approval_limit, designation FROM ${SQLSERVER_USERS_TABLE} ORDER BY username ASC`
         );
       } catch {
-        rs = await sqlPool.request().query(
-          `SELECT id, username, role, department FROM ${SQLSERVER_USERS_TABLE} ORDER BY username ASC`
-        );
+        try {
+          rs = await sqlPool.request().query(
+            `SELECT id, username, role, department, approval_limit FROM ${SQLSERVER_USERS_TABLE} ORDER BY username ASC`
+          );
+        } catch {
+          rs = await sqlPool.request().query(
+            `SELECT id, username, role, department FROM ${SQLSERVER_USERS_TABLE} ORDER BY username ASC`
+          );
+        }
       }
       const rows = (rs.recordset || []).map((u: any) => ({
         id: u.id,
         username: u.username,
         department: u.department,
+        designation: u.designation != null ? String(u.designation).trim() || null : null,
         roles: parseCommaSeparatedList(u.role),
         approval_limit_myr: parseNullableNumber(u.approval_limit ?? u.approval_limit_myr),
       }));
@@ -1044,7 +1072,7 @@ async function startServer() {
   });
 
   app.patch("/api/users/:id", authenticate, hasPermission('manage_users'), async (req, res) => {
-    const { username, password, roles, department } = req.body;
+    const { username, password, roles, department, designation } = req.body;
     const userId = Number(req.params.id);
     try {
       if (username) {
@@ -1063,6 +1091,14 @@ async function startServer() {
       }
       if (department) {
         await sqlPool.request().input("department", sql.NVarChar, department).input("id", sql.Int, userId).query(`UPDATE ${SQLSERVER_USERS_TABLE} SET department = @department WHERE id = @id`);
+      }
+      if (designation !== undefined) {
+        const des = designation != null ? String(designation).trim() : "";
+        await sqlPool
+          .request()
+          .input("designation", sql.NVarChar, des || null)
+          .input("id", sql.Int, userId)
+          .query(`UPDATE ${SQLSERVER_USERS_TABLE} SET designation = @designation WHERE id = @id`);
       }
       return res.json({ success: true });
     } catch (err: any) {
@@ -1742,6 +1778,7 @@ async function startServer() {
       const rs = await reqSql.query(`
           SELECT r.*,
             COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.requester_name AS NVARCHAR(255)))), N''), u.username) AS computed_requester_name,
+            u.designation AS requester_designation,
             w.name AS template_name,
             COALESCE(r.request_steps, w.steps) AS template_steps, w.table_columns AS table_columns,
             w.attachments_required AS attachments_required, w.category AS category
@@ -1858,6 +1895,15 @@ async function startServer() {
 
     let requestStepsJson: string | null = null;
     const discValCreate = discount_rate !== undefined ? Number(discount_rate) : 0;
+    const suggestedSupplierRaw =
+      req.body.suggested_supplier != null ? String(req.body.suggested_supplier).trim() : "";
+    let suggestedSupplierSql: string | null = null;
+    if (isPR) {
+      if (!suggestedSupplierRaw) {
+        return res.status(400).json({ error: "Suggested supplier is required for purchase requests" });
+      }
+      suggestedSupplierSql = suggestedSupplierRaw;
+    }
     if (isPOName(template.name)) {
       requestStepsJson = JSON.stringify(
         buildPoRequestSteps(
@@ -1922,6 +1968,7 @@ async function startServer() {
         .input("currency", sql.NVarChar, curVal)
         .input("cost_center", sql.NVarChar, cost_center || "")
         .input("section", sql.NVarChar, sectionTrimmed)
+        .input("suggested_supplier", sql.NVarChar, suggestedSupplierSql)
         .input("entity", sql.NVarChar, req.entityContext)
         .input("formatted_id", sql.NVarChar, formatted_id)
         .input("request_steps", sql.NVarChar(sql.MAX), requestStepsJson)
@@ -1930,13 +1977,13 @@ async function startServer() {
             INSERT INTO workflow_requests (
               template_id, requester_id, requester_username_snapshot, requester_name, template_name_snapshot,
               department, title, details, line_items, requester_signature, requester_signed_at, tax_rate, discount_rate, currency, cost_center, section,
-              entity, formatted_id, request_steps, assigned_approver_id
+              suggested_supplier, entity, formatted_id, request_steps, assigned_approver_id
             ) VALUES (
               @template_id, @requester_id, @requester_username_snapshot, @requester_name, @template_name_snapshot,
               @department, @title, @details, @line_items, @requester_signature,
               CASE WHEN @requester_signed_flag = 1 THEN SYSUTCDATETIME() ELSE NULL END,
               @tax_rate, @discount_rate, @currency, @cost_center, @section,
-              @entity, @formatted_id, @request_steps, @assigned_approver_id
+              @suggested_supplier, @entity, @formatted_id, @request_steps, @assigned_approver_id
             );
             SELECT CAST(SCOPE_IDENTITY() AS INT) AS id;
           `);
@@ -2064,7 +2111,7 @@ async function startServer() {
     const requestRow = rr.recordset?.[0];
     if (!assertWorkflowRequestAccess(req, res, requestRow, requestRow?.template_category)) return;
     const appr = await sqlPool.request().input("request_id", sql.Int, Number(req.params.id)).query(`
-        SELECT a.*, u.username AS approver_name
+        SELECT a.*, u.username AS approver_name, u.designation AS approver_designation
         FROM request_approvals a
         INNER JOIN ${userJoinSql} u ON a.approver_id = u.id
         WHERE a.request_id = @request_id
@@ -2104,6 +2151,7 @@ async function startServer() {
       let q = `
       SELECT r.*,
         COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.requester_name AS NVARCHAR(255)))), N''), u.username) AS computed_requester_name,
+        u.designation AS requester_designation,
         w.name AS template_name, COALESCE(r.request_steps, w.steps) AS template_steps,
         w.table_columns AS table_columns, w.attachments_required AS attachments_required, w.category AS category
       FROM workflow_requests r
@@ -2137,7 +2185,7 @@ async function startServer() {
             .request()
             .input("rid", sql.Int, Number(r.id))
             .query(`
-            SELECT a.*, u.username AS approver_name
+            SELECT a.*, u.username AS approver_name, u.designation AS approver_designation
             FROM request_approvals a
             INNER JOIN ${userJoinSql} u ON a.approver_id = u.id
             WHERE a.request_id = @rid
@@ -2162,7 +2210,8 @@ async function startServer() {
   });
 
   app.patch("/api/workflow-requests/:id", authenticate, requireEntityContext, async (req: any, res) => {
-    const { title, details, line_items, tax_rate, discount_rate, currency, cost_center, section } = req.body;
+    const { title, details, line_items, tax_rate, discount_rate, currency, cost_center, section, suggested_supplier } =
+      req.body;
     const requestId = req.params.id;
 
     const rq = await sqlPool.request().input("id", sql.Int, Number(requestId)).query(`
@@ -2274,6 +2323,17 @@ async function startServer() {
           .input("id", sql.Int, rid)
           .query("UPDATE workflow_requests SET section = @section WHERE id = @id");
       }
+      if (suggested_supplier !== undefined && isPR) {
+        const ss = String(suggested_supplier ?? "").trim();
+        if (!ss) {
+          return res.status(400).json({ error: "Suggested supplier cannot be empty for a purchase request" });
+        }
+        await sqlPool
+          .request()
+          .input("suggested_supplier", sql.NVarChar, ss)
+          .input("id", sql.Int, rid)
+          .query("UPDATE workflow_requests SET suggested_supplier = @suggested_supplier WHERE id = @id");
+      }
       if (request.status === "pending" && isPO && request.current_step_index === 0) {
         if (line_items !== undefined || tax_rate !== undefined || currency !== undefined || discount_rate !== undefined) {
           const li = line_items !== undefined ? line_items : JSON.parse(request.line_items || "[]");
@@ -2362,6 +2422,13 @@ async function startServer() {
       return res.status(400).json({ error: "Only Purchase Requisitions can be converted to PO" });
     }
 
+    const existingPoId = request.converted_po_request_id != null ? Number(request.converted_po_request_id) : null;
+    if (existingPoId != null && !Number.isNaN(existingPoId) && existingPoId > 0) {
+      return res.status(400).json({
+        error: "This PR has already been converted to a PO. Each purchase requisition can only create one PO.",
+      });
+    }
+
     const pt = await sqlPool.request().query(`
         SELECT TOP 1 id FROM workflows
         WHERE category = N'procurement' AND (name LIKE N'%Purchase Order%' OR name LIKE N'%PO%') AND status = N'approved'
@@ -2371,39 +2438,41 @@ async function startServer() {
       return res.status(400).json({ error: "No approved Purchase Order template found" });
     }
 
-    const year = new Date().getFullYear().toString().slice(-2);
-    const prefixMap: { [key: string]: string } = {
-      CCI: "CCI",
-      GCBCM: "CM",
-      GCCM: "GC",
-      GCBCS: "SG",
-      ACI: "ACI",
-    };
-    const entityPrefix = prefixMap[request.entity] || (request.entity ? request.entity.toUpperCase() : "GEN");
-    const pattern = `PO${entityPrefix}${year}-%`;
-
-    const lr = await sqlPool
-      .request()
-      .input("entity", sql.NVarChar, request.entity)
-      .input("pattern", sql.NVarChar, pattern)
-      .query(
-        "SELECT TOP 1 formatted_id FROM workflow_requests WHERE entity = @entity AND formatted_id LIKE @pattern ORDER BY formatted_id DESC"
-      );
-    const lastRequest = lr.recordset?.[0];
-
-    let nextNum = 1;
-    if (lastRequest && lastRequest.formatted_id) {
-      const parts = lastRequest.formatted_id.split("-");
-      const lastNum = parseInt(parts[parts.length - 1]);
-      if (!isNaN(lastNum)) nextNum = lastNum + 1;
+    const poNumberRaw = req.body.po_number != null ? String(req.body.po_number).trim() : "";
+    if (!poNumberRaw) {
+      return res.status(400).json({
+        error:
+          "PO number is required. Enter the official purchase order reference (must be unique for this entity).",
+      });
     }
-    const formatted_id = `PO${entityPrefix}${year}-${nextNum.toString().padStart(5, "0")}`;
+
+    const dupRs = await sqlPool
+      .request()
+      .input("entity", sql.NVarChar, String(request.entity || "").trim())
+      .input("fid", sql.NVarChar, poNumberRaw)
+      .query(`
+        SELECT TOP 1 id FROM workflow_requests
+        WHERE entity = @entity
+          AND formatted_id IS NOT NULL
+          AND LTRIM(RTRIM(formatted_id)) <> N''
+          AND LOWER(LTRIM(RTRIM(formatted_id))) = LOWER(LTRIM(RTRIM(@fid)))
+      `);
+    if (dupRs.recordset?.length) {
+      return res.status(400).json({
+        error:
+          "This PO number is already recorded for this entity. Use a different reference to avoid issuing a duplicate PO.",
+      });
+    }
+
+    const formatted_id = poNumberRaw;
 
     let lineItems: any[] = [];
     try {
+      const prSup = String(request.suggested_supplier || "").trim();
       lineItems = JSON.parse(request.line_items).map((item: any) => ({
         ...item,
-        "Final Supplier": item["Suggested Supplier"] || "",
+        "Final Supplier":
+          prSup || String(item["Suggested Supplier"] || item["Final Supplier"] || "").trim() || "",
       }));
     } catch {
       lineItems = [];
@@ -2452,6 +2521,26 @@ async function startServer() {
             SELECT CAST(SCOPE_IDENTITY() AS INT) AS id;
           `);
       newRequestId = ins.recordset?.[0]?.id;
+      const linkRs = await sqlPool
+        .request()
+        .input("prId", sql.Int, Number(requestId))
+        .input("poId", sql.Int, Number(newRequestId))
+        .query(`
+          UPDATE workflow_requests
+          SET converted_po_request_id = @poId
+          WHERE id = @prId AND (converted_po_request_id IS NULL OR converted_po_request_id = 0);
+        `);
+      const rowsAff = linkRs.rowsAffected as number[] | undefined;
+      const linkedCount = rowsAff && rowsAff.length ? Number(rowsAff[0]) : 0;
+      if (!linkedCount) {
+        await sqlPool.request().input("orphanId", sql.Int, Number(newRequestId)).query(`
+          DELETE FROM request_attachments WHERE request_id = @orphanId;
+          DELETE FROM workflow_requests WHERE id = @orphanId;
+        `);
+        return res.status(409).json({
+          error: "This PR was already converted to a PO (concurrent update). Refresh and open the existing PO request.",
+        });
+      }
       const attRs = await sqlPool
         .request()
         .input("request_id", sql.Int, Number(requestId))
