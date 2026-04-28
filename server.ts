@@ -73,7 +73,10 @@ function getLanIPv4Addresses(): string[] {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const JWT_SECRET = "flowmaster-secret-key-123";
+const JWT_SECRET = process.env.JWT_SECRET || "";
+if (!JWT_SECRET) {
+  throw new Error("Missing JWT_SECRET in environment (.env)");
+}
 const SQLSERVER_CONNECTION_STRING = process.env.SQLSERVER_CONNECTION_STRING || "";
 let sqlPool: sql.ConnectionPool;
 const rolePermissionsCache = new Map<string, string[]>();
@@ -84,10 +87,9 @@ const rawSqlUsersTable = (process.env.SQLSERVER_USERS_TABLE || DEFAULT_SQL_USERS
 const SQLSERVER_USERS_TABLE =
   /^[\w\[\].]+$/.test(rawSqlUsersTable) && rawSqlUsersTable.length < 200 ? rawSqlUsersTable : DEFAULT_SQL_USERS_TABLE;
 
-/** PR: checker then approver (must match client FIXED_PR_STEPS). */
+/** PR: single approver step (must match client FIXED_PR_STEPS). */
 const FIXED_PR_STEPS = [
-  { id: "pr-step-1", label: "Checker Verification", approverRole: "checker" },
-  { id: "pr-step-2", label: "Approver", approverRole: "approver" },
+  { id: "pr-step-1", label: "Approver", approverRole: "approver" },
 ];
 
 /** PO template: full chain; director step may be omitted per request when total ≤ RM30k equivalent. */
@@ -207,7 +209,7 @@ function buildPoRequestSteps(totalMyr: number) {
 
 const seedRoles = [
   { name: "admin", permissions: ["admin", "view_history", "create_templates", "approve_templates", "manage_users", "edit_requests", "view_procurement_center"] },
-  { name: "preparer", permissions: ["create_templates"] },
+  { name: "preparer", permissions: [] },
   { name: "checker", permissions: ["create_templates", "approve_templates", "edit_requests"] },
   { name: "approver", permissions: ["create_templates", "approve_templates", "edit_requests"] },
   { name: "director", permissions: ["view_history", "approve_templates"] },
@@ -374,22 +376,6 @@ async function fetchSqlUsersettingById(pool: sql.ConnectionPool, userId: number)
     return rs.recordset?.[0] ?? null;
   } catch {
     return null;
-  }
-}
-
-/** GCCM: user appears in requestor approver dropdown when row exists with selectable_by_requestor = 1. */
-async function isGccmRegistrySelectableApprover(pool: sql.ConnectionPool, userId: number): Promise<boolean> {
-  try {
-    const rs = await pool
-      .request()
-      .input("userId", sql.Int, Number(userId))
-      .input("entity", sql.NVarChar, GCCM_ENTITY)
-      .query(
-        `SELECT TOP 1 1 AS ok FROM dbo.entity_approver_registry WHERE user_id = @userId AND UPPER(LTRIM(RTRIM(entity))) = @entity AND selectable_by_requestor = 1 AND active = 1`
-      );
-    return !!(rs.recordset && rs.recordset.length > 0);
-  } catch {
-    return false;
   }
 }
 
@@ -901,8 +887,8 @@ async function startServer() {
     }
     
     // Default permissions for specific roles as requested
-    // Preparer, Approver, Checker can create templates
-    if (lowerRoles.includes('preparer') || lowerRoles.includes('approver') || lowerRoles.includes('checker')) {
+    // Approver, Checker can create templates
+    if (lowerRoles.includes('approver') || lowerRoles.includes('checker')) {
       allPermissions.add('create_templates');
     }
     // Approver, Checker, Director can approve templates
@@ -985,7 +971,9 @@ async function startServer() {
       });
     }
     const allowed = parseUserEntities(req.user);
-    if (!allowed.includes(raw)) {
+    const allowedByUpper = new Map(allowed.map((e) => [e.toUpperCase(), e]));
+    const canonical = allowedByUpper.get(raw.toUpperCase()) || raw;
+    if (!allowedByUpper.has(raw.toUpperCase())) {
       // Director/SOM (Management department) can access all entities.
       if (isDirectorUser(req) || isSomUser(req)) {
         req.entityContext = raw;
@@ -994,7 +982,7 @@ async function startServer() {
       }
       return res.status(403).json({ error: "You do not have access to this entity" });
     }
-    req.entityContext = raw;
+    req.entityContext = canonical;
     next();
   };
 
@@ -1098,8 +1086,8 @@ async function startServer() {
     try {
       const dataUrl = String(req.body?.dataUrl || "").trim();
       const buf = parsePngDataUrl(dataUrl);
-      // Basic safety cap (~350KB) so we don't store huge blobs by accident.
-      if (buf.length > 350_000) return res.status(400).json({ error: "Signature image is too large" });
+      // Safety cap (~2.5MB) to allow high-resolution signatures while preventing huge uploads.
+      if (buf.length > 2_500_000) return res.status(400).json({ error: "Signature image is too large (max 2.5MB)" });
       await fs.promises.mkdir(SIGNATURE_STORAGE_PATH, { recursive: true });
       const filePath = signatureFilePathForUser(req.user);
       await fs.promises.writeFile(filePath, buf);
@@ -1241,31 +1229,10 @@ async function startServer() {
     return res.json({ success: true });
   });
 
-  /** Users who may be picked as approver: GCCM uses `entity_approver_registry`; other entities use approver role + entity access. */
+  /** Users who may be picked as approver for the active entity context. */
   app.get("/api/users/eligible-approvers", authenticate, requireEntityContext, async (req: any, res) => {
     try {
       const activeEnt = String(req.entityContext || "").trim().toUpperCase();
-      if (activeEnt === GCCM_ENTITY) {
-        try {
-          const reg = await sqlPool
-            .request()
-            .input("entity", sql.NVarChar, GCCM_ENTITY)
-            .query(
-              `SELECT u.id, u.username, u.department
-               FROM dbo.entity_approver_registry r
-               INNER JOIN ${SQLSERVER_USERS_TABLE} u ON u.id = r.user_id
-               WHERE UPPER(LTRIM(RTRIM(r.entity))) = @entity AND r.active = 1 AND r.selectable_by_requestor = 1
-               ORDER BY r.sort_order ASC, u.username ASC`
-            );
-          const out = (reg.recordset || [])
-            .filter((u: any) => Number(u.id) !== Number(req.user.id))
-            .map((u: any) => ({ id: u.id, username: u.username, department: u.department || "" }));
-          return res.json(out);
-        } catch (e: any) {
-          console.warn("eligible-approvers GCCM registry:", e?.message || e);
-          return res.json([]);
-        }
-      }
       let rs;
       try {
         rs = await sqlPool.request().query(
@@ -2033,19 +2000,19 @@ async function startServer() {
 
     const entityUpper = String(req.entityContext || "").trim().toUpperCase();
     let assignedApproverSql: number | null = null;
-    if (entityUpper === GCCM_ENTITY && stepsJsonIncludesApproverRole(requestStepsJson)) {
+    if (stepsJsonIncludesApproverRole(requestStepsJson)) {
       const aid = Number(assigned_approver_id);
       if (!Number.isFinite(aid) || aid <= 0) {
-        return res.status(400).json({ error: "GCCM: select an approver for this request (assigned_approver_id)." });
+        return res.status(400).json({ error: "Select an approver for this request (assigned_approver_id)." });
       }
       if (aid === Number(req.user.id)) {
         return res.status(400).json({ error: "You cannot assign yourself as the approver." });
       }
       const approverRow = await fetchSqlUsersettingById(sqlPool, aid);
       if (!approverRow) return res.status(400).json({ error: "Chosen approver was not found." });
-      if (!(await isGccmRegistrySelectableApprover(sqlPool, aid))) {
+      if (!userRowHasApproverRole(approverRow) || !userRowHasEntityAccess(approverRow, entityUpper)) {
         return res.status(400).json({
-          error: "Chosen approver must be on the GCCM approver list (configure in entity_approver_registry, selectable_by_requestor).",
+          error: "Chosen approver must have approver role access for this entity.",
         });
       }
       assignedApproverSql = aid;
@@ -2103,7 +2070,16 @@ async function startServer() {
           if (!buf.length) continue;
           let rel: string | null = null;
           try {
-            rel = saveRequestAttachmentFile(req.entityContext, requestId, String(att.name || "file"), buf).relativePath;
+            const saved = saveRequestAttachmentFile(
+              req.entityContext,
+              requestId,
+              String(att.name || "file"),
+              buf,
+              String(att.type || "")
+            );
+            rel = saved.relativePath;
+            att.name = saved.storedFileName;
+            att.type = saved.mimeType;
           } catch (e: any) {
             console.error("Attachment save failed:", e?.message || e);
             return res.status(400).json({ error: e?.message || "Failed to save attachment file" });
@@ -2160,13 +2136,15 @@ async function startServer() {
           const full = resolveStoredPath(row.file_path);
           if (!fs.existsSync(full)) return res.status(404).json({ error: "File missing on server" });
           res.setHeader("Content-Type", row.file_type || "application/octet-stream");
-          res.setHeader("Content-Disposition", `inline; filename="${disp}"`);
+          res.setHeader("X-Content-Type-Options", "nosniff");
+          res.setHeader("Content-Disposition", `attachment; filename="${disp}"`);
           return res.sendFile(path.resolve(full));
         }
         if (row.file_data) {
           const buf = decodeAttachmentPayload(row.file_data);
           res.setHeader("Content-Type", row.file_type || "application/octet-stream");
-          res.setHeader("Content-Disposition", `inline; filename="${disp}"`);
+          res.setHeader("X-Content-Type-Options", "nosniff");
+          res.setHeader("Content-Disposition", `attachment; filename="${disp}"`);
           return res.send(buf);
         }
         return res.status(404).json({ error: "No file content" });
@@ -2319,7 +2297,19 @@ async function startServer() {
   });
 
   app.patch("/api/workflow-requests/:id", authenticate, requireEntityContext, async (req: any, res) => {
-    const { title, details, line_items, tax_rate, discount_rate, currency, cost_center, section, suggested_supplier } =
+    const {
+      title,
+      details,
+      line_items,
+      tax_rate,
+      discount_rate,
+      currency,
+      cost_center,
+      section,
+      suggested_supplier,
+      attachment_keep_ids,
+      attachments_add,
+    } =
       req.body;
     const requestId = req.params.id;
 
@@ -2443,6 +2433,62 @@ async function startServer() {
           .input("id", sql.Int, rid)
           .query("UPDATE workflow_requests SET suggested_supplier = @suggested_supplier WHERE id = @id");
       }
+      const attachmentKeepIds =
+        attachment_keep_ids !== undefined && Array.isArray(attachment_keep_ids)
+          ? attachment_keep_ids
+              .map((v: any) => Number(v))
+              .filter((v: number) => Number.isInteger(v) && v > 0)
+          : null;
+      const attachmentAdds = Array.isArray(attachments_add) ? attachments_add : null;
+      if (attachmentKeepIds !== null || attachmentAdds !== null) {
+        const existing = await sqlPool
+          .request()
+          .input("request_id", sql.Int, rid)
+          .query("SELECT id, file_path FROM request_attachments WHERE request_id = @request_id");
+        if (attachmentKeepIds !== null) {
+          const keepSet = new Set<number>(attachmentKeepIds);
+          for (const row of existing.recordset || []) {
+            const aid = Number((row as any).id);
+            if (keepSet.has(aid)) continue;
+            tryUnlinkStoredFile((row as any).file_path);
+            await sqlPool
+              .request()
+              .input("id", sql.Int, aid)
+              .input("request_id", sql.Int, rid)
+              .query("DELETE FROM request_attachments WHERE id = @id AND request_id = @request_id");
+          }
+        }
+        if (attachmentAdds) {
+          for (const att of attachmentAdds) {
+            const buf = decodeAttachmentPayload(att?.data || "");
+            let rel: string | null = null;
+            try {
+            const saved = saveRequestAttachmentFile(
+                req.entityContext,
+                rid,
+                String(att?.name || "file"),
+              buf,
+              String(att?.type || "")
+            );
+            rel = saved.relativePath;
+            att.name = saved.storedFileName;
+            att.type = saved.mimeType;
+            } catch (e: any) {
+              return res.status(400).json({ error: e?.message || "Failed to save attachment file" });
+            }
+            await sqlPool
+              .request()
+              .input("request_id", sql.Int, rid)
+              .input("file_name", sql.NVarChar, String(att?.name || "file"))
+              .input("file_type", sql.NVarChar, String(att?.type || "application/octet-stream"))
+              .input("file_data", sql.NVarChar(sql.MAX), null)
+              .input("file_path", sql.NVarChar, rel)
+              .query(
+                "INSERT INTO request_attachments (request_id, file_name, file_type, file_data, file_path) VALUES (@request_id, @file_name, @file_type, @file_data, @file_path)"
+              );
+          }
+        }
+      }
       if (request.status === "pending" && isPO && request.current_step_index === 0) {
         if (line_items !== undefined || tax_rate !== undefined || currency !== undefined || discount_rate !== undefined) {
           const li = line_items !== undefined ? line_items : JSON.parse(request.line_items || "[]");
@@ -2516,6 +2562,82 @@ async function startServer() {
     res.json({ success: true });
   });
 
+  /**
+   * Requester cancellation before any approval is granted:
+   * - only requester can cancel
+   * - request must still be pending
+   * - cannot cancel once any approver has approved
+   * The request remains in the system with status = cancelled for audit/history.
+   */
+  app.post("/api/workflow-requests/:id/cancel", authenticate, requireEntityContext, async (req: any, res) => {
+    const requestId = Number(req.params.id);
+    const comment = String(req.body?.comment || "").trim();
+    if (!Number.isFinite(requestId) || requestId <= 0) return res.status(400).json({ error: "Invalid request id" });
+
+    const rq = await sqlPool.request().input("id", sql.Int, requestId).query(`
+      SELECT r.*, w.category AS template_category
+      FROM workflow_requests r
+      INNER JOIN workflows w ON r.template_id = w.id
+      WHERE r.id = @id
+    `);
+    const request: any = rq.recordset?.[0];
+
+    if (!assertWorkflowRequestAccess(req, res, request, request?.template_category)) return;
+    if (!request) return res.status(404).json({ error: "Request not found" });
+    if (request.requester_id !== req.user.id) return res.status(403).json({ error: "Only the requester can cancel this request" });
+    if (String(request.status || "").trim().toLowerCase() !== "pending") {
+      return res.status(400).json({ error: "Only pending requests can be cancelled" });
+    }
+
+    const approvedRs = await sqlPool
+      .request()
+      .input("request_id", sql.Int, requestId)
+      .query(
+        "SELECT COUNT(1) AS cnt FROM request_approvals WHERE request_id = @request_id AND LOWER(LTRIM(RTRIM(CAST(status AS NVARCHAR(50))))) = N'approved'"
+      );
+    const approvedCount = Number(approvedRs.recordset?.[0]?.cnt || 0);
+    if (approvedCount > 0) {
+      return res.status(400).json({ error: "This request already has approver approval and can no longer be cancelled by requester" });
+    }
+
+    try {
+      await sqlPool
+        .request()
+        .input("id", sql.Int, requestId)
+        .query("UPDATE workflow_requests SET status = N'cancelled' WHERE id = @id");
+
+      await sqlPool
+        .request()
+        .input("request_id", sql.Int, requestId)
+        .input("step_index", sql.Int, Number(request.current_step_index ?? 0))
+        .input("approver_id", sql.Int, Number(req.user.id))
+        .input("approver_username", sql.NVarChar, String(req.user.username || ""))
+        .input("approver_role_snapshot", sql.NVarChar, "requester_cancel")
+        .input("request_title_snapshot", sql.NVarChar, request.title || "")
+        .input("request_formatted_id_snapshot", sql.NVarChar, request.formatted_id || null)
+        .input("status", sql.NVarChar, "cancelled")
+        .input("comment", sql.NVarChar, comment)
+        .input("approver_signature", sql.NVarChar(sql.MAX), null)
+        .query(`
+          INSERT INTO request_approvals (
+            request_id, step_index, approver_id, approver_username, approver_role_snapshot,
+            request_title_snapshot, request_formatted_id_snapshot, status, comment, approver_signature
+          ) VALUES (
+            @request_id, @step_index, @approver_id, @approver_username, @approver_role_snapshot,
+            @request_title_snapshot, @request_formatted_id_snapshot, @status, @comment, @approver_signature
+          )
+        `);
+    } catch (e: any) {
+      console.error("SQL requester-cancel:", e?.message || e);
+      return res.status(400).json({ error: e?.message || "Cancel failed" });
+    }
+
+    approvalEventLog(
+      `REQUEST_CANCEL_BY_REQUESTER ${formatActor(req)} request_id=${requestId} formatted_id=${approvalLogSanitize(String(request.formatted_id || ""), 64)} title=${approvalLogSanitize(String(request.title || ""), 200)}`
+    );
+    return res.json({ success: true });
+  });
+
   // Admin-only: delete a workflow request permanently (request + attachments + approvals)
   app.delete("/api/workflow-requests/:id", authenticate, requireEntityContext, async (req: any, res) => {
     return res.status(403).json({ error: "Delete operations are disabled in this system." });
@@ -2572,18 +2694,23 @@ async function startServer() {
       .input("entity", sql.NVarChar, String(request.entity || "").trim())
       .input("fid", sql.NVarChar, poNumberRaw)
       .query(`
-        SELECT TOP 1 id FROM workflow_requests
+        SELECT TOP 1 r.id,
+          r.status,
+          r.line_items,
+          r.tax_rate,
+          r.discount_rate,
+          r.currency,
+          r.template_id,
+          w.name AS template_name,
+          w.category AS template_category
+        FROM workflow_requests r
+        INNER JOIN workflows w ON r.template_id = w.id
         WHERE entity = @entity
           AND formatted_id IS NOT NULL
           AND LTRIM(RTRIM(formatted_id)) <> N''
           AND LOWER(LTRIM(RTRIM(formatted_id))) = LOWER(LTRIM(RTRIM(@fid)))
       `);
-    if (dupRs.recordset?.length) {
-      return res.status(400).json({
-        error:
-          "This PO number is already recorded for this entity. Use a different reference to avoid issuing a duplicate PO.",
-      });
-    }
+    const existingSameNumber: any = dupRs.recordset?.[0];
 
     const formatted_id = poNumberRaw;
 
@@ -2605,6 +2732,104 @@ async function startServer() {
 
     let newRequestId: number;
     try {
+      if (existingSameNumber) {
+        const isExistingPo =
+          String(existingSameNumber.template_category || "").toLowerCase() === "procurement" &&
+          isPOName(String(existingSameNumber.template_name || ""));
+        if (!isExistingPo) {
+          return res.status(400).json({
+            error:
+              "This document number already exists for this entity and is not a PO. Use a different PO number.",
+          });
+        }
+        if (String(existingSameNumber.status || "").toLowerCase() !== "pending") {
+          return res.status(400).json({
+            error:
+              "This PO number already exists, but that PO is no longer pending. Use a new PO number to convert this PR.",
+          });
+        }
+
+        newRequestId = Number(existingSameNumber.id);
+        let existingPoLines: any[] = [];
+        try {
+          existingPoLines = JSON.parse(existingSameNumber.line_items || "[]");
+          if (!Array.isArray(existingPoLines)) existingPoLines = [];
+        } catch {
+          existingPoLines = [];
+        }
+        const mergedLines = [...existingPoLines, ...lineItems];
+        const mergedLineJson = JSON.stringify(mergedLines);
+        const totalMyrMerged = computeRequestTotalMyr(
+          mergedLines,
+          existingSameNumber.tax_rate,
+          String(existingSameNumber.currency ?? "").trim(),
+          existingSameNumber.discount_rate
+        );
+        const mergedStepsJson = JSON.stringify(buildPoRequestSteps(totalMyrMerged));
+
+        await sqlPool
+          .request()
+          .input("id", sql.Int, newRequestId)
+          .input("line_items", sql.NVarChar(sql.MAX), mergedLineJson)
+          .input("request_steps", sql.NVarChar(sql.MAX), mergedStepsJson)
+          .query(`
+            UPDATE workflow_requests
+            SET line_items = @line_items,
+                request_steps = @request_steps
+            WHERE id = @id;
+          `);
+
+        const linkRs = await sqlPool
+          .request()
+          .input("prId", sql.Int, Number(requestId))
+          .input("poId", sql.Int, Number(newRequestId))
+          .query(`
+            UPDATE workflow_requests
+            SET converted_po_request_id = @poId
+            WHERE id = @prId AND (converted_po_request_id IS NULL OR converted_po_request_id = 0);
+          `);
+        const rowsAff = linkRs.rowsAffected as number[] | undefined;
+        const linkedCount = rowsAff && rowsAff.length ? Number(rowsAff[0]) : 0;
+        if (!linkedCount) {
+          return res.status(409).json({
+            error: "This PR was already converted to a PO (concurrent update). Refresh and open the linked PO request.",
+          });
+        }
+
+        const attRs = await sqlPool
+          .request()
+          .input("request_id", sql.Int, Number(requestId))
+          .query("SELECT file_name, file_type, file_data, file_path FROM request_attachments WHERE request_id = @request_id");
+        const ent = String(request.entity || req.entityContext || "default");
+        for (const att of attRs.recordset || []) {
+          let relOut: string | null = null;
+          const copied = copyStoredFileToRequest(ent, newRequestId, att.file_path, att.file_name);
+          if (copied) {
+            relOut = copied.relativePath;
+          } else if (att.file_data) {
+            const buf = decodeAttachmentPayload(att.file_data);
+            if (buf.length > 0) {
+              relOut = saveRequestAttachmentFile(ent, newRequestId, String(att.file_name || "file"), buf).relativePath;
+            }
+          }
+          await sqlPool
+            .request()
+            .input("request_id", sql.Int, newRequestId)
+            .input("file_name", sql.NVarChar, att.file_name)
+            .input("file_type", sql.NVarChar, att.file_type || "")
+            .input("file_data", sql.NVarChar(sql.MAX), null)
+            .input("file_path", sql.NVarChar, relOut)
+            .query(
+              "INSERT INTO request_attachments (request_id, file_name, file_type, file_data, file_path) VALUES (@request_id, @file_name, @file_type, @file_data, @file_path)"
+            );
+        }
+
+        approvalEventLog(
+          `REQUEST_CONVERT_PR_TO_PO_APPEND ${formatActor(req)} pr_request_id=${Number(requestId)} po_request_id=${newRequestId} po_formatted_id=${approvalLogSanitize(String(formatted_id), 64)}`
+        );
+        return res.json({ id: newRequestId, formatted_id, merged_into_existing: true });
+      }
+
       const ins = await sqlPool
         .request()
         .input("template_id", sql.Int, Number(poTemplate.id))
@@ -2692,7 +2917,7 @@ async function startServer() {
       approvalEventLog(
         `REQUEST_CONVERT_PR_TO_PO ${formatActor(req)} pr_request_id=${Number(requestId)} po_request_id=${newRequestId} po_formatted_id=${approvalLogSanitize(String(formatted_id), 64)}`
       );
-      return res.json({ id: newRequestId, formatted_id });
+      return res.json({ id: newRequestId, formatted_id, merged_into_existing: false });
     } catch (e: any) {
       console.error("SQL convert-to-po:", e?.message || e);
       return res.status(400).json({ error: e?.message || "Convert failed" });
@@ -2724,24 +2949,21 @@ async function startServer() {
     const userIsAdmin = req.user.roles && req.user.roles.some((r: string) => r.toLowerCase() === "admin");
     const userIsDirector = isDirectorUser(req);
     const roleLower = String(currentStep?.approverRole || "").toLowerCase();
-    const isGccmAssignedApproverStep =
-      String(request.entity || "")
-        .trim()
-        .toUpperCase() === GCCM_ENTITY &&
-      request.assigned_approver_id != null &&
-      roleLower === "approver";
+    const isAssignedApproverStep = request.assigned_approver_id != null && roleLower === "approver";
     const assignedId = Number(request.assigned_approver_id);
-    const userIsAssignedGccmApprover =
-      isGccmAssignedApproverStep && Number.isFinite(assignedId) && assignedId > 0 && Number(req.user.id) === assignedId;
+    const userIsAssignedApprover =
+      isAssignedApproverStep && Number.isFinite(assignedId) && assignedId > 0 && Number(req.user.id) === assignedId;
 
     const userHasRole = req.user.roles && req.user.roles.some((r: string) => r.toLowerCase() === currentStep.approverRole.toLowerCase());
     const somStep = roleLower === "som";
+    const roleBasedApprovalAllowed = isAssignedApproverStep
+      ? userIsAssignedApprover
+      : (userHasRole && req.user.department === request.department);
     const canApprove =
       userIsAdmin ||
       userIsDirector ||
       (somStep && isSomUser(req)) ||
-      userIsAssignedGccmApprover ||
-      (userHasRole && req.user.department === request.department);
+      roleBasedApprovalAllowed;
 
     if (!canApprove) {
       return res.status(403).json({ error: "You do not have the required role or department access to approve this step" });
@@ -2757,24 +2979,19 @@ async function startServer() {
     }
 
     if (status === "approved" && currentStep.approverRole.toLowerCase() === "approver") {
-      const entUpper = String(request.entity ?? "")
-        .trim()
-        .toUpperCase();
-      if (entUpper !== GCCM_ENTITY) {
-        let lineItems: any[] = [];
-        try {
-          lineItems = JSON.parse(request.line_items || "[]");
-        } catch {
-          lineItems = [];
-        }
-        const totalMyr = computeRequestTotalMyr(lineItems, request.tax_rate, String(request.currency ?? "").trim(), request.discount_rate);
-        const entForLimit = String(request.entity ?? "").trim();
-        const userLimitMyr = await getUserApprovalLimitMyr(sqlPool, Number(req.user.id), entForLimit);
-        if (userLimitMyr !== null && totalMyr > userLimitMyr) {
-          return res.status(403).json({
-            error: `Approval limit exceeded. Request total is RM ${totalMyr.toFixed(2)}, your limit is RM ${userLimitMyr.toFixed(2)} (entity-specific cap if configured).`,
-          });
-        }
+      let lineItems: any[] = [];
+      try {
+        lineItems = JSON.parse(request.line_items || "[]");
+      } catch {
+        lineItems = [];
+      }
+      const totalMyr = computeRequestTotalMyr(lineItems, request.tax_rate, String(request.currency ?? "").trim(), request.discount_rate);
+      const entForLimit = String(request.entity ?? "").trim();
+      const userLimitMyr = await getUserApprovalLimitMyr(sqlPool, Number(req.user.id), entForLimit);
+      if (userLimitMyr !== null && totalMyr > userLimitMyr) {
+        return res.status(403).json({
+          error: `Approval limit exceeded. Request total is RM ${totalMyr.toFixed(2)}, your limit is RM ${userLimitMyr.toFixed(2)} (entity-specific cap if configured).`,
+        });
       }
     }
 

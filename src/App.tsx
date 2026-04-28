@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { 
   LayoutDashboard, 
   PlusCircle, 
@@ -361,7 +361,7 @@ const PurchasingDecisionModal = ({
   );
 };
 
-/** Purchasing enters the official PO number; server enforces uniqueness per entity. */
+/** Purchasing enters the official PO number; creates a new PO or appends this PR into an existing pending PO in the same entity. */
 const ConvertPrToPoModal = ({
   target,
   loading,
@@ -418,7 +418,7 @@ const ConvertPrToPoModal = ({
           disabled={loading}
         />
         <p className="text-xs text-zinc-500 mt-2">
-          Required. The system will not create the PO if this number already exists for the same entity.
+          Required. If this PO number already exists as a pending PO in the same entity, this PR will be appended into that PO.
         </p>
         <div className="flex justify-end gap-2 mt-6">
           <button
@@ -442,7 +442,7 @@ const ConvertPrToPoModal = ({
             }}
             className="px-4 py-2 rounded-xl text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50"
           >
-            {loading ? 'Creating…' : 'Create PO request'}
+            {loading ? 'Processing…' : 'Create or append PO'}
           </button>
         </div>
       </motion.div>
@@ -1084,7 +1084,27 @@ const SignaturePad = ({
   onClearSaved?: () => void;
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const isDrawingRef = useRef(false);
+
+  const drawSignatureImageToCanvas = (img: HTMLImageElement, canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // Fit image into the signature box with safe padding while preserving aspect ratio.
+    const pad = 12;
+    const maxW = Math.max(1, canvas.width - pad * 2);
+    const maxH = Math.max(1, canvas.height - pad * 2);
+    const iw = img.naturalWidth || 1;
+    const ih = img.naturalHeight || 1;
+    let w = maxW;
+    let h = (w * ih) / iw;
+    if (h > maxH) {
+      h = maxH;
+      w = (h * iw) / ih;
+    }
+    const x = (canvas.width - w) / 2;
+    const y = (canvas.height - h) / 2;
+    ctx.drawImage(img, x, y, w, h);
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1092,7 +1112,7 @@ const SignaturePad = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     ctx.strokeStyle = '#000';
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 3;
     ctx.lineCap = 'round';
   }, []);
 
@@ -1102,26 +1122,14 @@ const SignaturePad = ({
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
     const v = String(value ?? '').trim();
-    if (!v) return;
+    if (!v) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
     const img = new Image();
     img.onload = () => {
-      // Fit image into canvas with padding, keep aspect ratio.
-      const pad = 8;
-      const maxW = Math.max(1, canvas.width - pad * 2);
-      const maxH = Math.max(1, canvas.height - pad * 2);
-      const iw = img.naturalWidth || 1;
-      const ih = img.naturalHeight || 1;
-      let w = maxW;
-      let h = (w * ih) / iw;
-      if (h > maxH) {
-        h = maxH;
-        w = (h * iw) / ih;
-      }
-      const x = (canvas.width - w) / 2;
-      const y = (canvas.height - h) / 2;
-      ctx.drawImage(img, x, y, w, h);
+      drawSignatureImageToCanvas(img, canvas, ctx);
     };
     img.src = v;
   }, [value]);
@@ -1160,7 +1168,7 @@ const SignaturePad = ({
     isDrawingRef.current = false;
     const canvas = canvasRef.current;
     if (canvas) {
-      onSave(canvas.toDataURL());
+      onSave(canvas.toDataURL('image/png'));
     }
   };
 
@@ -1185,14 +1193,47 @@ const SignaturePad = ({
     onClear();
   };
 
+  const openUploadPicker = () => {
+    uploadInputRef.current?.click();
+  };
+
+  const handleUploadSignature = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (!f) return;
+    if (!f.type.startsWith('image/')) {
+      toast.error('Please upload an image file.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      if (!dataUrl) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      const img = new Image();
+      img.onload = () => {
+        drawSignatureImageToCanvas(img, canvas, ctx);
+        onSave(canvas.toDataURL('image/png'));
+        toast.success('Signature uploaded.');
+      };
+      img.onerror = () => toast.error('Failed to read uploaded signature image.');
+      img.src = dataUrl;
+    };
+    reader.onerror = () => toast.error('Failed to read uploaded signature image.');
+    reader.readAsDataURL(f);
+  };
+
   return (
     <div className="space-y-2">
       <div className="border border-zinc-300 rounded-lg overflow-hidden bg-white">
         <canvas
           ref={canvasRef}
-          width={400}
-          height={150}
-          className="w-full cursor-crosshair touch-none"
+          width={1200}
+          height={400}
+          className="w-full h-36 cursor-crosshair touch-none"
           onMouseDown={startDrawing}
           onMouseMove={draw}
           onMouseUp={stopDrawing}
@@ -1203,6 +1244,13 @@ const SignaturePad = ({
         />
       </div>
       <div className="flex flex-wrap items-center gap-2">
+        <input
+          ref={uploadInputRef}
+          type="file"
+          accept="image/png,image/jpeg,image/jpg,image/webp"
+          className="hidden"
+          onChange={handleUploadSignature}
+        />
         <button
           type="button"
           onClick={clear}
@@ -1210,6 +1258,15 @@ const SignaturePad = ({
         >
           <RotateCcw className="w-3 h-3" />
           Clear
+        </button>
+        <button
+          type="button"
+          onClick={openUploadPicker}
+          className="text-xs font-medium flex items-center gap-1 px-2 py-1 rounded-md border border-zinc-200 text-zinc-600 hover:bg-zinc-50 hover:text-zinc-800"
+          title="Upload a signature image"
+        >
+          <Upload className="w-3 h-3" />
+          Upload
         </button>
         {onUseSaved ? (
           <button
@@ -1376,6 +1433,18 @@ function purchasingCancelApprovalForRequest(req: WorkflowRequest | null | undefi
   return byPurchasing || list[list.length - 1];
 }
 
+function requesterCancelApprovalForRequest(req: WorkflowRequest | null | undefined): RequestApproval | undefined {
+  if (!req) return undefined;
+  const list = (req.approvals || []).filter((a) => normalizeWorkflowRequestStatus(a.status) === 'cancelled');
+  if (list.length === 0) return undefined;
+  // Prefer requester cancellation record when present.
+  const byRequester =
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (list as any).findLast?.((a: RequestApproval) => String(a.approver_role_snapshot || '').toLowerCase() === 'requester_cancel') ??
+    undefined;
+  return byRequester;
+}
+
 function purchasingRejectApprovalForRequest(req: WorkflowRequest | null | undefined): RequestApproval | undefined {
   if (!req) return undefined;
   const list = (req.approvals || []).filter((a) => normalizeWorkflowRequestStatus(a.status) === 'rejected');
@@ -1429,6 +1498,17 @@ const canShowPurchasingApprovedPRHeaderActions = (r: WorkflowRequest, user: User
 /** Purchasing can still override an already-approved PR with reject/cancel. */
 const canShowPurchasingFinalDecision = (r: WorkflowRequest, user: User) =>
   isWorkflowRequestFullyApproved(r) && isPR_Only(r) && (isPurchasingRole(user) || isAdminPermission(user));
+
+const canRequesterCancelPendingRequest = (
+  r: WorkflowRequest,
+  user: User,
+  approvals: RequestApproval[] | undefined
+) => {
+  if (!isWorkflowRequestPending(r)) return false;
+  if (user.id !== r.requester_id) return false;
+  const hasApproved = (approvals || []).some((a) => normalizeWorkflowRequestStatus(a.status) === 'approved');
+  return !hasApproved;
+};
 
 const stepApproverRoleLowerAt = (steps: WorkflowStep[] | undefined, stepIndex: number): string =>
   (steps?.[stepIndex]?.approverRole ?? '').toString().trim().toLowerCase();
@@ -2761,12 +2841,11 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
     fetchError: costCentersFetchError,
   } = useCostCenterOptions();
   const columns = getColumns(template);
-  const needsGccmApproverPicker =
-    (entity || '').trim().toUpperCase() === 'GCCM' &&
+  const needsApproverPicker =
     (template.steps || []).some((s) => (s.approverRole || '').toLowerCase() === 'approver');
 
   useEffect(() => {
-    if (!needsGccmApproverPicker) {
+    if (!needsApproverPicker) {
       setEligibleApprovers([]);
       setAssignedApproverId('');
       return;
@@ -2783,7 +2862,7 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
     return () => {
       cancelled = true;
     };
-  }, [needsGccmApproverPicker, entity]);
+  }, [needsApproverPicker, entity]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2825,7 +2904,7 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
 
   const saveSignatureAsDefault = async () => {
     if (!signature || !isSignatureImageDataUrl(signature)) {
-      toast.error("Please draw a signature first.");
+      toast.error("Please draw or upload a signature first.");
       return;
     }
     try {
@@ -2897,6 +2976,9 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
 
     const handleSubmit = async (e: React.FormEvent) => {
       e.preventDefault();
+      if (!String(entity || '').trim()) {
+        return toast.error('Please select an active entity before submitting this request.');
+      }
       if (template.attachments_required && attachments.length === 0) {
         return toast.error('This workflow requires at least one attachment');
       }
@@ -2909,8 +2991,8 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
       if (isSR && !SECTION_OPTIONS.includes(String(section || "").trim().toUpperCase() as (typeof SECTION_OPTIONS)[number])) {
         return toast.error('Please select a section.');
       }
-      if (needsGccmApproverPicker && (assignedApproverId === '' || !Number.isFinite(Number(assignedApproverId)))) {
-        return toast.error('GCCM: please select who should approve this request.');
+      if (needsApproverPicker && (assignedApproverId === '' || !Number.isFinite(Number(assignedApproverId)))) {
+        return toast.error('Please select who should approve this request.');
       }
       if (isPR && !String(suggestedSupplier).trim()) {
         return toast.error('Please enter the suggested supplier for this PR.');
@@ -2958,7 +3040,7 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
             requester_signature: (isPR || isSR) && signature ? signature : undefined,
             tax_rate: isPR || isPO || isSR ? taxRateNum : 0,
             discount_rate: isPR || isPO || isSR ? discountRateNum : 0,
-            ...(needsGccmApproverPicker && assignedApproverId !== ''
+            ...(needsApproverPicker && assignedApproverId !== ''
               ? { assigned_approver_id: Number(assignedApproverId) }
               : {}),
             ...(isPR ? { suggested_supplier: String(suggestedSupplier).trim() } : {}),
@@ -3116,9 +3198,9 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
               </div>
             )}
 
-            {needsGccmApproverPicker && (
+            {needsApproverPicker && (
               <div className="space-y-2 max-w-xl">
-                <label className="text-sm font-medium text-zinc-700">Approver (GCCM)</label>
+                <label className="text-sm font-medium text-zinc-700">Approver</label>
                 <select
                   className="w-full px-4 py-2.5 rounded-lg border border-zinc-300 outline-none focus:ring-2 focus:ring-indigo-500"
                   value={assignedApproverId === '' ? '' : String(assignedApproverId)}
@@ -3137,7 +3219,7 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
                   ))}
                 </select>
                 <p className="text-xs text-zinc-500">
-                  GCCM only: you choose who acts at the approver step. Checker / SOM / director steps are unchanged.
+                  You choose who acts at the approver step. Checker / SOM / director steps are unchanged.
                 </p>
               </div>
             )}
@@ -3343,6 +3425,8 @@ const WorkflowRequestList = ({
   const [approvals, setApprovals] = useState<RequestApproval[]>([]);
   const [comment, setComment] = useState('');
   const [approverSignature, setApproverSignature] = useState<string | null>(null);
+  const [savedApproverSignature, setSavedApproverSignature] = useState<string | null>(null);
+  const [savedApproverSignatureLoading, setSavedApproverSignatureLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const {
     options: costCenterOptions,
@@ -3367,6 +3451,8 @@ const WorkflowRequestList = ({
     tax_rate: 18,
     discount_rate: 0,
   });
+  const [editAttachmentKeep, setEditAttachmentKeep] = useState<Attachment[]>([]);
+  const [editAttachmentAdd, setEditAttachmentAdd] = useState<{ id: string; name: string; type: string; data: string }[]>([]);
   const [viewingPdf, setViewingPdf] = useState<{ url: string; fileName: string } | null>(null);
   const [detailsViewMode, setDetailsViewMode] = useState<'details' | 'pdf'>('details');
   const [detailsPdfPreview, setDetailsPdfPreview] = useState<{ url: string; fileName: string } | null>(null);
@@ -3381,6 +3467,25 @@ const WorkflowRequestList = ({
       }
     }
   }, [preSelectedRequestId, requests]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        setSavedApproverSignatureLoading(true);
+        const r = await api.request("/api/me/signature", { skipEntity: true });
+        if (cancelled) return;
+        setSavedApproverSignature(r?.exists && typeof r?.dataUrl === "string" ? r.dataUrl : null);
+      } catch {
+        if (!cancelled) setSavedApproverSignature(null);
+      } finally {
+        if (!cancelled) setSavedApproverSignatureLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const hasPermission = (permission: string) => {
     if (!user) return false;
@@ -3492,6 +3597,27 @@ const WorkflowRequestList = ({
     }
   };
 
+  const handleEditAttachmentAdd = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+    Array.from(files).forEach((file: File) => {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        setEditAttachmentAdd((prev) => [
+          ...prev,
+          {
+            id: Math.random().toString(36).substr(2, 9),
+            name: file.name,
+            type: file.type,
+            data: event.target?.result as string,
+          },
+        ]);
+      };
+      reader.readAsDataURL(file);
+    });
+    e.target.value = '';
+  };
+
   const handleSaveEdit = async () => {
     if (!selectedRequest) return;
     if (
@@ -3524,6 +3650,9 @@ const WorkflowRequestList = ({
       if (isPRRequest(selectedRequest) && !String(editData.suggested_supplier ?? '').trim()) {
         return toast.error('Please enter the suggested supplier for this PR.');
       }
+      if (selectedRequest.attachments_required && (editAttachmentKeep.length + editAttachmentAdd.length) === 0) {
+        return toast.error('This workflow requires at least one attachment.');
+      }
       await api.request(`/api/workflow-requests/${selectedRequest.id}`, {
         method: 'PATCH',
         body: JSON.stringify({
@@ -3534,6 +3663,8 @@ const WorkflowRequestList = ({
           details: detailsOut,
           currency: curOut,
           section: sectionOut,
+          attachment_keep_ids: editAttachmentKeep.map((a) => a.id),
+          attachments_add: editAttachmentAdd.map((a) => ({ name: a.name, type: a.type, data: a.data })),
           ...(isPRRequest(selectedRequest)
             ? { suggested_supplier: String(editData.suggested_supplier ?? '').trim() }
             : {}),
@@ -3541,6 +3672,7 @@ const WorkflowRequestList = ({
       });
       toast.success('Request updated');
       setIsEditing(false);
+      setEditAttachmentAdd([]);
       onRefresh();
       // Update local selected request
       setSelectedRequest({
@@ -3556,6 +3688,7 @@ const WorkflowRequestList = ({
           ? { suggested_supplier: String(editData.suggested_supplier ?? '').trim() }
           : {}),
       });
+      await fetchDetails(selectedRequest.id);
     } catch (err: any) {
       toast.error(err.message);
     } finally {
@@ -3592,6 +3725,59 @@ const WorkflowRequestList = ({
     }
   };
 
+  const useSavedApproverSignature = async () => {
+    try {
+      setSavedApproverSignatureLoading(true);
+      const r = await api.request("/api/me/signature", { skipEntity: true });
+      const next = r?.exists && typeof r?.dataUrl === "string" ? r.dataUrl : null;
+      setSavedApproverSignature(next);
+      if (!next) {
+        toast.error("No saved signature found.");
+        return;
+      }
+      setApproverSignature(next);
+      toast.success("Using saved signature.");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to load saved signature");
+    } finally {
+      setSavedApproverSignatureLoading(false);
+    }
+  };
+
+  const saveApproverSignatureAsDefault = async () => {
+    if (!approverSignature || !isSignatureImageDataUrl(approverSignature)) {
+      toast.error("Please draw or upload a signature first.");
+      return;
+    }
+    try {
+      setSavedApproverSignatureLoading(true);
+      await api.request("/api/me/signature", {
+        method: "PUT",
+        skipEntity: true,
+        body: JSON.stringify({ dataUrl: approverSignature }),
+      });
+      setSavedApproverSignature(approverSignature);
+      toast.success("Saved signature.");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to save signature");
+    } finally {
+      setSavedApproverSignatureLoading(false);
+    }
+  };
+
+  const removeSavedApproverSignature = async () => {
+    try {
+      setSavedApproverSignatureLoading(true);
+      await api.request("/api/me/signature", { method: "DELETE", skipEntity: true });
+      setSavedApproverSignature(null);
+      toast.success("Removed saved signature.");
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to remove saved signature");
+    } finally {
+      setSavedApproverSignatureLoading(false);
+    }
+  };
+
   const handleResubmit = async (id: number) => {
     setLoading(true);
     try {
@@ -3599,6 +3785,28 @@ const WorkflowRequestList = ({
         method: 'POST',
       });
       toast.success('Request resubmitted successfully!');
+      onRefresh();
+      setSelectedRequest(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRequesterCancel = async (id: number) => {
+    const promptResult = window.prompt('Optional - Cancellation Reason:', '');
+    if (promptResult === null) return;
+    const reason = promptResult.trim();
+    const confirmed = window.confirm('Cancel this request? This action is final and cannot be resubmitted.');
+    if (!confirmed) return;
+    setLoading(true);
+    try {
+      await api.request(`/api/workflow-requests/${id}/cancel`, {
+        method: 'POST',
+        body: JSON.stringify({ comment: reason }),
+      });
+      toast.success('Request cancelled');
       onRefresh();
       setSelectedRequest(null);
     } catch (err: any) {
@@ -3710,7 +3918,11 @@ const WorkflowRequestList = ({
         method: 'POST',
         body: JSON.stringify({ po_number: poNumber }),
       });
-      toast.success(`PO created: ${toUpperSerial(result.formatted_id)}`);
+      toast.success(
+        result?.merged_into_existing
+          ? `PR appended to PO: ${toUpperSerial(result.formatted_id)}`
+          : `PO created: ${toUpperSerial(result.formatted_id)}`
+      );
       setConvertPoModal(null);
       onRefresh();
       setSelectedRequest(null);
@@ -3766,6 +3978,8 @@ const WorkflowRequestList = ({
     (isWorkflowRequestRejected(selectedRequest) && isPR_Only(selectedRequest) && user.id === selectedRequest.requester_id) ||
     (isWorkflowRequestFullyApproved(selectedRequest) && isPR_Only(selectedRequest) && isPurchasing)
   );
+  const canRequesterCancelSelected =
+    !!selectedRequest && canRequesterCancelPendingRequest(selectedRequest, user, approvals);
 
   return (
     <div className="space-y-4">
@@ -3981,6 +4195,8 @@ const WorkflowRequestList = ({
                           section: sectionSelectionFromStored(selectedRequest.section),
                           suggested_supplier: prSuggestedSupplierDisplay(selectedRequest),
                         } as any);
+                        setEditAttachmentKeep(attachments);
+                        setEditAttachmentAdd([]);
                         setIsEditing(true);
                       }}
                       className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-indigo-200 text-indigo-600 text-xs font-bold hover:bg-indigo-50 transition-all"
@@ -4027,6 +4243,17 @@ const WorkflowRequestList = ({
                         Cancel PR (Final)
                       </button>
                     </>
+                  )}
+                  {canRequesterCancelSelected && !isEditing && (
+                    <button
+                      onClick={() => handleRequesterCancel(selectedRequest.id)}
+                      disabled={loading}
+                      className="flex items-center gap-2 px-4 py-2 bg-zinc-200 border border-zinc-300 rounded-xl text-sm font-bold text-zinc-800 hover:bg-zinc-300 transition-colors disabled:opacity-50"
+                      title="Cancel before any approver has approved (final action)"
+                    >
+                      <X className="w-4 h-4" />
+                      Cancel Request
+                    </button>
                   )}
                   <button onClick={() => {
                     setSelectedRequest(null);
@@ -4268,6 +4495,45 @@ const WorkflowRequestList = ({
                               </tbody>
                             </table>
                           </div>
+                        </div>
+
+                        <div className="space-y-3">
+                          <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block">Attachments</label>
+                          <div className="flex flex-wrap gap-2">
+                            {editAttachmentKeep.map((att) => (
+                              <div key={`keep-${att.id}`} className="flex items-center gap-2 bg-zinc-100 px-3 py-1 rounded-full text-xs text-zinc-600 border border-zinc-200">
+                                <Paperclip className="w-3 h-3" />
+                                <span>{att.file_name}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditAttachmentKeep((prev) => prev.filter((a) => a.id !== att.id))}
+                                  title="Remove existing attachment"
+                                >
+                                  <Trash2 className="w-3 h-3 hover:text-red-500" />
+                                </button>
+                              </div>
+                            ))}
+                            {editAttachmentAdd.map((att) => (
+                              <div key={att.id} className="flex items-center gap-2 bg-indigo-50 px-3 py-1 rounded-full text-xs text-indigo-700 border border-indigo-100">
+                                <Upload className="w-3 h-3" />
+                                <span>{att.name}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditAttachmentAdd((prev) => prev.filter((a) => a.id !== att.id))}
+                                  title="Remove new attachment"
+                                >
+                                  <Trash2 className="w-3 h-3 hover:text-red-500" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                          <label className="flex flex-col items-center justify-center w-full h-20 border-2 border-dashed border-zinc-300 rounded-xl cursor-pointer hover:bg-zinc-50 transition-colors">
+                            <div className="flex flex-col items-center justify-center">
+                              <Upload className="w-5 h-5 text-zinc-400 mb-1" />
+                              <p className="text-xs text-zinc-500">Re-upload or add more files</p>
+                            </div>
+                            <input type="file" className="hidden" multiple onChange={handleEditAttachmentAdd} />
+                          </label>
                         </div>
 
                         <div className="flex gap-3 pt-6 border-t border-zinc-100">
@@ -4722,8 +4988,19 @@ const WorkflowRequestList = ({
                                   Signature <span className="text-red-500 ml-1">* Required</span>
                                 </label>
                                 <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden">
-                                  <SignaturePad onSave={setApproverSignature} onClear={() => setApproverSignature(null)} />
+                                  <SignaturePad
+                                    onSave={setApproverSignature}
+                                    onClear={() => setApproverSignature(null)}
+                                    value={approverSignature}
+                                    savedSignature={savedApproverSignature}
+                                    onUseSaved={useSavedApproverSignature}
+                                    onSaveDefault={savedApproverSignatureLoading ? undefined : saveApproverSignatureAsDefault}
+                                    onClearSaved={savedApproverSignatureLoading ? undefined : removeSavedApproverSignature}
+                                  />
                                 </div>
+                                {savedApproverSignatureLoading ? (
+                                  <p className="text-[11px] text-zinc-400 mt-1">Syncing saved signature…</p>
+                                ) : null}
                               </div>
                             )}
 
@@ -4805,14 +5082,18 @@ const WorkflowRequestList = ({
                       <section className="pt-12 border-t-2 border-zinc-100">
                         <div className="bg-rose-50 p-6 rounded-2xl border border-rose-200">
                           {(() => {
-                            const ca = purchasingCancelApprovalForRequest({ ...selectedRequest, approvals });
+                            const requesterCancel = requesterCancelApprovalForRequest({ ...selectedRequest, approvals });
+                            const purchasingCancel = purchasingCancelApprovalForRequest({ ...selectedRequest, approvals });
+                            const ca = requesterCancel || purchasingCancel;
                             const reason = String(ca?.comment || '').trim();
                             const who = String(ca?.approver_name || '').trim();
                             const when = ca?.created_at ? new Date(ca.created_at).toLocaleString() : '';
+                            const byRequester = !!requesterCancel;
                             return (
                               <div className="space-y-2">
                                 <p className="text-sm font-bold text-rose-800">
-                                  Cancelled by purchasing team{who ? ` — ${who}` : ''}{when ? ` (${when})` : ''}. This is final (cannot be resubmitted).
+                                  {byRequester ? 'Cancelled by requester' : 'Cancelled by purchasing team'}
+                                  {who ? ` — ${who}` : ''}{when ? ` (${when})` : ''}. This is final (cannot be resubmitted).
                                 </p>
                                 {reason ? (
                                   <div className="text-sm text-rose-950 bg-rose-100 border border-rose-300 rounded-xl p-3">
@@ -6161,6 +6442,8 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     section: '',
     suggested_supplier: '',
   });
+  const [editAttachmentKeep, setEditAttachmentKeep] = useState<Attachment[]>([]);
+  const [editAttachmentAdd, setEditAttachmentAdd] = useState<{ id: string; name: string; type: string; data: string }[]>([]);
   const [viewingPdf, setViewingPdf] = useState<{ url: string; fileName: string } | null>(null);
   const [detailsViewMode, setDetailsViewMode] = useState<'details' | 'pdf'>('details');
   const [detailsPdfPreview, setDetailsPdfPreview] = useState<{ url: string; fileName: string } | null>(null);
@@ -6179,6 +6462,8 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     (isWorkflowRequestPending(selectedRequest) && (user.id === selectedRequest.requester_id || user.permissions?.includes('admin'))) ||
     (isWorkflowRequestFullyApproved(selectedRequest) && isPR_Only(selectedRequest) && isPurchasing)
   );
+  const canRequesterCancelSelected =
+    !!selectedRequest && canRequesterCancelPendingRequest(selectedRequest, user, approvals);
 
   const fetchProcurementRequests = async () => {
     setLoading(true);
@@ -6206,6 +6491,27 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     }
   };
 
+  const handleEditAttachmentAdd = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+    Array.from(files).forEach((file: File) => {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        setEditAttachmentAdd((prev) => [
+          ...prev,
+          {
+            id: Math.random().toString(36).substr(2, 9),
+            name: file.name,
+            type: file.type,
+            data: event.target?.result as string,
+          },
+        ]);
+      };
+      reader.readAsDataURL(file);
+    });
+    e.target.value = '';
+  };
+
   const handleSaveEdit = async () => {
     if (!selectedRequest) return;
     if (
@@ -6222,6 +6528,9 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     }
     if (isPRRequest(selectedRequest) && !String(editData.suggested_supplier ?? '').trim()) {
       return toast.error('Please enter the suggested supplier for this PR.');
+    }
+    if (selectedRequest.attachments_required && (editAttachmentKeep.length + editAttachmentAdd.length) === 0) {
+      return toast.error('This workflow requires at least one attachment.');
     }
     setLoading(true);
     try {
@@ -6248,6 +6557,8 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           details: detailsOut,
           currency: curOut,
           section: sectionOut,
+          attachment_keep_ids: editAttachmentKeep.map((a) => a.id),
+          attachments_add: editAttachmentAdd.map((a) => ({ name: a.name, type: a.type, data: a.data })),
           ...(isPRRequest(selectedRequest)
             ? { suggested_supplier: String(editData.suggested_supplier ?? '').trim() }
             : {}),
@@ -6255,6 +6566,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
       });
       toast.success('Request updated');
       setIsEditing(false);
+      setEditAttachmentAdd([]);
       fetchProcurementRequests();
       // Update local selected request
       setSelectedRequest({
@@ -6270,6 +6582,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           ? { suggested_supplier: String(editData.suggested_supplier ?? '').trim() }
           : {}),
       });
+      await fetchDetails(selectedRequest.id);
     } catch (err: any) {
       toast.error(err.message);
     } finally {
@@ -6284,6 +6597,28 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
         method: 'POST',
       });
       toast.success('Request resubmitted successfully!');
+      fetchProcurementRequests();
+      setSelectedRequest(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRequesterCancel = async (id: number) => {
+    const promptResult = window.prompt('Optional cancellation reason (for audit):', '');
+    if (promptResult === null) return;
+    const reason = promptResult.trim();
+    const confirmed = window.confirm('Cancel this request? This action is final and cannot be resubmitted.');
+    if (!confirmed) return;
+    setLoading(true);
+    try {
+      await api.request(`/api/workflow-requests/${id}/cancel`, {
+        method: 'POST',
+        body: JSON.stringify({ comment: reason }),
+      });
+      toast.success('Request cancelled');
       fetchProcurementRequests();
       setSelectedRequest(null);
     } catch (err: any) {
@@ -6413,7 +6748,11 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
         method: 'POST',
         body: JSON.stringify({ po_number: poNumber }),
       });
-      toast.success(`PO created: ${toUpperSerial(result.formatted_id)}`);
+      toast.success(
+        result?.merged_into_existing
+          ? `PR appended to PO: ${toUpperSerial(result.formatted_id)}`
+          : `PO created: ${toUpperSerial(result.formatted_id)}`
+      );
       setConvertPoModal(null);
       fetchProcurementRequests();
       setSelectedRequest(null);
@@ -6924,6 +7263,8 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                               section: sectionSelectionFromStored(selectedRequest.section),
                               suggested_supplier: prSuggestedSupplierDisplay(selectedRequest),
                             });
+                            setEditAttachmentKeep(attachments);
+                            setEditAttachmentAdd([]);
                             setIsEditing(true);
                           }}
                           className="flex items-center gap-2 px-4 py-2 bg-emerald-50 border border-emerald-200 rounded-xl text-sm font-bold text-emerald-700 hover:bg-emerald-100 transition-colors"
@@ -6968,6 +7309,17 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                         Cancel PR (Final)
                       </button>
                     </>
+                  )}
+                  {canRequesterCancelSelected && !isEditing && (
+                    <button
+                      onClick={() => handleRequesterCancel(selectedRequest.id)}
+                      disabled={loading}
+                      className="flex items-center gap-2 px-4 py-2 bg-zinc-200 border border-zinc-300 rounded-xl text-sm font-bold text-zinc-800 hover:bg-zinc-300 transition-colors disabled:opacity-50"
+                      title="Cancel before any approver has approved (final action)"
+                    >
+                      <X className="w-4 h-4" />
+                      Cancel Request
+                    </button>
                   )}
                   <button 
                     onClick={() => handlePrintPR(selectedRequest)} 
@@ -7220,6 +7572,45 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                           </div>
                         </div>
                       </div>
+
+                        <div className="space-y-3">
+                          <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block">Attachments</label>
+                          <div className="flex flex-wrap gap-2">
+                            {editAttachmentKeep.map((att) => (
+                              <div key={`keep-${att.id}`} className="flex items-center gap-2 bg-zinc-100 px-3 py-1 rounded-full text-xs text-zinc-600 border border-zinc-200">
+                                <Paperclip className="w-3 h-3" />
+                                <span>{att.file_name}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditAttachmentKeep((prev) => prev.filter((a) => a.id !== att.id))}
+                                  title="Remove existing attachment"
+                                >
+                                  <Trash2 className="w-3 h-3 hover:text-red-500" />
+                                </button>
+                              </div>
+                            ))}
+                            {editAttachmentAdd.map((att) => (
+                              <div key={att.id} className="flex items-center gap-2 bg-indigo-50 px-3 py-1 rounded-full text-xs text-indigo-700 border border-indigo-100">
+                                <Upload className="w-3 h-3" />
+                                <span>{att.name}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditAttachmentAdd((prev) => prev.filter((a) => a.id !== att.id))}
+                                  title="Remove new attachment"
+                                >
+                                  <Trash2 className="w-3 h-3 hover:text-red-500" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                          <label className="flex flex-col items-center justify-center w-full h-20 border-2 border-dashed border-zinc-300 rounded-xl cursor-pointer hover:bg-zinc-50 transition-colors">
+                            <div className="flex flex-col items-center justify-center">
+                              <Upload className="w-5 h-5 text-zinc-400 mb-1" />
+                              <p className="text-xs text-zinc-500">Re-upload or add more files</p>
+                            </div>
+                            <input type="file" className="hidden" multiple onChange={handleEditAttachmentAdd} />
+                          </label>
+                        </div>
 
                       <div className="flex justify-end gap-3 pt-6 border-t border-zinc-100">
                         <button
@@ -7676,14 +8067,18 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                       <section className="pt-12 border-t-2 border-zinc-100">
                         <div className="bg-rose-50 p-6 rounded-2xl border border-rose-200">
                           {(() => {
-                            const ca = purchasingCancelApprovalForRequest({ ...selectedRequest, approvals });
+                            const requesterCancel = requesterCancelApprovalForRequest({ ...selectedRequest, approvals });
+                            const purchasingCancel = purchasingCancelApprovalForRequest({ ...selectedRequest, approvals });
+                            const ca = requesterCancel || purchasingCancel;
                             const reason = String(ca?.comment || '').trim();
                             const who = String(ca?.approver_name || '').trim();
                             const when = ca?.created_at ? new Date(ca.created_at).toLocaleString() : '';
+                            const byRequester = !!requesterCancel;
                             return (
                               <div className="space-y-2">
                                 <p className="text-sm font-bold text-rose-800">
-                                  Cancelled by purchasing team{who ? ` — ${who}` : ''}{when ? ` (${when})` : ''}. This is final (cannot be resubmitted).
+                                  {byRequester ? 'Cancelled by requester' : 'Cancelled by purchasing team'}
+                                  {who ? ` — ${who}` : ''}{when ? ` (${when})` : ''}. This is final (cannot be resubmitted).
                                 </p>
                                 {reason ? (
                                   <div className="text-sm text-rose-950 bg-rose-100 border border-rose-300 rounded-xl p-3">
@@ -7754,6 +8149,20 @@ export default function App() {
   const [selectedTemplateForRequest, setSelectedTemplateForRequest] = useState<Workflow | null>(null);
   const [preSelectedRequestId, setPreSelectedRequestId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
+  const hasMultipleEntities = (user?.entities || []).length > 1;
+
+  const handleEntityChange = useCallback((nextEntity: string | null) => {
+    const ents = (user?.entities || []).map((e) => String(e).trim()).filter(Boolean);
+    const normalizedNext = String(nextEntity || '').trim();
+    if (!normalizedNext) {
+      setSelectedEntity(null);
+      api.setActiveEntity(null);
+      return;
+    }
+    if (ents.length > 0 && !ents.includes(normalizedNext)) return;
+    setSelectedEntity(normalizedNext);
+    api.setActiveEntity(normalizedNext);
+  }, [user]);
 
   const fetchWorkflows = async () => {
     try {
@@ -7777,18 +8186,15 @@ export default function App() {
     const ents = userData.entities || [];
     const stored = localStorage.getItem(FLOWMASTER_ENTITY_KEY);
     if (ents.length === 1) {
-      setSelectedEntity(ents[0]);
-      api.setActiveEntity(ents[0]);
+      handleEntityChange(ents[0]);
       return;
     }
     if (ents.length > 1 && stored && ents.includes(stored)) {
-      setSelectedEntity(stored);
-      api.setActiveEntity(stored);
+      handleEntityChange(stored);
       return;
     }
     const fallback = ents[0] || null;
-    api.setActiveEntity(fallback);
-    setSelectedEntity(fallback);
+    handleEntityChange(fallback);
   };
 
   const fetchRoles = async () => {
@@ -7805,6 +8211,12 @@ export default function App() {
     if (user.permissions?.includes('admin')) return true;
     return user.permissions?.includes(permission);
   };
+  const approverViewRoles = new Set(['approver', 'checker', 'som']);
+  const isPreparerUser = (user?.roles || []).some((r) => String(r).toLowerCase() === 'preparer');
+  const isApproverViewUser = (user?.roles || []).some((r) => approverViewRoles.has(String(r).toLowerCase()));
+  const canSeeDashboard = hasPermission('admin');
+  const canSeeTemplateDesigner = hasPermission('create_templates') && !isApproverViewUser && !isPreparerUser;
+  const canSeeWorkflowTemplates = (hasPermission('create_templates') || hasPermission('approve_templates')) && !isApproverViewUser && !isPreparerUser;
 
   const init = async () => {
     const token = localStorage.getItem('token');
@@ -7831,11 +8243,34 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const syncEntity = () => {
+      const stored = String(localStorage.getItem(FLOWMASTER_ENTITY_KEY) || '').trim() || null;
+      const allowed = (user?.entities || []).map((e) => String(e).trim());
+      if (stored && allowed.length > 0 && !allowed.includes(stored)) return;
+      setSelectedEntity(stored);
+    };
+    window.addEventListener('storage', syncEntity);
+    window.addEventListener(FLOWMASTER_ENTITY_CHANGED_EVENT, syncEntity as EventListener);
+    return () => {
+      window.removeEventListener('storage', syncEntity);
+      window.removeEventListener(FLOWMASTER_ENTITY_CHANGED_EVENT, syncEntity as EventListener);
+    };
+  }, [user]);
+
+  useEffect(() => {
     if (!user || loading) return;
     const ents = user.entities || [];
     if (ents.length === 0) return;
     fetchRequests();
   }, [user, selectedEntity, loading]);
+
+  useEffect(() => {
+    if (!isApproverViewUser && !isPreparerUser && canSeeDashboard) return;
+    if (activeTab === 'create' || activeTab === 'templates' || (!canSeeDashboard && activeTab === 'dashboard')) {
+      setActiveTab('submit');
+      setSelectedTemplateForRequest(null);
+    }
+  }, [activeTab, isApproverViewUser, isPreparerUser, canSeeDashboard]);
 
   const handleLogout = () => {
     api.setToken(null);
@@ -7887,23 +8322,25 @@ export default function App() {
             <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-100">
               <Shield className="text-white w-4 h-4" />
             </div>
-            <span className="font-bold text-lg text-zinc-900">FlowMaster</span>
+            <span className="font-bold text-lg text-zinc-900">Approval System</span>
           </div>
-          <p className="text-[10px] text-zinc-400 uppercase font-bold tracking-widest">Workflow Engine</p>
+          <p className="text-[10px] text-zinc-400 uppercase font-bold tracking-widest">Approval Platform</p>
         </div>
 
         <nav className="flex-1 p-4 space-y-1">
-          <button
-            onClick={() => { setActiveTab('dashboard'); setSelectedTemplateForRequest(null); }}
-            className={cn(
-              "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
-              activeTab === 'dashboard' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
-            )}
-          >
-            <LayoutDashboard className="w-4 h-4" />
-            Dashboard
-          </button>
-          {hasPermission('create_templates') && (
+          {canSeeDashboard && (
+            <button
+              onClick={() => { setActiveTab('dashboard'); setSelectedTemplateForRequest(null); }}
+              className={cn(
+                "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
+                activeTab === 'dashboard' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+              )}
+            >
+              <LayoutDashboard className="w-4 h-4" />
+              Dashboard
+            </button>
+          )}
+          {canSeeTemplateDesigner && (
             <button
               onClick={() => { setActiveTab('create'); setSelectedTemplateForRequest(null); }}
               className={cn(
@@ -7915,7 +8352,7 @@ export default function App() {
               Design Template
             </button>
           )}
-          {(hasPermission('create_templates') || hasPermission('approve_templates')) && (
+          {canSeeWorkflowTemplates && (
             <button
               onClick={() => { setActiveTab('templates'); setSelectedTemplateForRequest(null); }}
               className={cn(
@@ -7981,25 +8418,6 @@ export default function App() {
           )}
         </nav>
 
-        {user.entities && user.entities.length > 1 && (
-          <div className="px-4 pb-2">
-            <label className="text-[10px] text-zinc-400 uppercase font-bold tracking-wider">Entity</label>
-            <select
-              value={selectedEntity || ''}
-              onChange={(e) => {
-                const v = e.target.value;
-                api.setActiveEntity(v);
-                setSelectedEntity(v);
-              }}
-              className="w-full mt-1 px-2 py-2 text-sm border border-zinc-200 rounded-xl bg-white text-zinc-800 font-medium"
-            >
-              {user.entities.map((ent) => (
-                <option key={ent} value={ent}>{ent}</option>
-              ))}
-            </select>
-          </div>
-        )}
-
         <div className="p-4 border-t border-zinc-100">
         <div className="flex items-center gap-3 px-4 py-3 mb-2">
           <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center font-bold text-xs">
@@ -8032,6 +8450,23 @@ export default function App() {
              activeTab === 'procurement' ? 'Procurement Center' : 'Administration'}
           </h2>
           <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2">
+              <Building2 className="w-4 h-4 text-zinc-400" />
+              {hasMultipleEntities ? (
+                <select
+                  value={selectedEntity || ''}
+                  onChange={(e) => handleEntityChange(e.target.value || null)}
+                  className="h-8 min-w-[180px] rounded-lg border border-zinc-300 bg-white px-2.5 text-xs font-semibold text-zinc-700 outline-none focus:ring-2 focus:ring-indigo-500"
+                >
+                  <option value="" disabled>Select Active Entity</option>
+                  {(user?.entities || []).map((ent) => (
+                    <option key={ent} value={ent}>{ent}</option>
+                  ))}
+                </select>
+              ) : (
+                <span className="text-xs font-semibold text-zinc-600">{selectedEntity || 'No Entity'}</span>
+              )}
+            </div>
             <div className="h-8 w-px bg-zinc-200" />
             <span className="text-xs text-zinc-400 font-medium">{new Date().toLocaleDateString()}</span>
           </div>
@@ -8048,7 +8483,7 @@ export default function App() {
           )}
         >
           <AnimatePresence mode="wait">
-            {activeTab === 'dashboard' && !selectedTemplateForRequest && (
+            {activeTab === 'dashboard' && canSeeDashboard && !selectedTemplateForRequest && (
               <motion.div
                 key="dashboard"
                 initial={{ opacity: 0, y: 10 }}
@@ -8072,7 +8507,7 @@ export default function App() {
               </motion.div>
             )}
 
-            {activeTab === 'create' && (
+            {activeTab === 'create' && canSeeTemplateDesigner && (
               <motion.div
                 key="create"
                 initial={{ opacity: 0, y: 10 }}
@@ -8086,7 +8521,7 @@ export default function App() {
               </motion.div>
             )}
             
-            {activeTab === 'templates' && !selectedTemplateForRequest && (
+            {activeTab === 'templates' && canSeeWorkflowTemplates && !selectedTemplateForRequest && (
               <motion.div
                 key="templates"
                 initial={{ opacity: 0, y: 10 }}
@@ -8149,6 +8584,9 @@ export default function App() {
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
               >
+                <div className="mb-3 text-xs text-zinc-500">
+                  Approvals view shows requests across your accessible entities. Submission always uses the active entity in the header.
+                </div>
                 <WorkflowRequestList 
                   requests={requests} 
                   user={user}
