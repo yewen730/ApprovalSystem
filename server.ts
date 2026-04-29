@@ -6,6 +6,7 @@ import os from "node:os";
 import sql from "mssql";
 import { approvalEventLog, approvalLogSanitize, formatActor } from "./approvalLog";
 import {
+  COMPANY_FILE_STORAGE_ROOT,
   copyStoredFileToRequest,
   decodeAttachmentPayload,
   getAttachmentsRoot,
@@ -277,6 +278,11 @@ const parseNullableNumber = (value: any): number | null => {
   return Number.isFinite(n) ? n : null;
 };
 
+const userHasDepartment = (departmentCsv: any, expectedDepartment: string): boolean =>
+  parseCommaSeparatedList(departmentCsv).some(
+    (d) => d.toLowerCase() === String(expectedDepartment || "").toLowerCase()
+  );
+
 /** Plain text or bcrypt (`$2a$` / `$2b$`) passwords in SQL usersetting. */
 const sqlPasswordMatches = (stored: string | null | undefined, plain: string): boolean => {
   const s = String(stored ?? "");
@@ -368,6 +374,20 @@ function userRowHasEntityAccess(row: any, entityUpper: string): boolean {
 
 function userRowHasApproverRole(row: any): boolean {
   return parseCommaSeparatedList(row?.role).some((r) => r.toLowerCase() === "approver");
+}
+
+/** Same department string rule as workflow request rows vs JWT user (see assertWorkflowRequestAccess). */
+function userDepartmentsMatch(a: string | null | undefined, b: string | null | undefined): boolean {
+  const left = new Set(
+    parseCommaSeparatedList(a)
+      .map((x) => x.toLowerCase())
+      .filter(Boolean)
+  );
+  const right = parseCommaSeparatedList(b)
+    .map((x) => x.toLowerCase())
+    .filter(Boolean);
+  if (left.size === 0 || right.length === 0) return false;
+  return right.some((d) => left.has(d));
 }
 
 async function fetchSqlUsersettingById(pool: sql.ConnectionPool, userId: number): Promise<any | null> {
@@ -637,6 +657,18 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
     `);
   } catch (e: any) {
     console.warn("SQL assigned_approver_id column:", e?.message || e);
+  }
+  try {
+    await pool.request().query(`
+      IF COL_LENGTH('workflows', 'is_active') IS NULL
+        ALTER TABLE workflows ADD is_active BIT NOT NULL CONSTRAINT DF_workflows_is_active DEFAULT (1);
+    `);
+    await pool.request().query(`
+      IF COL_LENGTH('workflows', 'is_active') IS NOT NULL
+        UPDATE workflows SET is_active = 1 WHERE is_active IS NULL;
+    `);
+  } catch (e: any) {
+    console.warn("SQL workflows.is_active column:", e?.message || e);
   }
   try {
     const utEsc = SQLSERVER_USERS_TABLE.replace(/'/g, "''");
@@ -950,14 +982,14 @@ async function startServer() {
 
   const isDirectorUser = (req: any) =>
     !!req.user?.roles?.some((r: string) => r.toLowerCase() === "director") &&
-    (req.user.department || "").toLowerCase() === "management";
+    userHasDepartment(req.user.department, "management");
 
   const isPurchasingUser = (req: any) =>
     !!req.user?.roles?.some((r: string) => r.toLowerCase() === "purchasing");
 
   const isSomUser = (req: any) =>
     !!req.user?.roles?.some((r: string) => r.toLowerCase() === "som") &&
-    (req.user.department || "").toLowerCase() === "management";
+    userHasDepartment(req.user.department, "management");
 
   /**
    * Requires `X-Entity` header to match one of the user's allowed entities.
@@ -991,7 +1023,7 @@ async function startServer() {
    * - Always: entity must match active entity context.
    * - Admin or director: any department within entity.
    * - Purchasing (on procurement workflows): any department within entity.
-   * - Otherwise: request department must match user's department.
+   * - Otherwise: request department must match one of user's departments.
    */
   const assertWorkflowRequestAccess = (req: any, res: any, requestRow: any, templateCategory?: string): boolean => {
     if (!requestRow) {
@@ -1011,10 +1043,25 @@ async function startServer() {
     if (isAdminUser(req)) return true;
     if (isDirectorUser(req)) return true;
     if (cat === "procurement" && (isPurchasingUser(req) || isSomUser(req))) return true;
-    if ((requestRow.department || "") === (req.user.department || "")) return true;
+    if (userDepartmentsMatch(requestRow.department, req.user.department)) return true;
     res.status(403).json({ error: "Department access denied" });
     return false;
   };
+
+  /** Public: LAN URLs for sharing; useful when the terminal is hidden. Set DISABLE_SERVER_ACCESS_URLS=1 to hide. */
+  app.get("/api/server-access-urls", (_req, res) => {
+    if (process.env.DISABLE_SERVER_ACCESS_URLS === "1") {
+      return res.status(404).json({ error: "Not found" });
+    }
+    const lanHosts = getLanIPv4Addresses();
+    const lanUrls = lanHosts.map((host) => `http://${host}:${PORT}`);
+    res.json({
+      port: PORT,
+      localhostUrl: `http://localhost:${PORT}`,
+      lanUrls,
+      hostname: os.hostname(),
+    });
+  });
 
   // Auth Routes
   app.post("/api/login", async (req, res) => {
@@ -1233,6 +1280,11 @@ async function startServer() {
   app.get("/api/users/eligible-approvers", authenticate, requireEntityContext, async (req: any, res) => {
     try {
       const activeEnt = String(req.entityContext || "").trim().toUpperCase();
+      const requesterRow = await fetchSqlUsersettingById(sqlPool, Number(req.user?.id));
+      const requesterDepartment =
+        requesterRow && requesterRow.department != null
+          ? String(requesterRow.department)
+          : String(req.user?.department || "");
       let rs;
       try {
         rs = await sqlPool.request().query(
@@ -1246,7 +1298,8 @@ async function startServer() {
           (u: any) =>
             Number(u.id) !== Number(req.user.id) &&
             userRowHasEntityAccess(u, activeEnt) &&
-            userRowHasApproverRole(u)
+            userRowHasApproverRole(u) &&
+            userDepartmentsMatch(u.department, requesterDepartment)
         )
         .map((u: any) => ({ id: u.id, username: u.username, department: u.department || "" }));
       return res.json(out);
@@ -1679,7 +1732,7 @@ async function startServer() {
             SELECT w.*, u.username AS creator_name
             FROM workflows w
             INNER JOIN ${userJoinSql} u ON w.creator_id = u.id
-            WHERE w.creator_id = @creatorId OR w.status = N'approved'
+            WHERE w.creator_id = @creatorId OR (w.status = N'approved' AND ISNULL(w.is_active, 1) = 1)
           `);
       }
       const workflows = rs.recordset || [];
@@ -1848,11 +1901,20 @@ async function startServer() {
       }
       let deptClause = "";
       if (!isAdminUser(req) && !isDirectorUser(req) && !isSomUser(req)) {
-        deptClause = " AND r.department = @department";
-        reqSql.input("department", sql.NVarChar, req.user.department);
+        const userDepartments = parseCommaSeparatedList(req.user.department);
+        if (userDepartments.length === 0) return res.json([]);
+        const deptParams: string[] = [];
+        userDepartments.forEach((d, idx) => {
+          const key = `dept_${idx}`;
+          reqSql.input(key, sql.NVarChar, d);
+          deptParams.push(`@${key}`);
+        });
+        deptClause = ` AND r.department IN (${deptParams.join(", ")})`;
       }
       const rs = await reqSql.query(`
           SELECT r.*,
+            po_link.formatted_id AS linked_po_formatted_id,
+            po_link.status AS linked_po_status,
             COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.requester_name AS NVARCHAR(255)))), N''), u.username) AS computed_requester_name,
             u.designation AS requester_designation,
             w.name AS template_name,
@@ -1861,6 +1923,7 @@ async function startServer() {
           FROM workflow_requests r
           INNER JOIN ${userJoinSql} u ON r.requester_id = u.id
           INNER JOIN workflows w ON r.template_id = w.id
+          LEFT JOIN workflow_requests po_link ON po_link.id = r.converted_po_request_id
           WHERE 1=1${entityClause}${deptClause}
           ORDER BY r.created_at DESC
         `);
@@ -2014,6 +2077,9 @@ async function startServer() {
         return res.status(400).json({
           error: "Chosen approver must have approver role access for this entity.",
         });
+      }
+      if (!userDepartmentsMatch(approverRow.department, req.user.department)) {
+        return res.status(400).json({ error: "Chosen approver must be in one of your departments." });
       }
       assignedApproverSql = aid;
     }
@@ -2351,7 +2417,7 @@ async function startServer() {
       req.user.roles.some((r: string) => r.toLowerCase() === currentStep.approverRole.toLowerCase());
     const userIsCurrentApprover =
       currentStep &&
-      ((roleMatch && req.user.department === request.department) ||
+      ((roleMatch && userDepartmentsMatch(req.user.department, request.department)) ||
         (currentStep.approverRole.toLowerCase() === "som" && isSomUser(req)));
     const userIsRequesterResolved = userIsRequester;
 
@@ -2945,24 +3011,67 @@ async function startServer() {
 
     const steps = JSON.parse(request.template_steps);
     const currentStep = steps[request.current_step_index];
+    const actorRow = await fetchSqlUsersettingById(sqlPool, Number(req.user.id));
+    const actorRoles = parseCommaSeparatedList(actorRow?.role ?? req.user.roles);
+    const actorDepartment = actorRow?.department ?? req.user.department;
 
-    const userIsAdmin = req.user.roles && req.user.roles.some((r: string) => r.toLowerCase() === "admin");
-    const userIsDirector = isDirectorUser(req);
+    const userIsAdmin = actorRoles.some((r) => r.toLowerCase() === "admin");
+    const userIsDirector =
+      actorRoles.some((r) => r.toLowerCase() === "director") &&
+      userHasDepartment(actorDepartment, "management");
     const roleLower = String(currentStep?.approverRole || "").toLowerCase();
     const isAssignedApproverStep = request.assigned_approver_id != null && roleLower === "approver";
     const assignedId = Number(request.assigned_approver_id);
     const userIsAssignedApprover =
       isAssignedApproverStep && Number.isFinite(assignedId) && assignedId > 0 && Number(req.user.id) === assignedId;
 
-    const userHasRole = req.user.roles && req.user.roles.some((r: string) => r.toLowerCase() === currentStep.approverRole.toLowerCase());
+    const userHasRole = actorRoles.some((r) => r.toLowerCase() === currentStep.approverRole.toLowerCase());
+    const userHasApproverRole = actorRoles.some((r) => r.toLowerCase() === "approver");
+    const userDeptMatchRequest = userDepartmentsMatch(actorDepartment, request.department);
+    const userIsSom =
+      actorRoles.some((r) => r.toLowerCase() === "som") &&
+      userHasDepartment(actorDepartment, "management");
     const somStep = roleLower === "som";
+    let approverStepTotalMyr: number | null = null;
+    let currentUserLimitMyr: number | null = null;
+    let assignedApproverInsufficient = false;
+    if (roleLower === "approver") {
+      let lineItemsForLimit: any[] = [];
+      try {
+        lineItemsForLimit = JSON.parse(request.line_items || "[]");
+      } catch {
+        lineItemsForLimit = [];
+      }
+      approverStepTotalMyr = computeRequestTotalMyr(
+        lineItemsForLimit,
+        request.tax_rate,
+        String(request.currency ?? "").trim(),
+        request.discount_rate
+      );
+      const entForLimitCheck = String(request.entity ?? "").trim();
+      currentUserLimitMyr = await getUserApprovalLimitMyr(sqlPool, Number(req.user.id), entForLimitCheck);
+      if (isAssignedApproverStep && Number.isFinite(assignedId) && assignedId > 0) {
+        const assignedApproverLimitMyr = await getUserApprovalLimitMyr(sqlPool, assignedId, entForLimitCheck);
+        assignedApproverInsufficient =
+          assignedApproverLimitMyr !== null &&
+          approverStepTotalMyr > assignedApproverLimitMyr;
+      }
+    }
+    const currentUserCanCoverApproverTotal =
+      approverStepTotalMyr !== null &&
+      (currentUserLimitMyr === null || approverStepTotalMyr <= currentUserLimitMyr);
     const roleBasedApprovalAllowed = isAssignedApproverStep
-      ? userIsAssignedApprover
-      : (userHasRole && req.user.department === request.department);
+      ? (userIsAssignedApprover && userDeptMatchRequest) ||
+        (!userIsAssignedApprover &&
+          !!userHasApproverRole &&
+          userDeptMatchRequest &&
+          assignedApproverInsufficient &&
+          currentUserCanCoverApproverTotal)
+      : userHasRole && userDeptMatchRequest;
     const canApprove =
       userIsAdmin ||
       userIsDirector ||
-      (somStep && isSomUser(req)) ||
+      (somStep && userIsSom) ||
       roleBasedApprovalAllowed;
 
     if (!canApprove) {
@@ -2979,18 +3088,16 @@ async function startServer() {
     }
 
     if (status === "approved" && currentStep.approverRole.toLowerCase() === "approver") {
-      let lineItems: any[] = [];
-      try {
-        lineItems = JSON.parse(request.line_items || "[]");
-      } catch {
-        lineItems = [];
+      if (approverStepTotalMyr === null) {
+        return res.status(400).json({ error: "Unable to compute approval total for this request." });
       }
-      const totalMyr = computeRequestTotalMyr(lineItems, request.tax_rate, String(request.currency ?? "").trim(), request.discount_rate);
-      const entForLimit = String(request.entity ?? "").trim();
-      const userLimitMyr = await getUserApprovalLimitMyr(sqlPool, Number(req.user.id), entForLimit);
-      if (userLimitMyr !== null && totalMyr > userLimitMyr) {
+      const userLimitMyr =
+        currentUserLimitMyr !== null
+          ? currentUserLimitMyr
+          : await getUserApprovalLimitMyr(sqlPool, Number(req.user.id), String(request.entity ?? "").trim());
+      if (userLimitMyr !== null && approverStepTotalMyr > userLimitMyr) {
         return res.status(403).json({
-          error: `Approval limit exceeded. Request total is RM ${totalMyr.toFixed(2)}, your limit is RM ${userLimitMyr.toFixed(2)} (entity-specific cap if configured).`,
+          error: `Approval limit exceeded. Request total is RM ${approverStepTotalMyr.toFixed(2)}, your limit is RM ${userLimitMyr.toFixed(2)} (entity-specific cap if configured).`,
         });
       }
     }
@@ -3167,21 +3274,25 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
     const lan = getLanIPv4Addresses();
+    const line = "─".repeat(56);
+    console.log(`\n${line}`);
+    console.log(`  Local:    http://localhost:${PORT}`);
     if (lan.length > 0) {
-      console.log("Same Wi‑Fi / LAN — open on phones or other PCs:");
+      console.log("  LAN:");
       for (const ip of lan) {
-        console.log(`  http://${ip}:${PORT}`);
+        console.log(`            http://${ip}:${PORT}`);
       }
+      console.log("  (Also shown on the login page under 'Open this app'.)");
       console.log(
-        "If those URLs do not load, allow this port in Windows Firewall (run as Admin): npm run allow-lan"
+        "  Firewall: npm run allow-lan  (Admin PowerShell) if other devices cannot connect."
       );
     } else {
       console.log(
-        "No LAN IPv4 found; connect to Wi‑Fi and check ipconfig, or set PORT if you use another port."
+        "  LAN:     (none detected — use ipconfig, or open the login page for hints.)"
       );
     }
+    console.log(`${line}\n`);
   });
 }
 

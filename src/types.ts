@@ -33,6 +33,7 @@ export interface Workflow {
   steps: WorkflowStep[];
   table_columns?: string[];
   attachments_required?: boolean;
+  is_active?: boolean;
   status: 'Pending' | 'Approved' | 'Rejected';
   created_at: string;
 }
@@ -65,6 +66,12 @@ export interface WorkflowRequest {
   entity?: string; // The entity this request belongs to
   /** GCCM: requester-selected user id for approver-role steps (see server rules). */
   assigned_approver_id?: number | null;
+  /** List API: request total (MYR) when pending on approver step (for limit / escalation UI). */
+  request_total_myr_snapshot?: number | null;
+  /** List API: chosen approver's cap (MYR) for this entity; null = no cap in DB. */
+  assigned_approver_limit_myr?: number | null;
+  /** List API: true when amount exceeds chosen approver's cap (another same-dept higher-limit approver may sign). */
+  assigned_approval_shortfall?: boolean;
   formatted_id?: string; // The auto-generated PR ID
   currency?: string;
   cost_center?: string;
@@ -73,6 +80,10 @@ export interface WorkflowRequest {
   suggested_supplier?: string | null;
   /** Set when this PR has been converted to a PO (server); one PR → one PO. */
   converted_po_request_id?: number | null;
+  /** Populated on list API for PR rows: linked PO document id (official PO number). */
+  linked_po_formatted_id?: string | null;
+  /** Populated on list API for PR rows: workflow status of the linked PO request. */
+  linked_po_status?: string | null;
   line_items?: any[];
   tax_rate?: number;
   /** Document-level discount 0–1 (e.g. 0.05 = 5% off subtotal before tax). PR-focused; PO may carry from PR convert. */

@@ -5,11 +5,15 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 15 * 1024 * 1024);
 
+/** Default UNC root for request attachments and related on-disk files (one folder per request under `{entity}/{requestId}/`). */
+export const COMPANY_FILE_STORAGE_ROOT =
+  "\\\\10.128.3.10\\data\\E_IVOICING\\Approval System";
+
 /** Root directory on the company server where request files are stored (absolute path recommended). */
 export function getAttachmentsRoot(): string {
   const raw = process.env.ATTACHMENTS_STORAGE_PATH?.trim();
   if (raw) return path.isAbsolute(raw) ? raw : path.join(__dirname, raw);
-  return path.join(__dirname, "data", "request-attachments");
+  return COMPANY_FILE_STORAGE_ROOT;
 }
 
 function safeSegment(s: string, max = 64): string {

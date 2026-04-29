@@ -35,7 +35,9 @@ import {
   RefreshCw,
   TrendingUp,
   Activity,
-  FileSpreadsheet
+  FileSpreadsheet,
+  ChevronsLeft,
+  ChevronsRight
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Toaster, toast } from 'react-hot-toast';
@@ -57,6 +59,7 @@ import { cn } from './lib/utils';
 
 // --- API Helpers ---
 const FLOWMASTER_ENTITY_KEY = 'flowmaster_entity';
+const FLOWMASTER_SIDEBAR_COLLAPSED_KEY = 'flowmaster_sidebar_collapsed';
 const FLOWMASTER_ENTITY_CHANGED_EVENT = 'flowmaster-entity-changed';
 
 const api = {
@@ -484,32 +487,21 @@ const EntitySelection = ({ entities, onSelect }: { entities: string[]; onSelect:
 };
 
 const Login = ({ onLogin }: { onLogin: (user: User) => void }) => {
-  const [isRegister, setIsRegister] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [department, setDepartment] = useState('');
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     try {
-      if (isRegister) {
-        await api.request('/api/register', {
-          method: 'POST',
-          body: JSON.stringify({ username, password, department }),
-        });
-        toast.success('Registered successfully! Please login.');
-        setIsRegister(false);
-      } else {
-        const data = await api.request('/api/login', {
-          method: 'POST',
-          body: JSON.stringify({ username, password }),
-        });
-        api.setToken(data.token);
-        onLogin(data.user);
-        toast.success('Welcome back!');
-      }
+      const data = await api.request('/api/login', {
+        method: 'POST',
+        body: JSON.stringify({ username, password }),
+      });
+      api.setToken(data.token);
+      onLogin(data.user);
+      toast.success('Welcome back!');
     } catch (err: any) {
       toast.error(err.message);
     } finally {
@@ -530,7 +522,7 @@ const Login = ({ onLogin }: { onLogin: (user: User) => void }) => {
           </div>
           <h1 className="text-2xl font-bold text-zinc-900">Approval System</h1>
           <p className="text-zinc-500 text-sm mt-1">
-            {isRegister ? 'Create your account' : 'Sign in to your account'}
+            Sign in to your account
           </p>
         </div>
 
@@ -555,41 +547,14 @@ const Login = ({ onLogin }: { onLogin: (user: User) => void }) => {
               onChange={(e) => setPassword(e.target.value)}
             />
           </div>
-          {isRegister && (
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 mb-1">Department</label>
-              <select
-                required
-                className="w-full px-4 py-2 rounded-lg border border-zinc-300 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
-                value={department}
-                onChange={(e) => setDepartment(e.target.value)}
-              >
-                <option value="">Select Department</option>
-                <option value="IT">IT</option>
-                <option value="HR">HR</option>
-                <option value="Finance">Finance</option>
-                <option value="Sales">Sales</option>
-                <option value="General">General</option>
-              </select>
-            </div>
-          )}
           <button
             type="submit"
             disabled={loading}
             className="w-full bg-indigo-600 text-white py-2 rounded-lg font-semibold hover:bg-indigo-700 transition-colors disabled:opacity-50"
           >
-            {loading ? 'Processing...' : (isRegister ? 'Register' : 'Login')}
+            {loading ? 'Processing...' : 'Login'}
           </button>
         </form>
-
-        <div className="mt-6 text-center">
-          <button
-            onClick={() => setIsRegister(!isRegister)}
-            className="text-sm text-indigo-600 hover:underline"
-          >
-            {isRegister ? 'Already have an account? Login' : "Don't have an account? Register"}
-          </button>
-        </div>
       </motion.div>
     </div>
   );
@@ -1232,8 +1197,8 @@ const SignaturePad = ({
         <canvas
           ref={canvasRef}
           width={1200}
-          height={400}
-          className="w-full h-36 cursor-crosshair touch-none"
+          height={480}
+          className="w-full h-100 cursor-crosshair touch-none"
           onMouseDown={startDrawing}
           onMouseMove={draw}
           onMouseUp={stopDrawing}
@@ -1380,6 +1345,19 @@ const procurementGridColumns = (req: WorkflowRequest) => {
 
 const procurementRowShowsLineTotal = (req: WorkflowRequest) => isPRRequest(req) || isSRRequest(req);
 
+const parseDepartmentCsv = (value: string | undefined) =>
+  String(value || '')
+    .split(',')
+    .map((x) => x.trim().toLowerCase())
+    .filter(Boolean);
+
+const departmentsOverlap = (left: string | undefined, right: string | undefined) => {
+  const lset = new Set(parseDepartmentCsv(left));
+  const rightList = parseDepartmentCsv(right);
+  if (lset.size === 0 || rightList.length === 0) return false;
+  return rightList.some((d) => lset.has(d));
+};
+
 const getColumns = (item: any) => {
   if (!item) return [];
   if (isPO_Only(item)) return PO_COLUMNS;
@@ -1399,8 +1377,13 @@ const userCanApproveWorkflowStep = (user: User, request: WorkflowRequest, curren
   if (role === 'som' && isSom) return true;
   const ent = (request.entity || '').trim().toUpperCase();
   const pick = request.assigned_approver_id != null ? Number(request.assigned_approver_id) : NaN;
-  if (ent === 'GCCM' && role === 'approver' && Number.isFinite(pick) && pick > 0 && user.id === pick) return true;
-  if (userHasRole && user.department === request.department) return true;
+  if (
+    ent === 'GCCM' &&
+    role === 'approver' &&
+    departmentsOverlap(user.department, request.department)
+  )
+    return true;
+  if (userHasRole && departmentsOverlap(user.department, request.department)) return true;
   return false;
 };
 
@@ -1457,21 +1440,65 @@ function purchasingRejectApprovalForRequest(req: WorkflowRequest | null | undefi
   return byPurchasing || list[list.length - 1];
 }
 
-const workflowRequestStatusBadgeClass = (r: WorkflowRequest) => {
-  const n = normalizeWorkflowRequestStatus(r.status);
+const workflowStatusNormalizedBadgeClass = (n: string) => {
   if (n === 'approved') return 'bg-emerald-100 text-emerald-700 ring-1 ring-inset ring-emerald-200/70';
   if (n === 'rejected') return 'bg-red-100 text-red-700 ring-1 ring-inset ring-red-200/70';
   if (n === 'cancelled') return 'bg-rose-100 text-rose-700 ring-1 ring-inset ring-rose-200/70';
   return 'bg-amber-100 text-amber-700 ring-1 ring-inset ring-amber-200/70';
 };
 
+const workflowRequestStatusBadgeClass = (r: WorkflowRequest) =>
+  workflowStatusNormalizedBadgeClass(normalizeWorkflowRequestStatus(r.status));
+
+const workflowRequestStatusBadgeClassFromRawStatus = (status: string | null | undefined) =>
+  workflowStatusNormalizedBadgeClass(normalizeWorkflowRequestStatus(status));
+
+/** Status text for a linked PO row (uses PO-approved wording when approved). */
+const formatLinkedPoWorkflowStatusLabel = (linkedStatus: string | null | undefined) => {
+  const n = normalizeWorkflowRequestStatus(linkedStatus);
+  if (n === 'approved') return 'PO approved';
+  if (n === 'rejected') return 'Rejected';
+  if (n === 'cancelled') return 'Cancelled';
+  if (n === 'pending') return 'Pending';
+  return linkedStatus?.trim() || '—';
+};
+
 const formatWorkflowRequestStatusLabel = (r: WorkflowRequest) => {
   const n = normalizeWorkflowRequestStatus(r.status);
-  if (n === 'approved') return 'Approved';
+  if (n === 'approved') {
+    if (isPO_Only(r)) return 'PO approved';
+    if (isPR_Only(r)) return 'PR approved';
+    return 'Approved';
+  }
   if (n === 'rejected') return 'Rejected';
   if (n === 'cancelled') return 'Cancelled';
   if (n === 'pending') return 'Pending';
   return r.status ?? '—';
+};
+
+/** PR already has a PO request created from it (one PR → one PO). */
+const prHasLinkedPoRequest = (r: WorkflowRequest) =>
+  r.converted_po_request_id != null && Number(r.converted_po_request_id) > 0;
+
+/** PO # column: PO documents show their own formatted id; PRs show the linked PO id when converted. */
+const displayPoNumberInRequestTable = (r: WorkflowRequest) => {
+  if (isPO_Only(r) && String(r.formatted_id ?? '').trim()) return toUpperSerial(String(r.formatted_id).trim());
+  const linked = String(r.linked_po_formatted_id ?? '').trim();
+  if (linked) return toUpperSerial(linked);
+  return '—';
+};
+
+/** PO workflow status: for PO rows, same as document status; for PRs with a linked PO, linked PO status. */
+const displayPoStatusLabelInRequestTable = (r: WorkflowRequest): string => {
+  if (isPO_Only(r)) return formatWorkflowRequestStatusLabel(r);
+  if (isPR_Only(r) && prHasLinkedPoRequest(r)) return formatLinkedPoWorkflowStatusLabel(r.linked_po_status);
+  return '—';
+};
+
+const showPoStatusBadgeInRequestTable = (r: WorkflowRequest) => {
+  if (isPO_Only(r)) return true;
+  if (isPR_Only(r) && prHasLinkedPoRequest(r)) return !!String(r.linked_po_status ?? '').trim();
+  return false;
 };
 
 /** Purchasing users only; used for PR → PO actions. */
@@ -1479,10 +1506,6 @@ const isPurchasingRole = (user: User) =>
   !!user.roles?.some((role) => role.toLowerCase() === 'purchasing');
 
 const isAdminPermission = (user: User) => !!user.permissions?.includes('admin');
-
-/** PR already has a PO request created from it (one PR → one PO). */
-const prHasLinkedPoRequest = (r: WorkflowRequest) =>
-  r.converted_po_request_id != null && Number(r.converted_po_request_id) > 0;
 
 /** Show Convert to PO only for fully approved procurement PRs on the purchasing side, and only once per PR. */
 const canShowConvertPRToPO = (r: WorkflowRequest, user: User) =>
@@ -3982,8 +4005,8 @@ const WorkflowRequestList = ({
     !!selectedRequest && canRequesterCancelPendingRequest(selectedRequest, user, approvals);
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-2">
+    <div className="space-y-3 flex flex-col flex-1 min-h-0">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 shrink-0">
         <h2 className="text-xl font-bold text-zinc-900">
           {(isAdmin || isDirector || hasPermission('view_history')) ? 'All Requests' : 'My Requests'}
         </h2>
@@ -4047,48 +4070,50 @@ const WorkflowRequestList = ({
         </div>
       </div>
 
-      <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden shadow-sm">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left">
-            <thead className="bg-zinc-50 text-zinc-500 text-xs uppercase font-bold">
+      <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden shadow-sm flex-1 min-h-0 flex flex-col min-w-0">
+        <div className="overflow-auto flex-1 min-h-0 min-w-0">
+          <table className="w-full table-fixed text-left text-[11px] sm:text-xs">
+            <thead className="bg-zinc-50 text-zinc-500 text-[10px] sm:text-xs uppercase font-bold sticky top-0 z-[1] shadow-[0_1px_0_0_rgb(228_228_231)]">
               <tr>
-                <th className="px-6 py-3">
-                  <button type="button" onClick={() => toggleSort('request')} className="hover:text-zinc-700 transition-colors">
+                <th className="px-2 py-2 w-[17%] min-w-0 align-bottom">
+                  <button type="button" onClick={() => toggleSort('request')} className="hover:text-zinc-700 transition-colors text-left w-full">
                     Request{sortIndicator('request')}
                   </button>
                 </th>
-                <th className="px-6 py-3">
-                  <button type="button" onClick={() => toggleSort('entity')} className="hover:text-zinc-700 transition-colors">
+                <th className="px-2 py-2 w-[11%] min-w-0 align-bottom">
+                  <button type="button" onClick={() => toggleSort('entity')} className="hover:text-zinc-700 transition-colors text-left w-full">
                     Entity{sortIndicator('entity')}
                   </button>
                 </th>
-                <th className="px-6 py-3">
-                  <button type="button" onClick={() => toggleSort('department')} className="hover:text-zinc-700 transition-colors">
-                    Department{sortIndicator('department')}
+                <th className="px-2 py-2 w-[8%] min-w-0 align-bottom">
+                  <button type="button" onClick={() => toggleSort('department')} className="hover:text-zinc-700 transition-colors text-left w-full">
+                    Dept{sortIndicator('department')}
                   </button>
                 </th>
-                <th className="px-6 py-3">
-                  <button type="button" onClick={() => toggleSort('requester')} className="hover:text-zinc-700 transition-colors">
+                <th className="px-2 py-2 w-[10%] min-w-0 align-bottom">
+                  <button type="button" onClick={() => toggleSort('requester')} className="hover:text-zinc-700 transition-colors text-left w-full">
                     Requester{sortIndicator('requester')}
                   </button>
                 </th>
-                <th className="px-6 py-3">
-                  <button type="button" onClick={() => toggleSort('status')} className="hover:text-zinc-700 transition-colors">
+                <th className="px-2 py-2 w-[10%] min-w-0 align-bottom">
+                  <button type="button" onClick={() => toggleSort('status')} className="hover:text-zinc-700 transition-colors text-left w-full">
                     Status{sortIndicator('status')}
                   </button>
                 </th>
-                <th className="px-6 py-3">
-                  <button type="button" onClick={() => toggleSort('date')} className="hover:text-zinc-700 transition-colors">
+                <th className="px-2 py-2 w-[8%] min-w-0 align-bottom text-zinc-500">PO #</th>
+                <th className="px-2 py-2 w-[10%] min-w-0 align-bottom text-zinc-500">PO status</th>
+                <th className="px-2 py-2 w-[8%] min-w-0 align-bottom">
+                  <button type="button" onClick={() => toggleSort('date')} className="hover:text-zinc-700 transition-colors text-left w-full">
                     Date{sortIndicator('date')}
                   </button>
                 </th>
-                <th className="px-6 py-3 text-right">Actions</th>
+                <th className="px-2 py-2 w-[14%] min-w-0 align-bottom text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-100">
               {sortedFilteredRequests.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-6 py-12 text-center text-zinc-400 italic">
+                  <td colSpan={9} className="px-3 py-12 text-center text-zinc-400 italic">
                     No requests found matching filters.
                   </td>
                 </tr>
@@ -4099,37 +4124,58 @@ const WorkflowRequestList = ({
                     onClick={() => {
                       void handleViewRequest(r);
                     }}
-                    className="hover:bg-zinc-50 transition-colors text-sm cursor-pointer"
+                    className="hover:bg-zinc-50 transition-colors cursor-pointer align-top"
                   >
-                    <td className="px-6 py-4">
-                      <p className="text-sm font-semibold text-zinc-900 truncate max-w-[340px]">
+                    <td className="px-2 py-2 min-w-0">
+                      <p className="font-semibold text-zinc-900 line-clamp-2 leading-snug break-words">
                         {r.formatted_id ? `[${toUpperSerial(r.formatted_id)}] ${r.title}` : r.title}
                       </p>
-                      <p className="text-xs text-zinc-500 truncate max-w-[340px]">{r.template_name}</p>
+                      <p className="text-zinc-500 line-clamp-1 mt-0.5 break-words">{r.template_name}</p>
                     </td>
-                    <td className="px-6 py-4">
-                      <div className="flex flex-col">
-                        <span className="text-xs font-bold text-indigo-600 uppercase tracking-wide">
+                    <td className="px-2 py-2 min-w-0">
+                      <div className="flex flex-col gap-0.5 break-words hyphens-auto leading-tight">
+                        <span className="font-bold text-indigo-600 uppercase tracking-wide text-[10px] sm:text-xs">
                           {String(r.entity || '-')}
                         </span>
-                        <span className="text-[11px] text-zinc-500">
+                        <span className="text-[10px] text-zinc-500">
                           {entityLegalDisplayName(r.entity)}
                         </span>
                       </div>
                     </td>
-                    <td className="px-6 py-4 text-zinc-700 font-medium">{r.department}</td>
-                    <td className="px-6 py-4 text-zinc-700">{r.requester_name}</td>
-                    <td className="px-6 py-4">
-                      <span className={cn(
-                        "text-[10px] uppercase font-bold px-2 py-0.5 rounded-full",
-                        workflowRequestStatusBadgeClass(r)
-                      )}>
+                    <td className="px-2 py-2 text-zinc-700 font-medium break-words leading-tight">{r.department}</td>
+                    <td className="px-2 py-2 text-zinc-700 break-words leading-tight">{r.requester_name}</td>
+                    <td className="px-2 py-2 min-w-0">
+                      <span
+                        className={cn(
+                          'inline-flex text-[9px] sm:text-[10px] uppercase font-bold px-1.5 py-0.5 rounded-full leading-tight',
+                          workflowRequestStatusBadgeClass(r)
+                        )}
+                      >
                         {formatWorkflowRequestStatusLabel(r)}
                       </span>
                     </td>
-                    <td className="px-6 py-4 text-zinc-500">{new Date(r.created_at).toLocaleDateString()}</td>
-                    <td className="px-6 py-4 text-right">
-                      <div className="flex items-center justify-end gap-2">
+                    <td className="px-2 py-2 text-zinc-700 font-mono tabular-nums break-all leading-tight">
+                      {displayPoNumberInRequestTable(r)}
+                    </td>
+                    <td className="px-2 py-2 min-w-0">
+                      {showPoStatusBadgeInRequestTable(r) ? (
+                        <span
+                          className={cn(
+                            'inline-flex text-[9px] sm:text-[10px] uppercase font-bold px-1.5 py-0.5 rounded-full leading-tight',
+                            workflowRequestStatusBadgeClassFromRawStatus(
+                              isPO_Only(r) ? r.status : r.linked_po_status
+                            )
+                          )}
+                        >
+                          {displayPoStatusLabelInRequestTable(r)}
+                        </span>
+                      ) : (
+                        <span className="text-zinc-400">{displayPoStatusLabelInRequestTable(r)}</span>
+                      )}
+                    </td>
+                    <td className="px-2 py-2 text-zinc-500 whitespace-nowrap">{new Date(r.created_at).toLocaleDateString()}</td>
+                    <td className="px-2 py-2 text-right min-w-0">
+                      <div className="flex flex-col items-end gap-1">
                         {canShowConvertPRToPO(r, user) && (
                           <button
                             type="button"
@@ -4137,10 +4183,12 @@ const WorkflowRequestList = ({
                               e.stopPropagation();
                               openConvertPoModal(r);
                             }}
-                            className="inline-flex items-center gap-1.5 px-3 py-2 bg-indigo-600 text-white rounded-lg font-bold text-xs hover:bg-indigo-700 transition-colors shadow-sm"
+                            title="Convert to PO"
+                            className="inline-flex items-center justify-center gap-1 px-2 py-1 bg-indigo-600 text-white rounded-md font-bold text-[10px] hover:bg-indigo-700 transition-colors shadow-sm whitespace-nowrap"
                           >
-                            <RefreshCw className="w-3.5 h-3.5" />
-                            Convert to PO
+                            <RefreshCw className="w-3 h-3 shrink-0" />
+                            <span className="hidden lg:inline">Convert to PO</span>
+                            <span className="lg:hidden">→ PO</span>
                           </button>
                         )}
                         <button
@@ -4149,9 +4197,10 @@ const WorkflowRequestList = ({
                             e.stopPropagation();
                             void handleViewRequest(r);
                           }}
-                          className="inline-flex items-center gap-2 px-3 py-2 bg-indigo-50 text-indigo-600 rounded-lg font-bold text-xs hover:bg-indigo-100 transition-all border border-indigo-100 shadow-sm"
+                          title="Request details"
+                          className="inline-flex items-center justify-center gap-1 px-2 py-1 bg-indigo-50 text-indigo-600 rounded-md font-bold text-[10px] hover:bg-indigo-100 transition-all border border-indigo-100 shadow-sm whitespace-nowrap"
                         >
-                          <FileText className="w-4 h-4" />
+                          <FileText className="w-3 h-3 shrink-0" />
                           Details
                         </button>
                       </div>
@@ -6893,46 +6942,46 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           </div>
         </div>
 
-        <div className="flex gap-2 p-1 bg-zinc-100 rounded-xl w-fit">
+        <div className="flex flex-wrap gap-2 p-1 bg-zinc-100 rounded-xl w-full max-w-full">
           <button
             onClick={() => setActiveSubTab('pr')}
             className={cn(
-              "px-4 py-2 rounded-lg text-sm font-bold transition-all flex items-center gap-2",
+              "px-3 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all flex items-center gap-2",
               activeSubTab === 'pr' ? "bg-white text-indigo-600 shadow-sm" : "text-zinc-500 hover:text-zinc-700"
             )}
           >
-            <ClipboardList className="w-4 h-4" />
-            Purchase Requests (PR)
+            <ClipboardList className="w-4 h-4 shrink-0" />
+            <span className="whitespace-nowrap">Purchase Requests (PR)</span>
           </button>
           <button
             onClick={() => setActiveSubTab('sr')}
             className={cn(
-              "px-4 py-2 rounded-lg text-sm font-bold transition-all flex items-center gap-2",
+              "px-3 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all flex items-center gap-2",
               activeSubTab === 'sr' ? "bg-white text-indigo-600 shadow-sm" : "text-zinc-500 hover:text-zinc-700"
             )}
           >
-            <Warehouse className="w-4 h-4" />
-            Stock Requisition (SR)
+            <Warehouse className="w-4 h-4 shrink-0" />
+            <span className="whitespace-nowrap">Stock Requisition (SR)</span>
           </button>
           <button
             onClick={() => setActiveSubTab('po')}
             className={cn(
-              "px-4 py-2 rounded-lg text-sm font-bold transition-all flex items-center gap-2",
+              "px-3 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all flex items-center gap-2",
               activeSubTab === 'po' ? "bg-white text-indigo-600 shadow-sm" : "text-zinc-500 hover:text-zinc-700"
             )}
           >
-            <Package className="w-4 h-4" />
-            Purchase Orders (PO)
+            <Package className="w-4 h-4 shrink-0" />
+            <span className="whitespace-nowrap">Purchase Orders (PO)</span>
           </button>
           <button
             onClick={() => setActiveSubTab('invoice')}
             className={cn(
-              "px-4 py-2 rounded-lg text-sm font-bold transition-all flex items-center gap-2",
+              "px-3 sm:px-4 py-2 rounded-lg text-xs sm:text-sm font-bold transition-all flex items-center gap-2",
               activeSubTab === 'invoice' ? "bg-white text-indigo-600 shadow-sm" : "text-zinc-500 hover:text-zinc-700"
             )}
           >
-            <Receipt className="w-4 h-4" />
-            Invoice Requests
+            <Receipt className="w-4 h-4 shrink-0" />
+            <span className="whitespace-nowrap">Invoice Requests</span>
           </button>
         </div>
       </div>
@@ -7001,66 +7050,66 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
 
       {/* Table */}
       <div className="bg-white rounded-2xl border border-zinc-200 shadow-sm overflow-hidden flex-1 min-h-0">
-        <div className="w-full h-full overflow-auto">
-        <table className="w-full text-left border-collapse">
+        <div className="w-full h-full overflow-auto min-w-0">
+        <table className="w-full table-fixed text-left border-collapse text-[11px] sm:text-xs">
           <thead>
-            <tr className="bg-zinc-50 border-b border-zinc-200 sticky top-0 z-10">
-              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
-                <button type="button" onClick={() => toggleProcurementSort('id')} className="hover:text-zinc-700 transition-colors">
+            <tr className="bg-zinc-50 border-b border-zinc-200 sticky top-0 z-[1] shadow-[0_1px_0_0_rgb(228_228_231)]">
+              <th className="px-2 py-2 w-[6%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('id')} className="hover:text-zinc-700 transition-colors text-left w-full">
                   ID{procurementSortIndicator('id')}
                 </button>
               </th>
-              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
-                <button type="button" onClick={() => toggleProcurementSort('type')} className="hover:text-zinc-700 transition-colors">
-                  Type/Title{procurementSortIndicator('type')}
+              <th className="px-2 py-2 w-[13%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('type')} className="hover:text-zinc-700 transition-colors text-left w-full">
+                  Type{procurementSortIndicator('type')}
                 </button>
               </th>
-              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
-                <button type="button" onClick={() => toggleProcurementSort('entity')} className="hover:text-zinc-700 transition-colors">
+              <th className="px-2 py-2 w-[10%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('entity')} className="hover:text-zinc-700 transition-colors text-left w-full">
                   Entity{procurementSortIndicator('entity')}
                 </button>
               </th>
-              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
-                <button type="button" onClick={() => toggleProcurementSort('requester')} className="hover:text-zinc-700 transition-colors">
+              <th className="px-2 py-2 w-[10%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('requester')} className="hover:text-zinc-700 transition-colors text-left w-full">
                   Requester{procurementSortIndicator('requester')}
                 </button>
               </th>
-              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
-                <button type="button" onClick={() => toggleProcurementSort('items')} className="hover:text-zinc-700 transition-colors">
+              <th className="px-2 py-2 w-[14%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('items')} className="hover:text-zinc-700 transition-colors text-left w-full">
                   Items{procurementSortIndicator('items')}
                 </button>
               </th>
-              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
-                <button type="button" onClick={() => toggleProcurementSort('supplier')} className="hover:text-zinc-700 transition-colors">
+              <th className="px-2 py-2 w-[10%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('supplier')} className="hover:text-zinc-700 transition-colors text-left w-full">
                   Supplier{procurementSortIndicator('supplier')}
                 </button>
               </th>
-              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
-                <button type="button" onClick={() => toggleProcurementSort('total')} className="hover:text-zinc-700 transition-colors">
+              <th className="px-2 py-2 w-[8%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('total')} className="hover:text-zinc-700 transition-colors text-left w-full">
                   Total{procurementSortIndicator('total')}
                 </button>
               </th>
-              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
-                <button type="button" onClick={() => toggleProcurementSort('status')} className="hover:text-zinc-700 transition-colors">
+              <th className="px-2 py-2 w-[9%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('status')} className="hover:text-zinc-700 transition-colors text-left w-full">
                   Status{procurementSortIndicator('status')}
                 </button>
               </th>
-              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider">
-                <button type="button" onClick={() => toggleProcurementSort('date')} className="hover:text-zinc-700 transition-colors">
+              <th className="px-2 py-2 w-[8%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('date')} className="hover:text-zinc-700 transition-colors text-left w-full">
                   Date{procurementSortIndicator('date')}
                 </button>
               </th>
-              <th className="px-6 py-4 text-xs font-bold text-zinc-500 uppercase tracking-wider text-right">Action</th>
+              <th className="px-2 py-2 w-[12%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider text-right align-bottom">Action</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-100">
             {loading ? (
               <tr>
-                <td colSpan={10} className="px-6 py-12 text-center text-zinc-400 italic">Loading requests...</td>
+                <td colSpan={10} className="px-3 py-12 text-center text-zinc-400 italic">Loading requests...</td>
               </tr>
             ) : sortedFilteredRequests.length === 0 ? (
               <tr>
-                <td colSpan={10} className="px-6 py-12 text-center text-zinc-400 italic">{emptyProcurementListMessage}</td>
+                <td colSpan={10} className="px-3 py-12 text-center text-zinc-400 italic">{emptyProcurementListMessage}</td>
               </tr>
             ) : (
               sortedFilteredRequests.map((r) => {
@@ -7069,7 +7118,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                 return (
                   <tr 
                     key={r.id} 
-                    className="hover:bg-zinc-50 transition-colors cursor-pointer group"
+                    className="hover:bg-zinc-50 transition-colors cursor-pointer group align-top"
                     onClick={() => {
                       api.setActiveEntity(String(r.entity || '').trim() || null);
                       setSelectedRequest(r);
@@ -7081,62 +7130,62 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                       fetchDetails(r.id);
                     }}
                   >
-                    <td className="px-6 py-4 text-sm font-mono text-zinc-500">#{displayRequestSerial(r)}</td>
-                    <td className="px-6 py-4">
-                      <p className="text-sm font-bold text-zinc-900">{r.template_name}</p>
-                      <p className="text-xs text-zinc-500 truncate max-w-[150px]">{r.title}</p>
+                    <td className="px-2 py-2 font-mono text-zinc-500 tabular-nums whitespace-nowrap">#{displayRequestSerial(r)}</td>
+                    <td className="px-2 py-2 min-w-0">
+                      <p className="font-bold text-zinc-900 line-clamp-2 leading-snug break-words">{r.template_name}</p>
+                      <p className="text-zinc-500 line-clamp-1 mt-0.5 break-words">{r.title}</p>
                     </td>
-                    <td className="px-6 py-4">
-                      <div className="flex flex-col">
-                        <span className="text-xs font-bold text-indigo-600 uppercase tracking-wide">
+                    <td className="px-2 py-2 min-w-0">
+                      <div className="flex flex-col gap-0.5 break-words leading-tight">
+                        <span className="text-[10px] sm:text-xs font-bold text-indigo-600 uppercase tracking-wide">
                           {String(r.entity || '-')}
                         </span>
-                        <span className="text-[11px] text-zinc-500">
+                        <span className="text-[10px] text-zinc-500">
                           {entityLegalDisplayName(r.entity)}
                         </span>
                       </div>
                     </td>
-                    <td className="px-6 py-4">
-                      <p className="text-sm text-zinc-700 font-medium">{r.requester_name}</p>
-                      <p className="text-[10px] text-zinc-400 font-bold uppercase">{r.department}</p>
+                    <td className="px-2 py-2 min-w-0">
+                      <p className="text-zinc-700 font-medium break-words leading-tight">{r.requester_name}</p>
+                      <p className="text-[9px] text-zinc-400 font-bold uppercase">{r.department}</p>
                     </td>
-                    <td className="px-6 py-4">
-                      <div className="space-y-1">
+                    <td className="px-2 py-2 min-w-0">
+                      <div className="space-y-0.5">
                         {r.line_items?.slice(0, 2).map((item, idx) => (
-                          <div key={item.id || idx} className="text-xs text-zinc-700">
-                            <span className="font-bold text-indigo-600">{item.Quantity || item.quantity || 0}x</span> {item.Item || item.item || 'Item'}
+                          <div key={item.id || idx} className="text-zinc-700 line-clamp-2 leading-tight break-words">
+                            <span className="font-bold text-indigo-600">{item.Quantity || item.quantity || 0}x</span>{' '}
+                            {item.Item || item.item || 'Item'}
                           </div>
                         ))}
                         {r.line_items && r.line_items.length > 2 && (
-                          <p className="text-[10px] text-zinc-400 font-bold uppercase">+{r.line_items.length - 2} more items</p>
+                          <p className="text-[9px] text-zinc-400 font-bold uppercase">+{r.line_items.length - 2} more</p>
                         )}
                         {(!r.line_items || r.line_items.length === 0) && (
-                          <p className="text-sm text-zinc-400 italic">No items</p>
+                          <p className="text-zinc-400 italic">No items</p>
                         )}
                       </div>
                     </td>
-                    <td className="px-6 py-4">
-                      <p className="text-sm text-zinc-700 font-medium truncate max-w-[120px]">
+                    <td className="px-2 py-2 min-w-0">
+                      <p className="text-zinc-700 font-medium line-clamp-2 leading-tight break-words">
                         {prSuggestedSupplierDisplay(r) || '-'}
-                        {r.line_items?.length > 1 && '...'}
                       </p>
                     </td>
-                    <td className="px-6 py-4">
-                      <p className="text-sm font-bold text-zinc-900">
+                    <td className="px-2 py-2 whitespace-nowrap">
+                      <p className="font-bold text-zinc-900 tabular-nums">
                         {totalAmount > 0 ? `${procurementCurrencyPrefix(r.currency)}${totalAmount.toLocaleString()}`.trim() : '-'}
                       </p>
                     </td>
-                    <td className="px-6 py-4">
+                    <td className="px-2 py-2 min-w-0">
                       <span className={cn(
-                        "text-[10px] uppercase font-bold px-2 py-0.5 rounded-full",
+                        'inline-flex text-[9px] sm:text-[10px] uppercase font-bold px-1.5 py-0.5 rounded-full leading-tight',
                         workflowRequestStatusBadgeClass(r)
                       )}>
                         {formatWorkflowRequestStatusLabel(r)}
                       </span>
                     </td>
-                    <td className="px-6 py-4 text-sm text-zinc-500">{new Date(r.created_at).toLocaleDateString()}</td>
-                    <td className="px-6 py-4 text-right">
-                      <div className="flex flex-wrap items-center justify-end gap-2">
+                    <td className="px-2 py-2 text-zinc-500 whitespace-nowrap">{new Date(r.created_at).toLocaleDateString()}</td>
+                    <td className="px-2 py-2 text-right min-w-0">
+                      <div className="flex flex-col items-end gap-1">
                         {canShowConvertPRToPO(r, user) && (
                           <button
                             type="button"
@@ -7144,10 +7193,12 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                               e.stopPropagation();
                               openConvertPoModal(r);
                             }}
-                            className="inline-flex items-center gap-1.5 px-3 py-2 bg-indigo-600 text-white rounded-lg font-bold text-xs hover:bg-indigo-700 transition-colors shadow-sm"
+                            title="Convert to PO"
+                            className="inline-flex items-center justify-center gap-1 px-2 py-1 bg-indigo-600 text-white rounded-md font-bold text-[10px] hover:bg-indigo-700 transition-colors shadow-sm whitespace-nowrap"
                           >
-                            <RefreshCw className="w-3.5 h-3.5" />
-                            Convert to PO
+                            <RefreshCw className="w-3 h-3 shrink-0" />
+                            <span className="hidden lg:inline">Convert to PO</span>
+                            <span className="lg:hidden">→ PO</span>
                           </button>
                         )}
                         {canShowPurchasingFinalDecision(r, user) && (
@@ -7157,11 +7208,12 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                               e.stopPropagation();
                               openPurchasingDecisionModal(r, 'rejected');
                             }}
-                            className="flex items-center gap-2 px-4 py-2 bg-rose-50 text-rose-700 rounded-lg font-bold text-xs hover:bg-rose-100 transition-all border border-rose-200 shadow-sm"
+                            className="inline-flex items-center justify-center gap-1 px-2 py-1 bg-rose-50 text-rose-700 rounded-md font-bold text-[10px] hover:bg-rose-100 transition-all border border-rose-200 shadow-sm whitespace-nowrap"
                             title="Reject returns PR to requester for edit + resubmit"
                           >
-                            <XCircle className="w-4 h-4" />
-                            Reject PR
+                            <XCircle className="w-3 h-3 shrink-0" />
+                            <span className="hidden xl:inline">Reject PR</span>
+                            <span className="xl:hidden">Reject</span>
                           </button>
                         )}
                         {canShowPurchasingFinalDecision(r, user) && (
@@ -7172,10 +7224,11 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                               openPurchasingDecisionModal(r, 'cancelled');
                             }}
                             title="Cancellation is final and cannot be resubmitted"
-                            className="flex items-center gap-2 px-4 py-2 bg-rose-50 text-rose-700 rounded-lg font-bold text-xs hover:bg-rose-100 transition-all border border-rose-200 shadow-sm"
+                            className="inline-flex items-center justify-center gap-1 px-2 py-1 bg-rose-50 text-rose-700 rounded-md font-bold text-[10px] hover:bg-rose-100 transition-all border border-rose-200 shadow-sm whitespace-nowrap"
                           >
-                            <XCircle className="w-4 h-4" />
-                            Cancel PR
+                            <XCircle className="w-3 h-3 shrink-0" />
+                            <span className="hidden xl:inline">Cancel PR</span>
+                            <span className="xl:hidden">Cancel</span>
                           </button>
                         )}
                         <button
@@ -7191,9 +7244,10 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                             });
                             fetchDetails(r.id);
                           }}
-                          className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-600 rounded-lg font-bold text-xs hover:bg-indigo-100 transition-all border border-indigo-100 shadow-sm"
+                          title="Request details"
+                          className="inline-flex items-center justify-center gap-1 px-2 py-1 bg-indigo-50 text-indigo-600 rounded-md font-bold text-[10px] hover:bg-indigo-100 transition-all border border-indigo-100 shadow-sm whitespace-nowrap"
                         >
-                          <FileText className="w-4 h-4" />
+                          <FileText className="w-3 h-3 shrink-0" />
                           Details
                         </button>
                       </div>
@@ -8150,6 +8204,25 @@ export default function App() {
   const [preSelectedRequestId, setPreSelectedRequestId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const hasMultipleEntities = (user?.entities || []).length > 1;
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(FLOWMASTER_SIDEBAR_COLLAPSED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleSidebarCollapsed = useCallback(() => {
+    setSidebarCollapsed((c) => {
+      const next = !c;
+      try {
+        localStorage.setItem(FLOWMASTER_SIDEBAR_COLLAPSED_KEY, next ? '1' : '0');
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
 
   const handleEntityChange = useCallback((nextEntity: string | null) => {
     const ents = (user?.entities || []).map((e) => String(e).trim()).filter(Boolean);
@@ -8312,135 +8385,198 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-50 flex">
+    <div className="min-h-screen bg-zinc-50 flex min-w-0">
       <Toaster position="top-right" />
       
-      {/* Sidebar */}
-      <aside className="w-64 bg-white border-r border-zinc-200 flex flex-col shrink-0">
-        <div className="p-6 border-b border-zinc-100">
-          <div className="flex items-center gap-3 mb-1">
-            <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-100">
+      {/* Sidebar — collapsible rail for more horizontal space on laptop/desktop */}
+      <aside
+        className={cn(
+          'bg-white border-r border-zinc-200 flex flex-col shrink-0 transition-[width] duration-200 ease-out overflow-x-hidden overflow-y-auto',
+          sidebarCollapsed ? 'w-14' : 'w-64'
+        )}
+      >
+        <div className={cn('border-b border-zinc-100 shrink-0', sidebarCollapsed ? 'p-2' : 'p-4')}>
+          <div className={cn('flex items-center gap-2', sidebarCollapsed && 'flex-col')}>
+            <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-100 shrink-0">
               <Shield className="text-white w-4 h-4" />
             </div>
-            <span className="font-bold text-lg text-zinc-900">Approval System</span>
+            {!sidebarCollapsed && (
+              <div className="flex-1 min-w-0">
+                <span className="font-bold text-lg text-zinc-900 block leading-tight">Approval System</span>
+                <p className="text-[10px] text-zinc-400 uppercase font-bold tracking-widest mt-0.5">Approval Platform</p>
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={toggleSidebarCollapsed}
+              title={sidebarCollapsed ? 'Expand navigation' : 'Collapse navigation'}
+              aria-label={sidebarCollapsed ? 'Expand navigation' : 'Collapse navigation'}
+              className={cn(
+                'shrink-0 p-1.5 rounded-lg text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800 transition-colors',
+                sidebarCollapsed ? 'mt-1' : 'ml-auto'
+              )}
+            >
+              {sidebarCollapsed ? <ChevronsRight className="w-4 h-4" /> : <ChevronsLeft className="w-4 h-4" />}
+            </button>
           </div>
-          <p className="text-[10px] text-zinc-400 uppercase font-bold tracking-widest">Approval Platform</p>
         </div>
 
-        <nav className="flex-1 p-4 space-y-1">
+        <nav className={cn('flex-1 space-y-1', sidebarCollapsed ? 'p-1.5' : 'p-3')}>
           {canSeeDashboard && (
             <button
               onClick={() => { setActiveTab('dashboard'); setSelectedTemplateForRequest(null); }}
+              title="Dashboard"
+              aria-label="Dashboard"
               className={cn(
-                "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
-                activeTab === 'dashboard' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+                'w-full flex items-center rounded-xl text-sm font-medium transition-all',
+                sidebarCollapsed ? 'justify-center px-2 py-2.5' : 'gap-3 px-3 py-2.5',
+                activeTab === 'dashboard' ? 'bg-indigo-50 text-indigo-600' : 'text-zinc-500 hover:bg-zinc-50'
               )}
             >
-              <LayoutDashboard className="w-4 h-4" />
-              Dashboard
+              <LayoutDashboard className="w-4 h-4 shrink-0" />
+              {!sidebarCollapsed && <span className="truncate">Dashboard</span>}
             </button>
           )}
           {canSeeTemplateDesigner && (
             <button
               onClick={() => { setActiveTab('create'); setSelectedTemplateForRequest(null); }}
+              title="Design Template"
+              aria-label="Design Template"
               className={cn(
-                "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
-                activeTab === 'create' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+                'w-full flex items-center rounded-xl text-sm font-medium transition-all',
+                sidebarCollapsed ? 'justify-center px-2 py-2.5' : 'gap-3 px-3 py-2.5',
+                activeTab === 'create' ? 'bg-indigo-50 text-indigo-600' : 'text-zinc-500 hover:bg-zinc-50'
               )}
             >
-              <PlusCircle className="w-4 h-4" />
-              Design Template
+              <PlusCircle className="w-4 h-4 shrink-0" />
+              {!sidebarCollapsed && <span className="truncate">Design Template</span>}
             </button>
           )}
           {canSeeWorkflowTemplates && (
-            <button
-              onClick={() => { setActiveTab('templates'); setSelectedTemplateForRequest(null); }}
-              className={cn(
-                "w-full flex items-center justify-between px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
-                activeTab === 'templates' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
-              )}
-            >
-              <div className="flex items-center gap-3">
-                <ClipboardList className="w-4 h-4" />
-                Workflow Templates
-              </div>
-              {workflows.filter(w => w.status === 'pending').length > 0 && (
-                <span className="bg-amber-500 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full min-w-[18px] text-center">
-                  {workflows.filter(w => w.status === 'pending').length}
+            <div className="relative">
+              <button
+                onClick={() => { setActiveTab('templates'); setSelectedTemplateForRequest(null); }}
+                title="Workflow Templates"
+                aria-label="Workflow Templates"
+                className={cn(
+                  'w-full flex items-center rounded-xl text-sm font-medium transition-all',
+                  sidebarCollapsed ? 'justify-center px-2 py-2.5' : 'justify-between gap-2 px-3 py-2.5',
+                  activeTab === 'templates' ? 'bg-indigo-50 text-indigo-600' : 'text-zinc-500 hover:bg-zinc-50'
+                )}
+              >
+                <div className={cn('flex items-center min-w-0', !sidebarCollapsed && 'gap-3')}>
+                  <ClipboardList className="w-4 h-4 shrink-0" />
+                  {!sidebarCollapsed && <span className="truncate">Workflow Templates</span>}
+                </div>
+                {!sidebarCollapsed && workflows.filter((w) => w.status === 'pending').length > 0 && (
+                  <span className="bg-amber-500 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full min-w-[18px] text-center shrink-0">
+                    {workflows.filter((w) => w.status === 'pending').length}
+                  </span>
+                )}
+              </button>
+              {sidebarCollapsed && workflows.filter((w) => w.status === 'pending').length > 0 && (
+                <span className="absolute -right-0.5 -top-0.5 bg-amber-500 text-white text-[8px] font-black min-w-[14px] h-[14px] flex items-center justify-center rounded-full">
+                  {workflows.filter((w) => w.status === 'pending').length}
                 </span>
               )}
-            </button>
+            </div>
           )}
           <button
             onClick={() => { setActiveTab('submit'); setSelectedTemplateForRequest(null); }}
+            title="Submit Request"
+            aria-label="Submit Request"
             className={cn(
-              "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
-              activeTab === 'submit' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+              'w-full flex items-center rounded-xl text-sm font-medium transition-all',
+              sidebarCollapsed ? 'justify-center px-2 py-2.5' : 'gap-3 px-3 py-2.5',
+              activeTab === 'submit' ? 'bg-indigo-50 text-indigo-600' : 'text-zinc-500 hover:bg-zinc-50'
             )}
           >
-            <Send className="w-4 h-4" />
-            Submit Request
+            <Send className="w-4 h-4 shrink-0" />
+            {!sidebarCollapsed && <span className="truncate">Submit Request</span>}
           </button>
           <button
             onClick={() => { setActiveTab('requests'); setSelectedTemplateForRequest(null); }}
+            title="Approvals & Requests"
+            aria-label="Approvals & Requests"
             className={cn(
-              "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
-              activeTab === 'requests' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+              'w-full flex items-center rounded-xl text-sm font-medium transition-all',
+              sidebarCollapsed ? 'justify-center px-2 py-2.5' : 'gap-3 px-3 py-2.5',
+              activeTab === 'requests' ? 'bg-indigo-50 text-indigo-600' : 'text-zinc-500 hover:bg-zinc-50'
             )}
           >
-            <Inbox className="w-4 h-4" />
-            Approvals & Requests
+            <Inbox className="w-4 h-4 shrink-0" />
+            {!sidebarCollapsed && <span className="truncate">Approvals & Requests</span>}
           </button>
           {hasPermission('view_procurement_center') && (
             <button
               onClick={() => { setActiveTab('procurement'); setSelectedTemplateForRequest(null); }}
+              title="Procurement Center"
+              aria-label="Procurement Center"
               className={cn(
-                "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
-                activeTab === 'procurement' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+                'w-full flex items-center rounded-xl text-sm font-medium transition-all',
+                sidebarCollapsed ? 'justify-center px-2 py-2.5' : 'gap-3 px-3 py-2.5',
+                activeTab === 'procurement' ? 'bg-indigo-50 text-indigo-600' : 'text-zinc-500 hover:bg-zinc-50'
               )}
             >
-              <ShoppingCart className="w-4 h-4" />
-              Procurement Center
+              <ShoppingCart className="w-4 h-4 shrink-0" />
+              {!sidebarCollapsed && <span className="truncate">Procurement Center</span>}
             </button>
           )}
 
           {hasPermission('manage_users') && (
             <button
               onClick={() => { setActiveTab('admin'); setSelectedTemplateForRequest(null); }}
+              title="Role Management"
+              aria-label="Role Management"
               className={cn(
-                "w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium transition-all",
-                activeTab === 'admin' ? "bg-indigo-50 text-indigo-600" : "text-zinc-500 hover:bg-zinc-50"
+                'w-full flex items-center rounded-xl text-sm font-medium transition-all',
+                sidebarCollapsed ? 'justify-center px-2 py-2.5' : 'gap-3 px-3 py-2.5',
+                activeTab === 'admin' ? 'bg-indigo-50 text-indigo-600' : 'text-zinc-500 hover:bg-zinc-50'
               )}
             >
-              <Users className="w-4 h-4" />
-              Role Management
+              <Users className="w-4 h-4 shrink-0" />
+              {!sidebarCollapsed && <span className="truncate">Role Management</span>}
             </button>
           )}
         </nav>
 
-        <div className="p-4 border-t border-zinc-100">
-        <div className="flex items-center gap-3 px-4 py-3 mb-2">
-          <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center font-bold text-xs">
-            {user.username[0].toUpperCase()}
+        <div className={cn('border-t border-zinc-100 shrink-0', sidebarCollapsed ? 'p-2' : 'p-3')}>
+          <div
+            className={cn(
+              'flex items-center mb-2',
+              sidebarCollapsed ? 'flex-col gap-2 justify-center' : 'gap-3 px-1 py-2'
+            )}
+          >
+            <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center font-bold text-xs shrink-0">
+              {user.username[0].toUpperCase()}
+            </div>
+            {!sidebarCollapsed && (
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-bold text-zinc-900 truncate">{user.username}</p>
+                <p className="text-[10px] text-zinc-400 uppercase font-bold truncate">
+                  {selectedEntity} • {(user.roles || []).join(', ')}
+                </p>
+              </div>
+            )}
           </div>
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-bold text-zinc-900 truncate">{user.username}</p>
-            <p className="text-[10px] text-zinc-400 uppercase font-bold truncate">{selectedEntity} • {(user.roles || []).join(', ')}</p>
-          </div>
-        </div>
           <button
             onClick={handleLogout}
-            className="w-full flex items-center gap-3 px-4 py-2 rounded-xl text-sm font-medium text-red-500 hover:bg-red-50 transition-all"
+            title="Log out"
+            aria-label="Log out"
+            className={cn(
+              'w-full flex items-center rounded-xl text-sm font-medium text-red-500 hover:bg-red-50 transition-all',
+              sidebarCollapsed ? 'justify-center px-2 py-2' : 'gap-3 px-3 py-2'
+            )}
           >
-            <LogOut className="w-4 h-4" />
-            Logout
+            <LogOut className="w-4 h-4 shrink-0" />
+            {!sidebarCollapsed && <span>Logout</span>}
           </button>
         </div>
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 overflow-y-auto">
-        <header className="h-16 bg-white border-b border-zinc-200 flex items-center justify-between px-8 sticky top-0 z-10">
+      <main className="flex-1 min-w-0 overflow-y-auto">
+        <header className="h-14 sm:h-16 bg-white border-b border-zinc-200 flex items-center justify-between px-4 lg:px-6 sticky top-0 z-10">
           <h2 className="text-sm font-bold text-zinc-900 uppercase tracking-wider">
             {activeTab === 'dashboard' ? 'Overview' : 
              activeTab === 'create' ? 'Template Designer' : 
@@ -8584,16 +8720,18 @@ export default function App() {
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
               >
-                <div className="mb-3 text-xs text-zinc-500">
+                <div className="mb-3 text-xs text-zinc-500 shrink-0">
                   Approvals view shows requests across your accessible entities. Submission always uses the active entity in the header.
                 </div>
-                <WorkflowRequestList 
-                  requests={requests} 
-                  user={user}
-                  onRefresh={fetchRequests} 
-                  preSelectedRequestId={preSelectedRequestId}
-                  onClearPreSelected={() => setPreSelectedRequestId(null)}
-                />
+                <div className="flex-1 min-h-0 flex flex-col">
+                  <WorkflowRequestList 
+                    requests={requests} 
+                    user={user}
+                    onRefresh={fetchRequests} 
+                    preSelectedRequestId={preSelectedRequestId}
+                    onClearPreSelected={() => setPreSelectedRequestId(null)}
+                  />
+                </div>
               </motion.div>
             )}
 
