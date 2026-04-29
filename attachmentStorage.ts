@@ -81,7 +81,6 @@ const ALLOWED_ATTACHMENT_TYPES: Record<
     mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     allowedMagic: ["zip"],
   },
-  ".xls": { mime: "application/vnd.ms-excel", allowedMagic: ["ole"] },
   ".xlsx": { mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", allowedMagic: ["zip"] },
   ".csv": { mime: "text/csv", allowedMagic: ["text"], aliases: ["application/csv", "application/vnd.ms-excel"] },
   ".txt": { mime: "text/plain", allowedMagic: ["text"] },
@@ -103,7 +102,7 @@ export function validateAttachmentUpload(
   const ext = path.extname(String(originalName || "").trim()).toLowerCase();
   const cfg = ALLOWED_ATTACHMENT_TYPES[ext];
   if (!cfg) {
-    throw new Error("Unsupported file type. Allowed: PDF, PNG, JPG, DOC, DOCX, XLS, XLSX, CSV, TXT");
+    throw new Error("Unsupported file type. Allowed: PDF, PNG, JPG, DOC, DOCX, XLSX, CSV, TXT");
   }
 
   const magic = detectMagic(buffer);

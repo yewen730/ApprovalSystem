@@ -140,6 +140,10 @@ const isPOName = (name: string) => {
   return n.includes("purchase order") || n.includes("po");
 };
 
+function isXlsxFileName(fileName: string): boolean {
+  return path.extname(String(fileName || "").trim()).toLowerCase() === ".xlsx";
+}
+
 function getLineItemValue(item: any, keys: string[]): string {
   const foundKey = Object.keys(item || {}).find((k) => keys.includes(k.toLowerCase()));
   if (!foundKey) return "";
@@ -2131,7 +2135,11 @@ async function startServer() {
           `);
       requestId = ins.recordset?.[0]?.id;
       if (attachments && Array.isArray(attachments)) {
+        const allowExcelForThisRequest = String(template.category || "").toLowerCase() === "procurement";
         for (const att of attachments) {
+          if (isXlsxFileName(String(att.name || "")) && !allowExcelForThisRequest) {
+            return res.status(400).json({ error: ".xlsx attachments are only allowed for procurement requests." });
+          }
           const buf = decodeAttachmentPayload(att.data || "");
           if (!buf.length) continue;
           let rel: string | null = null;
@@ -2527,7 +2535,11 @@ async function startServer() {
           }
         }
         if (attachmentAdds) {
+          const allowExcelForThisRequest = String(request.template_category || "").toLowerCase() === "procurement";
           for (const att of attachmentAdds) {
+            if (isXlsxFileName(String(att?.name || "")) && !allowExcelForThisRequest) {
+              return res.status(400).json({ error: ".xlsx attachments are only allowed for procurement requests." });
+            }
             const buf = decodeAttachmentPayload(att?.data || "");
             let rel: string | null = null;
             try {

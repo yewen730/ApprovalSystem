@@ -6362,28 +6362,58 @@ function procurementCenterExportTabLabel(tab: ProcurementCenterExportTab): strin
   return 'Invoice';
 }
 
-/** Workbook: Export info, Requests (summary), Line items (one row per line with parent refs). */
+function csvEscape(value: unknown): string {
+  const s = value == null ? '' : String(value);
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function rowsToCsv(rows: Array<Record<string, unknown>>): string {
+  if (!rows.length) return '';
+  const headers = Array.from(
+    rows.reduce((set, row) => {
+      Object.keys(row).forEach((k) => set.add(k));
+      return set;
+    }, new Set<string>())
+  );
+  const headerLine = headers.map(csvEscape).join(',');
+  const body = rows
+    .map((row) => headers.map((h) => csvEscape(row[h])).join(','))
+    .join('\r\n');
+  return `${headerLine}\r\n${body}`;
+}
+
+function downloadCsvFile(fileName: string, csvContent: string): void {
+  const blob = new Blob([`\uFEFF${csvContent}`], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+/** Export as 3 CSV files: export info, requests summary, and line items. */
 async function downloadProcurementCenterExcel(
   rows: WorkflowRequest[],
   tab: ProcurementCenterExportTab,
   filters: { status: string; department: string; search: string; entity: string }
 ): Promise<void> {
-  const XLSX = await import('xlsx');
-  const wb = XLSX.utils.book_new();
   const tabLabel = procurementCenterExportTabLabel(tab);
   const stamp = new Date().toISOString().slice(0, 10);
 
-  const infoRows: (string | number)[][] = [
-    ['Procurement Center export'],
-    ['Exported', new Date().toLocaleString()],
-    ['List', tabLabel],
-    ['Search', filters.search.trim() || '—'],
-    ['Status', filters.status.trim() || 'All'],
-    ['Department', filters.department.trim() || '—'],
-    ['Entity filter', filters.entity.trim() || 'All'],
-    ['Row count', rows.length],
+  const infoRows = [
+    { Key: 'Title', Value: 'Procurement Center export' },
+    { Key: 'Exported', Value: new Date().toLocaleString() },
+    { Key: 'List', Value: tabLabel },
+    { Key: 'Search', Value: filters.search.trim() || '—' },
+    { Key: 'Status', Value: filters.status.trim() || 'All' },
+    { Key: 'Department', Value: filters.department.trim() || '—' },
+    { Key: 'Entity filter', Value: filters.entity.trim() || 'All' },
+    { Key: 'Row count', Value: rows.length },
   ];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(infoRows), 'Export info');
 
   const summaryRows = rows.map((r) => {
     const m = procurementMoneyTotals(r);
@@ -6422,7 +6452,6 @@ async function downloadProcurementCenterExcel(
       Details: (r.details ?? '').toString().slice(0, 8000),
     };
   });
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), 'Requests');
 
   const lineRows: Record<string, string | number>[] = [];
   for (const r of rows) {
@@ -6454,14 +6483,13 @@ async function downloadProcurementCenterExcel(
       lineRows.push(flat);
     }
   }
-  const lineSheet =
-    lineRows.length > 0
-      ? XLSX.utils.json_to_sheet(lineRows)
-      : XLSX.utils.json_to_sheet([{ Note: 'No line items in this export' }]);
-  XLSX.utils.book_append_sheet(wb, lineSheet, 'Line items');
+  const lineRowsOut =
+    lineRows.length > 0 ? lineRows : [{ Note: 'No line items in this export' }];
 
-  const fname = `Procurement_${tabLabel}_${stamp}.xlsx`.replace(/[/\\?%*:|"<>]/g, '-');
-  XLSX.writeFile(wb, fname);
+  const base = `Procurement_${tabLabel}_${stamp}`.replace(/[/\\?%*:|"<>]/g, '-');
+  downloadCsvFile(`${base}_ExportInfo.csv`, rowsToCsv(infoRows));
+  downloadCsvFile(`${base}_Requests.csv`, rowsToCsv(summaryRows as Array<Record<string, unknown>>));
+  downloadCsvFile(`${base}_LineItems.csv`, rowsToCsv(lineRowsOut as Array<Record<string, unknown>>));
 }
 
 const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: string }) => {
