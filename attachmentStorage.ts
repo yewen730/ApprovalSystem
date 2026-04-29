@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 15 * 1024 * 1024);
 
-/** Default UNC root for request attachments and related on-disk files (one folder per request under `{entity}/{requestId}/`). */
+/** Default UNC root for request attachments and related on-disk files (one folder per request under `{entity}/{department}/{formatted_id}/`). */
 export const COMPANY_FILE_STORAGE_ROOT =
   "\\\\10.128.3.10\\data\\E_IVOICING\\Approval System";
 
@@ -145,13 +145,22 @@ export function resolveStoredPath(relativePath: string): string {
 
 export function saveRequestAttachmentFile(
   entity: string,
+  department: string | null | undefined,
+  formattedId: string | null | undefined,
   requestId: number,
   originalName: string,
   buffer: Buffer,
   claimedMimeType?: string | null
 ): { relativePath: string; mimeType: string; storedFileName: string } {
   const validated = validateAttachmentUpload(originalName, claimedMimeType, buffer);
-  const dir = path.join(getAttachmentsRoot(), safeSegment(entity), String(requestId));
+  const folderId =
+    String(formattedId || "").trim() || `request_${Number.isFinite(requestId) ? String(requestId) : "unknown"}`;
+  const dir = path.join(
+    getAttachmentsRoot(),
+    safeSegment(entity),
+    safeSegment(String(department || "general")),
+    safeSegment(folderId, 128)
+  );
   fs.mkdirSync(dir, { recursive: true });
   const unique = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   const filename = `${unique}_${validated.safeFileName}`;
@@ -173,6 +182,8 @@ export function tryUnlinkStoredFile(relativePath: string | null | undefined): vo
 
 export function copyStoredFileToRequest(
   entity: string,
+  department: string | null | undefined,
+  formattedId: string | null | undefined,
   newRequestId: number,
   sourceRelativePath: string | null | undefined,
   originalFileName: string
@@ -182,7 +193,7 @@ export function copyStoredFileToRequest(
     const src = resolveStoredPath(sourceRelativePath);
     if (!fs.existsSync(src)) return null;
     const buf = fs.readFileSync(src);
-    return saveRequestAttachmentFile(entity, newRequestId, originalFileName, buf);
+    return saveRequestAttachmentFile(entity, department, formattedId, newRequestId, originalFileName, buf);
   } catch {
     return null;
   }

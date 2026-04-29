@@ -2138,6 +2138,8 @@ async function startServer() {
           try {
             const saved = saveRequestAttachmentFile(
               req.entityContext,
+              req.user.department,
+              formatted_id,
               requestId,
               String(att.name || "file"),
               buf,
@@ -2529,16 +2531,18 @@ async function startServer() {
             const buf = decodeAttachmentPayload(att?.data || "");
             let rel: string | null = null;
             try {
-            const saved = saveRequestAttachmentFile(
+              const saved = saveRequestAttachmentFile(
                 req.entityContext,
+                request.department,
+                request.formatted_id,
                 rid,
                 String(att?.name || "file"),
-              buf,
-              String(att?.type || "")
-            );
-            rel = saved.relativePath;
-            att.name = saved.storedFileName;
-            att.type = saved.mimeType;
+                buf,
+                String(att?.type || "")
+              );
+              rel = saved.relativePath;
+              att.name = saved.storedFileName;
+              att.type = saved.mimeType;
             } catch (e: any) {
               return res.status(400).json({ error: e?.message || "Failed to save attachment file" });
             }
@@ -2766,6 +2770,7 @@ async function startServer() {
           r.tax_rate,
           r.discount_rate,
           r.currency,
+          r.department,
           r.template_id,
           w.name AS template_name,
           w.category AS template_category
@@ -2869,13 +2874,27 @@ async function startServer() {
         const ent = String(request.entity || req.entityContext || "default");
         for (const att of attRs.recordset || []) {
           let relOut: string | null = null;
-          const copied = copyStoredFileToRequest(ent, newRequestId, att.file_path, att.file_name);
+          const copied = copyStoredFileToRequest(
+            ent,
+            existingSameNumber.department,
+            formatted_id,
+            newRequestId,
+            att.file_path,
+            att.file_name
+          );
           if (copied) {
             relOut = copied.relativePath;
           } else if (att.file_data) {
             const buf = decodeAttachmentPayload(att.file_data);
             if (buf.length > 0) {
-              relOut = saveRequestAttachmentFile(ent, newRequestId, String(att.file_name || "file"), buf).relativePath;
+              relOut = saveRequestAttachmentFile(
+                ent,
+                existingSameNumber.department,
+                formatted_id,
+                newRequestId,
+                String(att.file_name || "file"),
+                buf
+              ).relativePath;
             }
           }
           await sqlPool
@@ -2960,13 +2979,27 @@ async function startServer() {
       const ent = String(request.entity || req.entityContext || "default");
       for (const att of attRs.recordset || []) {
         let relOut: string | null = null;
-        const copied = copyStoredFileToRequest(ent, newRequestId, att.file_path, att.file_name);
+        const copied = copyStoredFileToRequest(
+          ent,
+          request.department,
+          formatted_id,
+          newRequestId,
+          att.file_path,
+          att.file_name
+        );
         if (copied) {
           relOut = copied.relativePath;
         } else if (att.file_data) {
           const buf = decodeAttachmentPayload(att.file_data);
           if (buf.length > 0) {
-            relOut = saveRequestAttachmentFile(ent, newRequestId, String(att.file_name || "file"), buf).relativePath;
+            relOut = saveRequestAttachmentFile(
+              ent,
+              request.department,
+              formatted_id,
+              newRequestId,
+              String(att.file_name || "file"),
+              buf
+            ).relativePath;
           }
         }
         await sqlPool
