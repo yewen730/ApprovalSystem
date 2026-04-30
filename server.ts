@@ -400,12 +400,53 @@ const PR_SIGN_ON_BEHALF_USERNAMES_LOWER = (process.env.PR_SIGN_ON_BEHALF_USERNAM
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
+/** Only these nominal approvers may be proxied by Gracelyn (comma-separated usernames). */
+const PR_SIGN_ON_BEHALF_ALLOWED_APPROVERS_LOWER = (
+  process.env.PR_SIGN_ON_BEHALF_ALLOWED_APPROVERS ||
+  "Ting Bing Keh,Law Choon Chien,YAU TEE WAN,Boon Leong Lau"
+)
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
 function isPrSignOnBehalfDelegate(username: string | null | undefined): boolean {
   const n = String(username ?? "")
     .trim()
     .toLowerCase();
   if (!n) return false;
   return PR_SIGN_ON_BEHALF_USERNAMES_LOWER.includes(n);
+}
+
+function isAllowedPrProxyApproverUsername(username: string | null | undefined): boolean {
+  const n = String(username ?? "")
+    .trim()
+    .toLowerCase();
+  if (!n) return false;
+  return PR_SIGN_ON_BEHALF_ALLOWED_APPROVERS_LOWER.includes(n);
+}
+
+let prProxyApproverIdsCache: { atMs: number; ids: number[] } | null = null;
+async function getPrProxyApproverIds(pool: sql.ConnectionPool): Promise<number[]> {
+  const now = Date.now();
+  // Cache for 60s to avoid hammering SQL while users refresh.
+  if (prProxyApproverIdsCache && now - prProxyApproverIdsCache.atMs < 60_000) {
+    return prProxyApproverIdsCache.ids;
+  }
+  const names = PR_SIGN_ON_BEHALF_ALLOWED_APPROVERS_LOWER;
+  if (names.length === 0) return [];
+  const rs = await pool
+    .request()
+    .query(`SELECT id, username FROM ${SQLSERVER_USERS_TABLE} ORDER BY username ASC`);
+  const ids: number[] = [];
+  for (const u of rs.recordset || []) {
+    const uname = String((u as any)?.username ?? "").trim().toLowerCase();
+    if (uname && names.includes(uname)) {
+      const id = Number((u as any)?.id);
+      if (Number.isFinite(id) && id > 0) ids.push(id);
+    }
+  }
+  prProxyApproverIdsCache = { atMs: now, ids };
+  return ids;
 }
 
 /**
@@ -2051,19 +2092,30 @@ async function startServer() {
           ORDER BY r.created_at DESC
         `);
       const requests = rs.recordset || [];
-      return res.json(
-        requests.map((r: any) => {
-          const { computed_requester_name, ...row } = r;
-          return {
-            ...row,
-            requester_name: computed_requester_name ?? row.requester_name,
-            template_steps: JSON.parse(row.template_steps),
-            table_columns: row.table_columns ? JSON.parse(row.table_columns) : [],
-            line_items: row.line_items ? JSON.parse(row.line_items) : [],
-            attachments_required: !!row.attachments_required,
-          };
-        })
-      );
+      const mapped = requests.map((r: any) => {
+        const { computed_requester_name, ...row } = r;
+        return {
+          ...row,
+          requester_name: computed_requester_name ?? row.requester_name,
+          template_steps: JSON.parse(row.template_steps),
+          table_columns: row.table_columns ? JSON.parse(row.table_columns) : [],
+          line_items: row.line_items ? JSON.parse(row.line_items) : [],
+          attachments_required: !!row.attachments_required,
+        };
+      });
+      // Special case: PR proxy delegate (Gracelyn) only sees pending PRs assigned to allowed approvers.
+      if (prSignOnBehalfDelegate) {
+        const allowIds = new Set(await getPrProxyApproverIds(sqlPool));
+        const out = mapped.filter((r: any) => {
+          if (String(r?.category || "").toLowerCase() !== "procurement") return false;
+          if (!isPRName(String(r?.template_name || ""))) return false;
+          if (String(r?.status || "").toLowerCase() !== "pending") return false;
+          const aid = Number(r?.assigned_approver_id);
+          return Number.isFinite(aid) && aid > 0 && allowIds.has(aid);
+        });
+        return res.json(out);
+      }
+      return res.json(mapped);
     } catch (e: any) {
       console.error("SQL GET /api/workflow-requests:", e?.message || e);
       return res.status(500).json({ error: "Failed to load workflow requests" });
@@ -3198,8 +3250,11 @@ async function startServer() {
       return res.status(500).json({ error: "Failed to load users" });
     }
     const entUpper = String(request.entity ?? "").trim().toUpperCase();
+    const allowIds = new Set(await getPrProxyApproverIds(sqlPool));
     const out: { id: number; username: string; department: string }[] = [];
     for (const u of rs.recordset || []) {
+      const uid = Number(u.id);
+      if (!allowIds.has(uid)) continue;
       if (!userRowHasEntityAccess(u, entUpper)) continue;
       const roles = parseCommaSeparatedList(u?.role ?? "");
       const roleLower = roles.map((r) => String(r).toLowerCase());
@@ -3257,6 +3312,9 @@ async function startServer() {
     if (useOnBehalf) {
       onBehalfNominal = await fetchSqlUsersettingById(sqlPool, onBehalfParsed);
       if (!onBehalfNominal) return res.status(400).json({ error: "Invalid on_behalf_of_approver_id" });
+      if (!isAllowedPrProxyApproverUsername(String(onBehalfNominal?.username || ""))) {
+        return res.status(403).json({ error: "Selected approver is not allowed for proxy signing" });
+      }
       const entUpper = String(request.entity ?? "").trim().toUpperCase();
       if (entUpper && !userRowHasEntityAccess(onBehalfNominal, entUpper)) {
         return res.status(400).json({ error: "Selected approver does not have entity access" });
