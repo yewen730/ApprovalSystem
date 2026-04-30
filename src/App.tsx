@@ -1222,7 +1222,7 @@ const SignaturePad = ({
           className="text-xs text-zinc-500 hover:text-zinc-700 font-medium flex items-center gap-1"
         >
           <RotateCcw className="w-3 h-3" />
-          Clear
+          Cleared
         </button>
         <button
           type="button"
