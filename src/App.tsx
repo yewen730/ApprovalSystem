@@ -1358,6 +1358,24 @@ const departmentsOverlap = (left: string | undefined, right: string | undefined)
   return rightList.some((d) => lset.has(d));
 };
 
+/** Must match server `PR_SIGN_ON_BEHALF_USERNAMES` (display names, comma-separated). */
+const parsePrSignOnBehalfUsernames = () => {
+  const raw = (import.meta as any).env?.VITE_PR_SIGN_ON_BEHALF_USERNAMES as string | undefined;
+  const s = (raw && String(raw).trim()) || 'Gracelyn Tong';
+  return s
+    .split(',')
+    .map((x) => x.trim().toLowerCase())
+    .filter(Boolean);
+};
+
+const isPrSignOnBehalfUser = (user: User | null | undefined) => {
+  const n = String(user?.username || '')
+    .trim()
+    .toLowerCase();
+  if (!n) return false;
+  return parsePrSignOnBehalfUsernames().includes(n);
+};
+
 const getColumns = (item: any) => {
   if (!item) return [];
   if (isPO_Only(item)) return PO_COLUMNS;
@@ -1376,7 +1394,12 @@ const userCanApproveWorkflowStep = (user: User, request: WorkflowRequest, curren
   if (isAdmin || isDirector) return true;
   if (role === 'som' && isSom) return true;
   const ent = (request.entity || '').trim().toUpperCase();
-  const pick = request.assigned_approver_id != null ? Number(request.assigned_approver_id) : NaN;
+  if (
+    isPrSignOnBehalfUser(user) &&
+    isPRRequest(request) &&
+    role === 'approver'
+  )
+    return true;
   if (
     ent === 'GCCM' &&
     role === 'approver' &&
@@ -1857,6 +1880,15 @@ const printProcurementPRFormPdf = (request: WorkflowRequest) => {
       doc.text(ln, mid + 2, yDesPr);
       yDesPr += 3.2;
     });
+    const proxyName = String(hodApproval?.signed_by_name ?? '').trim();
+    if (proxyName) {
+      doc.setFontSize(7);
+      doc.setTextColor(67, 56, 202);
+      doc.text(`Signed by proxy: ${proxyName}`, mid + 2, yDesPr);
+      doc.setTextColor(0, 0, 0);
+      doc.setFontSize(8);
+      yDesPr += 3.2;
+    }
     doc.setFontSize(8);
     doc.text(new Date(request.created_at).toLocaleDateString(), left + 2, signBottom - 2);
     doc.text(
@@ -2451,6 +2483,16 @@ const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
     doc.setFont('helvetica', 'normal');
     if (approval) {
       doc.text(`${approval.status.toUpperCase()} by ${approval.approver_name} on ${new Date(approval.created_at).toLocaleDateString()}`, margin + 50, y);
+      let stepH = 12;
+      const proxyNm = String(approval.signed_by_name ?? '').trim();
+      if (proxyNm) {
+        doc.setFontSize(8);
+        doc.setTextColor(67, 56, 202);
+        doc.text(`Signed by proxy: ${proxyNm}`, margin + 50, y + 4);
+        doc.setTextColor(0, 0, 0);
+        doc.setFontSize(10);
+        stepH = 16;
+      }
       const asig = approval.approver_signature;
       if (isSignatureImageDataUrl(asig)) {
         try {
@@ -2463,10 +2505,11 @@ const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
         doc.text('E-signed', margin + 128, y - 2);
         doc.setFontSize(10);
       }
+      y += stepH;
     } else {
       doc.text('Pending', margin + 50, y);
+      y += 12;
     }
-    y += 12;
   });
 
   return buildPdfPreview(doc, `PR_${displayRequestSerial(request)}.pdf`);
@@ -3480,6 +3523,9 @@ const WorkflowRequestList = ({
   const [detailsViewMode, setDetailsViewMode] = useState<'details' | 'pdf'>('details');
   const [detailsPdfPreview, setDetailsPdfPreview] = useState<{ url: string; fileName: string } | null>(null);
   const [convertPoModal, setConvertPoModal] = useState<ConvertPoModalTarget | null>(null);
+  const [onBehalfOptions, setOnBehalfOptions] = useState<{ id: number; username: string; department: string }[]>([]);
+  const [onBehalfApproverId, setOnBehalfApproverId] = useState<number | ''>('');
+  const [onBehalfLoading, setOnBehalfLoading] = useState(false);
 
   useEffect(() => {
     if (preSelectedRequestId) {
@@ -3509,6 +3555,53 @@ const WorkflowRequestList = ({
       cancelled = true;
     };
   }, []);
+
+  const prAtApproverStepForBehalf =
+    !!selectedRequest &&
+    isPRRequest(selectedRequest) &&
+    isWorkflowRequestPending(selectedRequest) &&
+    (() => {
+      const st = selectedRequest.template_steps[selectedRequest.current_step_index];
+      return st?.approverRole?.toLowerCase() === 'approver';
+    })();
+  const mustPickOnBehalf = prAtApproverStepForBehalf && isPrSignOnBehalfUser(user);
+  const assignedApproverForSelected =
+    mustPickOnBehalf && selectedRequest?.assigned_approver_id != null
+      ? Number(selectedRequest.assigned_approver_id)
+      : NaN;
+  const hasFixedAssignedApprover =
+    mustPickOnBehalf && Number.isFinite(assignedApproverForSelected) && assignedApproverForSelected > 0;
+
+  useEffect(() => {
+    if (!mustPickOnBehalf || !selectedRequest) {
+      setOnBehalfOptions([]);
+      setOnBehalfApproverId('');
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setOnBehalfLoading(true);
+      try {
+        api.setActiveEntity(String(selectedRequest.entity || '').trim() || null);
+        const list = await api.request(`/api/workflow-requests/${selectedRequest.id}/on-behalf-approver-options`);
+        if (!cancelled && Array.isArray(list)) setOnBehalfOptions(list);
+      } catch {
+        if (!cancelled) setOnBehalfOptions([]);
+      } finally {
+        if (!cancelled) setOnBehalfLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [mustPickOnBehalf, selectedRequest?.id]);
+
+  useEffect(() => {
+    if (!mustPickOnBehalf) return;
+    if (hasFixedAssignedApprover) {
+      setOnBehalfApproverId(assignedApproverForSelected);
+    }
+  }, [mustPickOnBehalf, hasFixedAssignedApprover, assignedApproverForSelected]);
 
   const hasPermission = (permission: string) => {
     if (!user) return false;
@@ -3580,6 +3673,7 @@ const WorkflowRequestList = ({
     });
     setComment('');
     setApproverSignature(null);
+    setOnBehalfApproverId('');
     setIsEditing(false);
     setDetailsViewMode('details');
     setDetailsPdfPreview((prev) => {
@@ -3724,6 +3818,12 @@ const WorkflowRequestList = ({
     if (status === 'approved' && needSig && !approverSignature) {
       return toast.error('Signature is required to approve this document');
     }
+    if (
+      mustPickOnBehalf &&
+      (onBehalfApproverId === '' || !Number.isFinite(Number(onBehalfApproverId)))
+    ) {
+      return toast.error('Select which approver you are signing on behalf of');
+    }
     setLoading(true);
     try {
       const sendSig = needSig && approverSignature ? approverSignature : undefined;
@@ -3734,6 +3834,9 @@ const WorkflowRequestList = ({
           comment,
           approver_signed: !!sendSig,
           approver_signature: sendSig,
+          ...(mustPickOnBehalf && onBehalfApproverId !== ''
+            ? { on_behalf_of_approver_id: Number(onBehalfApproverId) }
+            : {}),
         }),
       });
       toast.success(`Request ${status}`);
@@ -3741,6 +3844,7 @@ const WorkflowRequestList = ({
       setSelectedRequest(null);
       setComment('');
       setApproverSignature(null);
+      setOnBehalfApproverId('');
     } catch (err: any) {
       toast.error(err.message);
     } finally {
@@ -4983,6 +5087,11 @@ const WorkflowRequestList = ({
                                         ) : null}
                                         <div>
                                           <p className="text-xs font-bold text-zinc-900">{approval.approver_name}</p>
+                                          {approval.signed_by_name ? (
+                                            <p className="text-[10px] text-indigo-600 font-medium">
+                                              Signed by proxy: {approval.signed_by_name}
+                                            </p>
+                                          ) : null}
                                           <p className="text-[10px] text-zinc-400">{new Date(approval.created_at).toLocaleDateString()}</p>
                                         </div>
                                       </div>
@@ -5020,6 +5129,42 @@ const WorkflowRequestList = ({
                           </div>
 
                           <div className="space-y-6">
+                            {mustPickOnBehalf && (
+                              <div>
+                                <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">
+                                  Sign on behalf of <span className="text-red-500 ml-1">* Required</span>
+                                </label>
+                                <select
+                                  className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+                                  value={onBehalfApproverId === '' ? '' : String(onBehalfApproverId)}
+                                  onChange={(e) => {
+                                    const v = e.target.value;
+                                    setOnBehalfApproverId(v === '' ? '' : Number(v));
+                                  }}
+                                  disabled={hasFixedAssignedApprover || onBehalfLoading || onBehalfOptions.length === 0}
+                                >
+                                  <option value="">
+                                    {onBehalfLoading ? 'Loading approvers…' : 'Select approver'}
+                                  </option>
+                                  {onBehalfOptions.map((u) => (
+                                    <option key={u.id} value={u.id}>
+                                      {u.username}
+                                      {u.department ? ` — ${u.department}` : ''}
+                                    </option>
+                                  ))}
+                                </select>
+                                {hasFixedAssignedApprover ? (
+                                  <p className="text-[11px] text-zinc-500 mt-1">
+                                    Fixed by requester selection for this PR.
+                                  </p>
+                                ) : null}
+                                {!onBehalfLoading && onBehalfOptions.length === 0 ? (
+                                  <p className="text-xs text-amber-700 mt-1">
+                                    No eligible approvers for this request.
+                                  </p>
+                                ) : null}
+                              </div>
+                            )}
                             <div>
                               <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Comment (Optional)</label>
                               <textarea
@@ -8079,6 +8224,11 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                         ) : null}
                                         <div>
                                           <p className="text-xs font-bold text-zinc-900">{approval.approver_name}</p>
+                                          {approval.signed_by_name ? (
+                                            <p className="text-[10px] text-indigo-600 font-medium">
+                                              Signed by proxy: {approval.signed_by_name}
+                                            </p>
+                                          ) : null}
                                           <p className="text-[10px] text-zinc-400">{new Date(approval.created_at).toLocaleDateString()}</p>
                                         </div>
                                       </div>

@@ -114,5 +114,9 @@ export interface RequestApproval {
   comment: string;
   /** Approver pad image as data URL; NVARCHAR(MAX) for PDFs. */
   approver_signature?: string;
+  /** When set, a delegate (e.g. sign-on-behalf) recorded the signature for `approver_id`. */
+  signed_by_user_id?: number | null;
+  /** Display name of the user who signed on behalf (from server join). */
+  signed_by_name?: string | null;
   created_at: string;
 }

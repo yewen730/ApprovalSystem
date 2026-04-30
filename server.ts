@@ -394,6 +394,122 @@ function userDepartmentsMatch(a: string | null | undefined, b: string | null | u
   return right.some((d) => left.has(d));
 }
 
+/** Comma-separated display names in env `PR_SIGN_ON_BEHALF_USERNAMES`; defaults to Gracelyn Tong. */
+const PR_SIGN_ON_BEHALF_USERNAMES_LOWER = (process.env.PR_SIGN_ON_BEHALF_USERNAMES || "Gracelyn Tong")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+function isPrSignOnBehalfDelegate(username: string | null | undefined): boolean {
+  const n = String(username ?? "")
+    .trim()
+    .toLowerCase();
+  if (!n) return false;
+  return PR_SIGN_ON_BEHALF_USERNAMES_LOWER.includes(n);
+}
+
+/**
+ * Whether `effectiveUserId` may approve the current workflow step (same rules as POST /approve).
+ * Used for sign-on-behalf candidate lists and server-side validation.
+ */
+async function evaluateApproverStepPermission(
+  pool: sql.ConnectionPool,
+  request: any,
+  currentStep: any,
+  effectiveUserId: number
+): Promise<boolean> {
+  const actorRow = await fetchSqlUsersettingById(pool, effectiveUserId);
+  if (!actorRow) return false;
+  const actorRoles = parseCommaSeparatedList(actorRow?.role ?? "");
+  const actorDepartment = actorRow?.department ?? "";
+
+  const userIsAdmin = actorRoles.some((r) => r.toLowerCase() === "admin");
+  const userIsDirector =
+    actorRoles.some((r) => r.toLowerCase() === "director") &&
+    userHasDepartment(actorDepartment, "management");
+  const roleLower = String(currentStep?.approverRole || "").toLowerCase();
+  const isAssignedApproverStep = request.assigned_approver_id != null && roleLower === "approver";
+  const assignedId = Number(request.assigned_approver_id);
+  const userIsAssignedApprover =
+    isAssignedApproverStep && Number.isFinite(assignedId) && assignedId > 0 && Number(effectiveUserId) === assignedId;
+
+  const userHasRole = actorRoles.some((r) => r.toLowerCase() === currentStep.approverRole.toLowerCase());
+  const userHasApproverRole = actorRoles.some((r) => r.toLowerCase() === "approver");
+  const userDeptMatchRequest = userDepartmentsMatch(actorDepartment, request.department);
+  const userIsSom =
+    actorRoles.some((r) => r.toLowerCase() === "som") && userHasDepartment(actorDepartment, "management");
+  const somStep = roleLower === "som";
+  let approverStepTotalMyr: number | null = null;
+  let currentUserLimitMyr: number | null = null;
+  let assignedApproverInsufficient = false;
+  if (roleLower === "approver") {
+    let lineItemsForLimit: any[] = [];
+    try {
+      lineItemsForLimit = JSON.parse(request.line_items || "[]");
+    } catch {
+      lineItemsForLimit = [];
+    }
+    approverStepTotalMyr = computeRequestTotalMyr(
+      lineItemsForLimit,
+      request.tax_rate,
+      String(request.currency ?? "").trim(),
+      request.discount_rate
+    );
+    const entForLimitCheck = String(request.entity ?? "").trim();
+    currentUserLimitMyr = await getUserApprovalLimitMyr(pool, Number(effectiveUserId), entForLimitCheck);
+    if (isAssignedApproverStep && Number.isFinite(assignedId) && assignedId > 0) {
+      const assignedApproverLimitMyr = await getUserApprovalLimitMyr(pool, assignedId, entForLimitCheck);
+      assignedApproverInsufficient =
+        assignedApproverLimitMyr !== null &&
+        approverStepTotalMyr !== null &&
+        approverStepTotalMyr > assignedApproverLimitMyr;
+    }
+  }
+  const currentUserCanCoverApproverTotal =
+    approverStepTotalMyr !== null &&
+    (currentUserLimitMyr === null || approverStepTotalMyr <= currentUserLimitMyr);
+  const roleBasedApprovalAllowed = isAssignedApproverStep
+    ? (userIsAssignedApprover && userDeptMatchRequest) ||
+      (!userIsAssignedApprover &&
+        !!userHasApproverRole &&
+        userDeptMatchRequest &&
+        assignedApproverInsufficient &&
+        currentUserCanCoverApproverTotal)
+    : userHasRole && userDeptMatchRequest;
+  return (
+    userIsAdmin ||
+    userIsDirector ||
+    (somStep && userIsSom) ||
+    roleBasedApprovalAllowed
+  );
+}
+
+async function approverStepLimitBlocksApproval(
+  pool: sql.ConnectionPool,
+  request: any,
+  effectiveUserId: number
+): Promise<{ blocked: boolean; total?: number; limit?: number | null }> {
+  let lineItemsForLimit: any[] = [];
+  try {
+    lineItemsForLimit = JSON.parse(request.line_items || "[]");
+  } catch {
+    lineItemsForLimit = [];
+  }
+  const approverStepTotalMyr = computeRequestTotalMyr(
+    lineItemsForLimit,
+    request.tax_rate,
+    String(request.currency ?? "").trim(),
+    request.discount_rate
+  );
+  const rawLimit = await getUserApprovalLimitMyr(pool, Number(effectiveUserId), String(request.entity ?? "").trim());
+  // Some environments store "no limit configured" as 0; treat <= 0 as unlimited.
+  const userLimitMyr = rawLimit !== null && rawLimit > 0 ? rawLimit : null;
+  if (userLimitMyr !== null && approverStepTotalMyr > userLimitMyr) {
+    return { blocked: true, total: approverStepTotalMyr, limit: userLimitMyr };
+  }
+  return { blocked: false };
+}
+
 async function fetchSqlUsersettingById(pool: sql.ConnectionPool, userId: number): Promise<any | null> {
   try {
     const rs = await pool.request().input("id", sql.Int, Number(userId)).query(`SELECT TOP 1 * FROM ${SQLSERVER_USERS_TABLE} WHERE id = @id`);
@@ -601,6 +717,8 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
         ALTER TABLE request_approvals ADD request_formatted_id_snapshot NVARCHAR(255) NULL;
       IF COL_LENGTH('request_approvals', 'approver_role_snapshot') IS NULL
         ALTER TABLE request_approvals ADD approver_role_snapshot NVARCHAR(255) NULL;
+      IF COL_LENGTH('request_approvals', 'signed_by_user_id') IS NULL
+        ALTER TABLE request_approvals ADD signed_by_user_id INT NULL;
       IF COL_LENGTH('workflow_requests', 'requester_username_snapshot') IS NULL
         ALTER TABLE workflow_requests ADD requester_username_snapshot NVARCHAR(255) NULL;
       IF COL_LENGTH('workflow_requests', 'template_name_snapshot') IS NULL
@@ -1904,7 +2022,8 @@ async function startServer() {
         entityClause = ` AND r.entity IN (${params.join(", ")})`;
       }
       let deptClause = "";
-      if (!isAdminUser(req) && !isDirectorUser(req) && !isSomUser(req)) {
+      const prSignOnBehalfDelegate = isPrSignOnBehalfDelegate(String(req.user?.username || ""));
+      if (!isAdminUser(req) && !isDirectorUser(req) && !isSomUser(req) && !prSignOnBehalfDelegate) {
         const userDepartments = parseCommaSeparatedList(req.user.department);
         if (userDepartments.length === 0) return res.json([]);
         const deptParams: string[] = [];
@@ -2274,9 +2393,11 @@ async function startServer() {
     const requestRow = rr.recordset?.[0];
     if (!assertWorkflowRequestAccess(req, res, requestRow, requestRow?.template_category)) return;
     const appr = await sqlPool.request().input("request_id", sql.Int, Number(req.params.id)).query(`
-        SELECT a.*, u.username AS approver_name, u.designation AS approver_designation
+        SELECT a.*, u.username AS approver_name, u.designation AS approver_designation,
+          su.username AS signed_by_name
         FROM request_approvals a
         INNER JOIN ${userJoinSql} u ON a.approver_id = u.id
+        LEFT JOIN ${userJoinSql} su ON a.signed_by_user_id = su.id
         WHERE a.request_id = @request_id
         ORDER BY a.created_at ASC
       `);
@@ -2348,9 +2469,11 @@ async function startServer() {
             .request()
             .input("rid", sql.Int, Number(r.id))
             .query(`
-            SELECT a.*, u.username AS approver_name, u.designation AS approver_designation
+            SELECT a.*, u.username AS approver_name, u.designation AS approver_designation,
+              su.username AS signed_by_name
             FROM request_approvals a
             INNER JOIN ${userJoinSql} u ON a.approver_id = u.id
+            LEFT JOIN ${userJoinSql} su ON a.signed_by_user_id = su.id
             WHERE a.request_id = @rid
             ORDER BY a.created_at ASC
           `);
@@ -3035,8 +3158,65 @@ async function startServer() {
     }
   });
 
+  app.get("/api/workflow-requests/:id/on-behalf-approver-options", authenticate, requireEntityContext, async (req: any, res) => {
+    if (!isPrSignOnBehalfDelegate(String(req.user?.username || ""))) {
+      return res.status(403).json({ error: "Not permitted" });
+    }
+    const requestId = Number(req.params.id);
+    if (!Number.isFinite(requestId) || requestId <= 0) return res.status(400).json({ error: "Invalid request id" });
+    const rqAppr = await sqlPool.request().input("id", sql.Int, requestId).query(`
+        SELECT r.*, COALESCE(r.request_steps, w.steps) AS template_steps, w.category AS template_category,
+          COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.template_name_snapshot AS NVARCHAR(255)))), N''), w.name) AS template_name_resolved
+        FROM workflow_requests r
+        INNER JOIN workflows w ON r.template_id = w.id
+        WHERE r.id = @id
+      `);
+    const request: any = rqAppr.recordset?.[0];
+    if (!assertWorkflowRequestAccess(req, res, request, request?.template_category)) return;
+    if (!request) return res.status(404).json({ error: "Request not found" });
+    if (request.status !== "pending") return res.status(400).json({ error: "Request is not pending" });
+    let steps: any[];
+    try {
+      steps = JSON.parse(request.template_steps);
+    } catch {
+      return res.status(400).json({ error: "Invalid workflow steps" });
+    }
+    const currentStep = steps[request.current_step_index];
+    const tplName = String(request.template_name_resolved || "");
+    if (!(request.template_category === "procurement" && isPRName(tplName))) {
+      return res.status(400).json({ error: "Sign-on-behalf applies only to purchase requests" });
+    }
+    if (String(currentStep?.approverRole || "").toLowerCase() !== "approver") {
+      return res.status(400).json({ error: "Not at approver step" });
+    }
+    let rs;
+    try {
+      rs = await sqlPool.request().query(
+        `SELECT id, username, role, department, entities FROM ${SQLSERVER_USERS_TABLE} ORDER BY username ASC`
+      );
+    } catch {
+      return res.status(500).json({ error: "Failed to load users" });
+    }
+    const entUpper = String(request.entity ?? "").trim().toUpperCase();
+    const out: { id: number; username: string; department: string }[] = [];
+    for (const u of rs.recordset || []) {
+      if (!userRowHasEntityAccess(u, entUpper)) continue;
+      const roles = parseCommaSeparatedList(u?.role ?? "");
+      const roleLower = roles.map((r) => String(r).toLowerCase());
+      const isApproverLike =
+        roleLower.includes("approver") ||
+        roleLower.includes("admin") ||
+        roleLower.includes("director") ||
+        roleLower.includes("som");
+      if (!isApproverLike) continue;
+      out.push({ id: Number(u.id), username: String(u.username || ""), department: String(u.department || "") });
+    }
+    out.sort((a, b) => a.username.localeCompare(b.username, undefined, { sensitivity: "base" }));
+    return res.json(out);
+  });
+
   app.post("/api/workflow-requests/:id/approve", authenticate, requireEntityContext, async (req: any, res) => {
-    const { status, comment, approver_signature } = req.body;
+    const { status, comment, approver_signature, on_behalf_of_approver_id } = req.body;
     const requestId = req.params.id;
     const approverSigned = bodyIndicatesApproverSigned(req.body);
     const approverSigStored =
@@ -3056,74 +3236,48 @@ async function startServer() {
 
     const steps = JSON.parse(request.template_steps);
     const currentStep = steps[request.current_step_index];
-    const actorRow = await fetchSqlUsersettingById(sqlPool, Number(req.user.id));
-    const actorRoles = parseCommaSeparatedList(actorRow?.role ?? req.user.roles);
-    const actorDepartment = actorRow?.department ?? req.user.department;
-
-    const userIsAdmin = actorRoles.some((r) => r.toLowerCase() === "admin");
-    const userIsDirector =
-      actorRoles.some((r) => r.toLowerCase() === "director") &&
-      userHasDepartment(actorDepartment, "management");
     const roleLower = String(currentStep?.approverRole || "").toLowerCase();
-    const isAssignedApproverStep = request.assigned_approver_id != null && roleLower === "approver";
-    const assignedId = Number(request.assigned_approver_id);
-    const userIsAssignedApprover =
-      isAssignedApproverStep && Number.isFinite(assignedId) && assignedId > 0 && Number(req.user.id) === assignedId;
+    const tplName = String(request.template_name_resolved || "");
+    const isPRDoc = request.template_category === "procurement" && isPRName(tplName);
+    const delegate = isPrSignOnBehalfDelegate(String(req.user?.username || ""));
+    const onBehalfRaw = Number(on_behalf_of_approver_id);
+    const assigned = Number(request.assigned_approver_id);
+    const fixedFromRequest = Number.isFinite(assigned) && assigned > 0 ? assigned : NaN;
+    const onBehalfParsed =
+      Number.isFinite(onBehalfRaw) && onBehalfRaw > 0 ? onBehalfRaw : fixedFromRequest;
+    const useOnBehalf =
+      delegate &&
+      isPRDoc &&
+      roleLower === "approver" &&
+      Number.isFinite(onBehalfParsed) &&
+      onBehalfParsed > 0;
 
-    const userHasRole = actorRoles.some((r) => r.toLowerCase() === currentStep.approverRole.toLowerCase());
-    const userHasApproverRole = actorRoles.some((r) => r.toLowerCase() === "approver");
-    const userDeptMatchRequest = userDepartmentsMatch(actorDepartment, request.department);
-    const userIsSom =
-      actorRoles.some((r) => r.toLowerCase() === "som") &&
-      userHasDepartment(actorDepartment, "management");
-    const somStep = roleLower === "som";
-    let approverStepTotalMyr: number | null = null;
-    let currentUserLimitMyr: number | null = null;
-    let assignedApproverInsufficient = false;
-    if (roleLower === "approver") {
-      let lineItemsForLimit: any[] = [];
-      try {
-        lineItemsForLimit = JSON.parse(request.line_items || "[]");
-      } catch {
-        lineItemsForLimit = [];
+    let canApprove: boolean;
+    let onBehalfNominal: any | null = null;
+    if (useOnBehalf) {
+      onBehalfNominal = await fetchSqlUsersettingById(sqlPool, onBehalfParsed);
+      if (!onBehalfNominal) return res.status(400).json({ error: "Invalid on_behalf_of_approver_id" });
+      const entUpper = String(request.entity ?? "").trim().toUpperCase();
+      if (entUpper && !userRowHasEntityAccess(onBehalfNominal, entUpper)) {
+        return res.status(400).json({ error: "Selected approver does not have entity access" });
       }
-      approverStepTotalMyr = computeRequestTotalMyr(
-        lineItemsForLimit,
-        request.tax_rate,
-        String(request.currency ?? "").trim(),
-        request.discount_rate
-      );
-      const entForLimitCheck = String(request.entity ?? "").trim();
-      currentUserLimitMyr = await getUserApprovalLimitMyr(sqlPool, Number(req.user.id), entForLimitCheck);
-      if (isAssignedApproverStep && Number.isFinite(assignedId) && assignedId > 0) {
-        const assignedApproverLimitMyr = await getUserApprovalLimitMyr(sqlPool, assignedId, entForLimitCheck);
-        assignedApproverInsufficient =
-          assignedApproverLimitMyr !== null &&
-          approverStepTotalMyr > assignedApproverLimitMyr;
-      }
+      const roles = parseCommaSeparatedList(onBehalfNominal?.role ?? "");
+      const roleLower = roles.map((r) => String(r).toLowerCase());
+      const isApproverLike =
+        roleLower.includes("approver") ||
+        roleLower.includes("admin") ||
+        roleLower.includes("director") ||
+        roleLower.includes("som");
+      if (!isApproverLike) return res.status(400).json({ error: "Selected user is not an approver" });
+      canApprove = true;
+    } else {
+      canApprove = await evaluateApproverStepPermission(sqlPool, request, currentStep, Number(req.user.id));
     }
-    const currentUserCanCoverApproverTotal =
-      approverStepTotalMyr !== null &&
-      (currentUserLimitMyr === null || approverStepTotalMyr <= currentUserLimitMyr);
-    const roleBasedApprovalAllowed = isAssignedApproverStep
-      ? (userIsAssignedApprover && userDeptMatchRequest) ||
-        (!userIsAssignedApprover &&
-          !!userHasApproverRole &&
-          userDeptMatchRequest &&
-          assignedApproverInsufficient &&
-          currentUserCanCoverApproverTotal)
-      : userHasRole && userDeptMatchRequest;
-    const canApprove =
-      userIsAdmin ||
-      userIsDirector ||
-      (somStep && userIsSom) ||
-      roleBasedApprovalAllowed;
 
     if (!canApprove) {
       return res.status(403).json({ error: "You do not have the required role or department access to approve this step" });
     }
 
-    const tplName = String(request.template_name_resolved || "");
     const n = tplName.toLowerCase();
     const isProcurementSignatureDoc =
       request.template_category === "procurement" &&
@@ -3132,29 +3286,35 @@ async function startServer() {
       return res.status(400).json({ error: "Signature is required to approve this procurement document" });
     }
 
+    const limitSubjectId = useOnBehalf ? onBehalfParsed : Number(req.user.id);
     if (status === "approved" && currentStep.approverRole.toLowerCase() === "approver") {
-      if (approverStepTotalMyr === null) {
-        return res.status(400).json({ error: "Unable to compute approval total for this request." });
-      }
-      const userLimitMyr =
-        currentUserLimitMyr !== null
-          ? currentUserLimitMyr
-          : await getUserApprovalLimitMyr(sqlPool, Number(req.user.id), String(request.entity ?? "").trim());
-      if (userLimitMyr !== null && approverStepTotalMyr > userLimitMyr) {
+      const lim = await approverStepLimitBlocksApproval(sqlPool, request, limitSubjectId);
+      if (lim.blocked) {
         return res.status(403).json({
-          error: `Approval limit exceeded. Request total is RM ${approverStepTotalMyr.toFixed(2)}, your limit is RM ${userLimitMyr.toFixed(2)} (entity-specific cap if configured).`,
+          error: `Approval limit exceeded. Request total is RM ${(lim.total ?? 0).toFixed(2)}, approver limit is RM ${(lim.limit ?? 0).toFixed(2)} (entity-specific cap if configured).`,
         });
       }
     }
 
     const rid = Number(requestId);
-    const approverDisplay = String(req.user.username || "");
+    let recordingApproverId = Number(req.user.id);
+    let approverDisplay = String(req.user.username || "");
+    let signedByUserId: number | null = null;
+    if (useOnBehalf) {
+      const nominal = onBehalfNominal ?? (await fetchSqlUsersettingById(sqlPool, onBehalfParsed));
+      recordingApproverId = onBehalfParsed;
+      approverDisplay = String(nominal?.username ?? "").trim() || approverDisplay;
+      if (Number(req.user.id) !== onBehalfParsed) {
+        signedByUserId = Number(req.user.id);
+      }
+    }
+
     try {
       await sqlPool
         .request()
         .input("request_id", sql.Int, rid)
         .input("step_index", sql.Int, Number(request.current_step_index))
-        .input("approver_id", sql.Int, Number(req.user.id))
+        .input("approver_id", sql.Int, recordingApproverId)
         .input("approver_username", sql.NVarChar, approverDisplay)
         .input("approver_role_snapshot", sql.NVarChar, currentStep?.approverRole || "")
         .input("request_title_snapshot", sql.NVarChar, request.title || "")
@@ -3162,13 +3322,14 @@ async function startServer() {
         .input("status", sql.NVarChar, status)
         .input("comment", sql.NVarChar, comment || "")
         .input("approver_signature", sql.NVarChar(sql.MAX), approverSigStored)
+        .input("signed_by_user_id", sql.Int, signedByUserId)
         .query(`
             INSERT INTO request_approvals (
               request_id, step_index, approver_id, approver_username, approver_role_snapshot,
-              request_title_snapshot, request_formatted_id_snapshot, status, comment, approver_signature
+              request_title_snapshot, request_formatted_id_snapshot, status, comment, approver_signature, signed_by_user_id
             ) VALUES (
               @request_id, @step_index, @approver_id, @approver_username, @approver_role_snapshot,
-              @request_title_snapshot, @request_formatted_id_snapshot, @status, @comment, @approver_signature
+              @request_title_snapshot, @request_formatted_id_snapshot, @status, @comment, @approver_signature, @signed_by_user_id
             )
           `);
       if (status === "rejected") {
@@ -3204,8 +3365,11 @@ async function startServer() {
       return res.status(400).json({ error: e?.message || "Approval failed" });
     }
 
+    const logProxy = useOnBehalf && signedByUserId
+      ? ` on_behalf_of_user_id=${approvalLogSanitize(String(recordingApproverId), 20)}`
+      : "";
     approvalEventLog(
-      `REQUEST_APPROVAL ${formatActor(req)} request_id=${Number(requestId)} step_index=${request.current_step_index} decision=${approvalLogSanitize(String(status), 20)} formatted_id=${approvalLogSanitize(String(request.formatted_id || ""), 64)} title=${approvalLogSanitize(String(request.title || ""), 200)}`
+      `REQUEST_APPROVAL ${formatActor(req)} request_id=${Number(requestId)} step_index=${request.current_step_index} decision=${approvalLogSanitize(String(status), 20)} formatted_id=${approvalLogSanitize(String(request.formatted_id || ""), 64)} title=${approvalLogSanitize(String(request.title || ""), 200)}${logProxy}`
     );
     return res.json({ success: true });
   });
