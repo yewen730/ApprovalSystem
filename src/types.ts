@@ -68,6 +68,8 @@ export interface WorkflowRequest {
   assigned_approver_id?: number | null;
   /** List API: request total (MYR) when pending on approver step (for limit / escalation UI). */
   request_total_myr_snapshot?: number | null;
+  /** Persisted request total amount in MYR (stored in SQL workflow_requests.total_amount_myr). */
+  total_amount_myr?: number | null;
   /** List API: chosen approver's cap (MYR) for this entity; null = no cap in DB. */
   assigned_approver_limit_myr?: number | null;
   /** List API: true when amount exceeds chosen approver's cap (another same-dept higher-limit approver may sign). */

@@ -784,6 +784,8 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
         ALTER TABLE workflow_requests ADD suggested_supplier NVARCHAR(512) NULL;
       IF COL_LENGTH('workflow_requests', 'converted_po_request_id') IS NULL
         ALTER TABLE workflow_requests ADD converted_po_request_id INT NULL;
+      IF COL_LENGTH('workflow_requests', 'total_amount_myr') IS NULL
+        ALTER TABLE workflow_requests ADD total_amount_myr DECIMAL(18, 2) NULL;
     `);
   } catch (e: any) {
     console.warn("SQL workflow column ensure skipped:", e?.message || e);
@@ -1251,27 +1253,8 @@ async function startServer() {
   });
 
   app.post("/api/register", async (req, res) => {
-    const { username, password, department, entities } = req.body;
-    if (!username || !password) return res.status(400).json({ error: "Username and password are required" });
-    const hashedPassword = bcrypt.hashSync(password, 10);
-    const roleCsv = toCommaSeparated(["user"]);
-    const entCsv = listToStoredCsv(entities || []);
-    try {
-      await sqlPool
-        .request()
-        .input("username", sql.NVarChar, username)
-        .input("password", sql.NVarChar, hashedPassword)
-        .input("role", sql.NVarChar(sql.MAX), roleCsv)
-        .input("department", sql.NVarChar, department || "General")
-        .input("entities", sql.NVarChar(sql.MAX), entCsv)
-        .query(
-          `INSERT INTO ${SQLSERVER_USERS_TABLE} (username, password, role, department, entities) VALUES (@username, @password, @role, @department, @entities)`
-        );
-      approvalEventLog(`REGISTER new_user username=${approvalLogSanitize(String(username), 120)}`);
-      return res.json({ success: true });
-    } catch {
-      return res.status(400).json({ error: "Username already exists or registration failed" });
-    }
+    approvalEventLog("REGISTER blocked self-registration-disabled");
+    return res.status(403).json({ error: "Self-registration is disabled. Please contact an administrator." });
   });
 
   app.get("/api/me", authenticate, (req: any, res) => {
@@ -1932,10 +1915,11 @@ async function startServer() {
         .input("steps", sql.NVarChar(sql.MAX), JSON.stringify(steps))
         .input("table_columns", sql.NVarChar(sql.MAX), JSON.stringify(table_columns || []))
         .input("attachments_required", sql.Bit, attachments_required ? 1 : 0)
+        .input("is_active", sql.Bit, 1)
         .query(`
-            INSERT INTO workflows (creator_id, name, category, steps, table_columns, attachments_required)
+            INSERT INTO workflows (creator_id, name, category, steps, table_columns, attachments_required, is_active)
             OUTPUT INSERTED.id AS id
-            VALUES (@creator_id, @name, @category, @steps, @table_columns, @attachments_required)
+            VALUES (@creator_id, @name, @category, @steps, @table_columns, @attachments_required, @is_active)
           `);
       const id = ins.recordset?.[0]?.id;
       approvalEventLog(
@@ -1966,6 +1950,26 @@ async function startServer() {
         .query("UPDATE workflows SET status = @status WHERE id = @id");
       approvalEventLog(
         `WORKFLOW_STATUS ${formatActor(req)} workflow_id=${Number(req.params.id)} status=${approvalLogSanitize(String(status ?? ""), 40)}`
+      );
+      return res.json({ success: true });
+    } catch (e: any) {
+      return res.status(400).json({ error: e?.message || "Update failed" });
+    }
+  });
+
+  app.patch("/api/workflows/:id/active", authenticate, async (req: any, res) => {
+    if (!req.user.permissions || (!req.user.permissions.includes("create_templates") && !req.user.permissions.includes("approve_templates") && !req.user.permissions.includes("admin"))) {
+      return res.status(403).json({ error: "You do not have permission to change workflow active state" });
+    }
+    const activeBit = req.body?.is_active ? 1 : 0;
+    try {
+      await sqlPool
+        .request()
+        .input("is_active", sql.Bit, activeBit)
+        .input("id", sql.Int, Number(req.params.id))
+        .query("UPDATE workflows SET is_active = @is_active WHERE id = @id");
+      approvalEventLog(
+        `WORKFLOW_ACTIVE ${formatActor(req)} workflow_id=${Number(req.params.id)} active=${activeBit}`
       );
       return res.json({ success: true });
     } catch (e: any) {
@@ -2262,6 +2266,7 @@ async function startServer() {
     const taxVal = tax_rate !== undefined ? tax_rate : 0.18;
     const discVal = discount_rate !== undefined ? Number(discount_rate) : 0;
     const curVal = currencyTrimmed;
+    const totalAmountMyr = computeRequestTotalMyr(line_items || [], taxVal, curVal, discVal);
     const lineJson = JSON.stringify(line_items || []);
     const detailsForDb = isPR || isPO || isSR ? "" : String(details ?? "");
 
@@ -2286,6 +2291,7 @@ async function startServer() {
         .input("cost_center", sql.NVarChar, cost_center || "")
         .input("section", sql.NVarChar, sectionTrimmed)
         .input("suggested_supplier", sql.NVarChar, suggestedSupplierSql)
+        .input("total_amount_myr", sql.Decimal(18, 2), totalAmountMyr)
         .input("entity", sql.NVarChar, req.entityContext)
         .input("formatted_id", sql.NVarChar, formatted_id)
         .input("request_steps", sql.NVarChar(sql.MAX), requestStepsJson)
@@ -2294,13 +2300,13 @@ async function startServer() {
             INSERT INTO workflow_requests (
               template_id, requester_id, requester_username_snapshot, requester_name, template_name_snapshot,
               department, title, details, line_items, requester_signature, requester_signed_at, tax_rate, discount_rate, currency, cost_center, section,
-              suggested_supplier, entity, formatted_id, request_steps, assigned_approver_id
+              suggested_supplier, total_amount_myr, entity, formatted_id, request_steps, assigned_approver_id
             ) VALUES (
               @template_id, @requester_id, @requester_username_snapshot, @requester_name, @template_name_snapshot,
               @department, @title, @details, @line_items, @requester_signature,
               CASE WHEN @requester_signed_flag = 1 THEN SYSUTCDATETIME() ELSE NULL END,
               @tax_rate, @discount_rate, @currency, @cost_center, @section,
-              @suggested_supplier, @entity, @formatted_id, @request_steps, @assigned_approver_id
+              @suggested_supplier, @total_amount_myr, @entity, @formatted_id, @request_steps, @assigned_approver_id
             );
             SELECT CAST(SCOPE_IDENTITY() AS INT) AS id;
           `);
@@ -2466,7 +2472,8 @@ async function startServer() {
         String(entity ?? req.headers["x-entity"] ?? req.headers["X-Entity"] ?? "").trim();
       const allowedEntities = parseUserEntities(req.user).map((e) => e.trim()).filter(Boolean);
       const allowedSetUpper = new Set(allowedEntities.map((e) => e.toUpperCase()));
-      const canViewAllEntities = isAdminUser(req) || isSomUser(req) || isDirectorUser(req) || isPurchasingUser(req);
+      // Purchasing follows assigned entities (and optional entity filter), same as other roles — not global cross-entity.
+      const canViewAllEntities = isAdminUser(req) || isSomUser(req) || isDirectorUser(req);
       let entityClause = "";
       if (requestedEntity) {
         if (!canViewAllEntities && !allowedSetUpper.has(requestedEntity.toUpperCase())) {
@@ -2746,14 +2753,31 @@ async function startServer() {
           }
         }
       }
+      let recomputeLineItems: any[] = [];
+      try {
+        recomputeLineItems = line_items !== undefined ? line_items : JSON.parse(request.line_items || "[]");
+        if (!Array.isArray(recomputeLineItems)) recomputeLineItems = [];
+      } catch {
+        recomputeLineItems = [];
+      }
+      const recomputeTax = tax_rate !== undefined ? tax_rate : request.tax_rate;
+      const recomputeDiscount = discount_rate !== undefined ? discount_rate : request.discount_rate;
+      const recomputeCurrency =
+        currency !== undefined ? String(currency).trim() : String(request.currency ?? "").trim();
+      const recomputedTotalMyr = computeRequestTotalMyr(
+        recomputeLineItems,
+        recomputeTax,
+        recomputeCurrency,
+        recomputeDiscount
+      );
+      await sqlPool
+        .request()
+        .input("total_amount_myr", sql.Decimal(18, 2), recomputedTotalMyr)
+        .input("id", sql.Int, rid)
+        .query("UPDATE workflow_requests SET total_amount_myr = @total_amount_myr WHERE id = @id");
       if (request.status === "pending" && isPO && request.current_step_index === 0) {
         if (line_items !== undefined || tax_rate !== undefined || currency !== undefined || discount_rate !== undefined) {
-          const li = line_items !== undefined ? line_items : JSON.parse(request.line_items || "[]");
-          const tr = tax_rate !== undefined ? tax_rate : request.tax_rate;
-          const dr = discount_rate !== undefined ? discount_rate : request.discount_rate;
-          const cur =
-            currency !== undefined ? String(currency).trim() : String(request.currency ?? "").trim();
-          const newSteps = buildPoRequestSteps(computeRequestTotalMyr(li, tr, cur, dr));
+          const newSteps = buildPoRequestSteps(recomputedTotalMyr);
           await sqlPool
             .request()
             .input("request_steps", sql.NVarChar(sql.MAX), JSON.stringify(newSteps))
@@ -2814,7 +2838,24 @@ async function startServer() {
         .query("UPDATE workflow_requests SET request_steps = @request_steps WHERE id = @id");
     }
 
-    await sqlPool.request().input("id", sql.Int, rid).query("UPDATE workflow_requests SET status = N'pending', current_step_index = 0 WHERE id = @id");
+    const resubmitTotalMyr = computeRequestTotalMyr(
+      (() => {
+        try {
+          const arr = JSON.parse(request.line_items || "[]");
+          return Array.isArray(arr) ? arr : [];
+        } catch {
+          return [];
+        }
+      })(),
+      request.tax_rate,
+      String(request.currency ?? "").trim(),
+      request.discount_rate
+    );
+    await sqlPool
+      .request()
+      .input("id", sql.Int, rid)
+      .input("total_amount_myr", sql.Decimal(18, 2), resubmitTotalMyr)
+      .query("UPDATE workflow_requests SET status = N'pending', current_step_index = 0, total_amount_myr = @total_amount_myr WHERE id = @id");
     approvalEventLog(`REQUEST_RESUBMIT ${formatActor(req)} request_id=${rid} formatted_id=${approvalLogSanitize(String(request.formatted_id || ""), 64)}`);
     res.json({ success: true });
   });
@@ -3030,10 +3071,12 @@ async function startServer() {
           .input("id", sql.Int, newRequestId)
           .input("line_items", sql.NVarChar(sql.MAX), mergedLineJson)
           .input("request_steps", sql.NVarChar(sql.MAX), mergedStepsJson)
+          .input("total_amount_myr", sql.Decimal(18, 2), totalMyrMerged)
           .query(`
             UPDATE workflow_requests
             SET line_items = @line_items,
-                request_steps = @request_steps
+                request_steps = @request_steps,
+                total_amount_myr = @total_amount_myr
             WHERE id = @id;
           `);
 
@@ -3124,17 +3167,18 @@ async function startServer() {
         .input("formatted_id", sql.NVarChar, formatted_id)
         .input("request_steps", sql.NVarChar(sql.MAX), poRequestStepsJson)
         .input("assigned_approver_id", sql.Int, null)
+        .input("total_amount_myr", sql.Decimal(18, 2), totalMyr)
         .query(`
             INSERT INTO workflow_requests (
               template_id, requester_id, requester_username_snapshot, requester_name, template_name_snapshot,
               department, title, details, line_items, requester_signature, requester_signed_at, tax_rate, discount_rate, currency, cost_center, section,
-              entity, formatted_id, request_steps, assigned_approver_id
+              entity, formatted_id, request_steps, assigned_approver_id, total_amount_myr
             ) VALUES (
               @template_id, @requester_id, @requester_username_snapshot, @requester_name, @template_name_snapshot,
               @department, @title, @details, @line_items, @requester_signature,
               CASE WHEN @po_requester_signed_flag = 1 THEN SYSUTCDATETIME() ELSE NULL END,
               @tax_rate, @discount_rate, @currency, @cost_center, @section,
-              @entity, @formatted_id, @request_steps, @assigned_approver_id
+              @entity, @formatted_id, @request_steps, @assigned_approver_id, @total_amount_myr
             );
             SELECT CAST(SCOPE_IDENTITY() AS INT) AS id;
           `);

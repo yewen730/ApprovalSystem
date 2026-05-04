@@ -563,7 +563,11 @@ const Login = ({ onLogin }: { onLogin: (user: User) => void }) => {
 const TemplateSelector = ({ templates, onSelect }: { templates: Workflow[], onSelect: (w: Workflow) => void }) => {
   // Backend stores workflow status in lowercase (e.g. "approved"), while UI types/UI code
   // sometimes expect Title Case. Normalize to make the submit page work reliably.
-  const approvedTemplates = templates.filter(t => (t.status ?? '').toString().trim().toLowerCase() === 'approved');
+  const approvedTemplates = templates.filter(
+    (t) =>
+      (t.status ?? '').toString().trim().toLowerCase() === 'approved' &&
+      (t.is_active ?? true)
+  );
 
   return (
     <div className="space-y-6">
@@ -988,6 +992,12 @@ const isProcurementNumericGridColumn = (col: string) => {
     c === 'min quantity' ||
     c === 'max quantity'
   );
+};
+
+/** Only these use min=0 on number inputs; unit price / amount may be negative (line discount). */
+const isProcurementQuantityGridColumn = (col: string) => {
+  const c = col.trim().toLowerCase();
+  return c === 'quantity' || c === 'min quantity' || c === 'max quantity';
 };
 
 const lineItemRemarksDisplay = (item: any) =>
@@ -3353,7 +3363,7 @@ const WorkflowRequestCreator = ({ template, entity, onSuccess }: { template: Wor
                               ) : (
                                 <input
                                   type={col === 'Delivery Date' || col === 'Request to be delivered on' ? 'date' : (isProcurementNumericGridColumn(col) ? 'number' : 'text')}
-                                  min={isProcurementNumericGridColumn(col) ? '0' : undefined}
+                                  min={isProcurementQuantityGridColumn(col) ? '0' : undefined}
                                   step={col.trim().toLowerCase() === 'quantity' || col.trim().toLowerCase() === 'min quantity' || col.trim().toLowerCase() === 'max quantity' ? '1' : (col.trim().toLowerCase() === 'unit price' || col.trim().toLowerCase() === 'price' || col.trim().toLowerCase() === 'amount' ? '0.01' : undefined)}
                                   className="w-full min-w-0 px-2.5 py-2 rounded-lg border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
                                   value={col === REMARKS_LINE_COL ? lineItemRemarksDisplay(item) : (item[col] ?? '')}
@@ -4176,42 +4186,42 @@ const WorkflowRequestList = ({
 
       <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden shadow-sm flex-1 min-h-0 flex flex-col min-w-0">
         <div className="overflow-auto flex-1 min-h-0 min-w-0">
-          <table className="w-full table-fixed text-left text-[11px] sm:text-xs">
+          <table className="w-full min-w-[1024px] table-auto border-collapse text-left text-[11px] sm:text-xs">
             <thead className="bg-zinc-50 text-zinc-500 text-[10px] sm:text-xs uppercase font-bold sticky top-0 z-[1] shadow-[0_1px_0_0_rgb(228_228_231)]">
               <tr>
-                <th className="px-2 py-2 w-[17%] min-w-0 align-bottom">
-                  <button type="button" onClick={() => toggleSort('request')} className="hover:text-zinc-700 transition-colors text-left w-full">
+                <th className="px-3 py-2 min-w-[14rem] align-bottom">
+                  <button type="button" onClick={() => toggleSort('request')} className="hover:text-zinc-700 transition-colors text-left">
                     Request{sortIndicator('request')}
                   </button>
                 </th>
-                <th className="px-2 py-2 w-[11%] min-w-0 align-bottom">
-                  <button type="button" onClick={() => toggleSort('entity')} className="hover:text-zinc-700 transition-colors text-left w-full">
+                <th className="px-3 py-2 min-w-[7rem] align-bottom">
+                  <button type="button" onClick={() => toggleSort('entity')} className="hover:text-zinc-700 transition-colors text-left">
                     Entity{sortIndicator('entity')}
                   </button>
                 </th>
-                <th className="px-2 py-2 w-[8%] min-w-0 align-bottom">
-                  <button type="button" onClick={() => toggleSort('department')} className="hover:text-zinc-700 transition-colors text-left w-full">
+                <th className="px-3 py-2 min-w-[5.5rem] align-bottom">
+                  <button type="button" onClick={() => toggleSort('department')} className="hover:text-zinc-700 transition-colors text-left">
                     Dept{sortIndicator('department')}
                   </button>
                 </th>
-                <th className="px-2 py-2 w-[10%] min-w-0 align-bottom">
-                  <button type="button" onClick={() => toggleSort('requester')} className="hover:text-zinc-700 transition-colors text-left w-full">
+                <th className="px-3 py-2 min-w-[8.5rem] align-bottom">
+                  <button type="button" onClick={() => toggleSort('requester')} className="hover:text-zinc-700 transition-colors text-left">
                     Requester{sortIndicator('requester')}
                   </button>
                 </th>
-                <th className="px-2 py-2 w-[10%] min-w-0 align-bottom">
-                  <button type="button" onClick={() => toggleSort('status')} className="hover:text-zinc-700 transition-colors text-left w-full">
+                <th className="px-3 py-2 min-w-[6.5rem] align-bottom">
+                  <button type="button" onClick={() => toggleSort('status')} className="hover:text-zinc-700 transition-colors text-left">
                     Status{sortIndicator('status')}
                   </button>
                 </th>
-                <th className="px-2 py-2 w-[8%] min-w-0 align-bottom text-zinc-500">PO #</th>
-                <th className="px-2 py-2 w-[10%] min-w-0 align-bottom text-zinc-500">PO status</th>
-                <th className="px-2 py-2 w-[8%] min-w-0 align-bottom">
-                  <button type="button" onClick={() => toggleSort('date')} className="hover:text-zinc-700 transition-colors text-left w-full">
+                <th className="px-3 py-2 min-w-[6rem] align-bottom text-zinc-500">PO #</th>
+                <th className="px-3 py-2 min-w-[7.5rem] align-bottom text-zinc-500">PO status</th>
+                <th className="px-3 py-2 min-w-[5.5rem] align-bottom">
+                  <button type="button" onClick={() => toggleSort('date')} className="hover:text-zinc-700 transition-colors text-left">
                     Date{sortIndicator('date')}
                   </button>
                 </th>
-                <th className="px-2 py-2 w-[14%] min-w-0 align-bottom text-right">Actions</th>
+                <th className="px-3 py-2 min-w-[9rem] align-bottom text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-100">
@@ -4230,13 +4240,13 @@ const WorkflowRequestList = ({
                     }}
                     className="hover:bg-zinc-50 transition-colors cursor-pointer align-top"
                   >
-                    <td className="px-2 py-2 min-w-0">
-                      <p className="font-semibold text-zinc-900 line-clamp-2 leading-snug break-words">
+                    <td className="px-3 py-2 align-top min-w-[14rem] max-w-md">
+                      <p className="font-semibold text-zinc-900 leading-snug break-words">
                         {r.formatted_id ? `[${toUpperSerial(r.formatted_id)}] ${r.title}` : r.title}
                       </p>
-                      <p className="text-zinc-500 line-clamp-1 mt-0.5 break-words">{r.template_name}</p>
+                      <p className="text-zinc-500 mt-0.5 break-words text-[10px] sm:text-xs leading-snug">{r.template_name}</p>
                     </td>
-                    <td className="px-2 py-2 min-w-0">
+                    <td className="px-3 py-2 align-top min-w-[7rem]">
                       <div className="flex flex-col gap-0.5 break-words hyphens-auto leading-tight">
                         <span className="font-bold text-indigo-600 uppercase tracking-wide text-[10px] sm:text-xs">
                           {String(r.entity || '-')}
@@ -4246,9 +4256,11 @@ const WorkflowRequestList = ({
                         </span>
                       </div>
                     </td>
-                    <td className="px-2 py-2 text-zinc-700 font-medium break-words leading-tight">{r.department}</td>
-                    <td className="px-2 py-2 text-zinc-700 break-words leading-tight">{r.requester_name}</td>
-                    <td className="px-2 py-2 min-w-0">
+                    <td className="px-3 py-2 align-top min-w-[5.5rem] text-zinc-700 font-medium break-words leading-tight">
+                      {r.department}
+                    </td>
+                    <td className="px-3 py-2 align-top min-w-[8.5rem] text-zinc-700 break-words leading-tight">{r.requester_name}</td>
+                    <td className="px-3 py-2 align-top min-w-[6.5rem]">
                       <span
                         className={cn(
                           'inline-flex text-[9px] sm:text-[10px] uppercase font-bold px-1.5 py-0.5 rounded-full leading-tight',
@@ -4258,10 +4270,10 @@ const WorkflowRequestList = ({
                         {formatWorkflowRequestStatusLabel(r)}
                       </span>
                     </td>
-                    <td className="px-2 py-2 text-zinc-700 font-mono tabular-nums break-all leading-tight">
+                    <td className="px-3 py-2 align-top min-w-[6rem] text-zinc-700 font-mono tabular-nums break-all leading-tight">
                       {displayPoNumberInRequestTable(r)}
                     </td>
-                    <td className="px-2 py-2 min-w-0">
+                    <td className="px-3 py-2 align-top min-w-[7.5rem]">
                       {showPoStatusBadgeInRequestTable(r) ? (
                         <span
                           className={cn(
@@ -4277,8 +4289,10 @@ const WorkflowRequestList = ({
                         <span className="text-zinc-400">{displayPoStatusLabelInRequestTable(r)}</span>
                       )}
                     </td>
-                    <td className="px-2 py-2 text-zinc-500 whitespace-nowrap">{new Date(r.created_at).toLocaleDateString()}</td>
-                    <td className="px-2 py-2 text-right min-w-0">
+                    <td className="px-3 py-2 align-top min-w-[5.5rem] text-zinc-500 whitespace-nowrap">
+                      {new Date(r.created_at).toLocaleDateString()}
+                    </td>
+                    <td className="px-3 py-2 align-top text-right min-w-[9rem]">
                       <div className="flex flex-col items-end gap-1">
                         {canShowConvertPRToPO(r, user) && (
                           <button
@@ -5568,7 +5582,11 @@ const Dashboard = ({
             </h3>
             <div className="space-y-2">
               {workflows
-                .filter(w => (w.status ?? '').toString().trim().toLowerCase() === 'approved')
+                .filter(
+                  w =>
+                    (w.status ?? '').toString().trim().toLowerCase() === 'approved' &&
+                    (w.is_active ?? true)
+                )
                 .slice(0, 3)
                 .map(w => (
                 <button
@@ -5646,6 +5664,22 @@ const WorkflowList = ({ workflows, user, roles: availableRoles, onRefresh, onSta
       toast.success(`Workflow Template ${status}`);
       onRefresh();
       setSelectedWorkflow(null);
+    } catch (err: any) {
+      toast.error(err.message);
+    }
+  };
+
+  const handleActiveToggle = async (id: number, isActive: boolean) => {
+    try {
+      await api.request(`/api/workflows/${id}/active`, {
+        method: 'PATCH',
+        body: JSON.stringify({ is_active: isActive }),
+      });
+      toast.success(isActive ? 'Template activated' : 'Template deactivated');
+      onRefresh();
+      if (selectedWorkflow && selectedWorkflow.id === id) {
+        setSelectedWorkflow({ ...selectedWorkflow, is_active: isActive });
+      }
     } catch (err: any) {
       toast.error(err.message);
     }
@@ -5750,6 +5784,14 @@ const WorkflowList = ({ workflows, user, roles: availableRoles, onRefresh, onSta
                   <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-100">
                     {w.category}
                   </span>
+                  <span className={cn(
+                    "text-[10px] uppercase font-bold px-2 py-0.5 rounded-full border",
+                    (w.is_active ?? true)
+                      ? "bg-emerald-50 text-emerald-700 border-emerald-100"
+                      : "bg-zinc-100 text-zinc-500 border-zinc-200"
+                  )}>
+                    {(w.is_active ?? true) ? 'Active' : 'Inactive'}
+                  </span>
                 </div>
                 <div className="flex items-center gap-4 mt-3 text-xs text-zinc-400">
                   <span className="flex items-center gap-1">
@@ -5769,7 +5811,7 @@ const WorkflowList = ({ workflows, user, roles: availableRoles, onRefresh, onSta
                 </div>
               </div>
               <div className="flex items-center gap-2">
-                {(w.status ?? '').toString().trim().toLowerCase() === 'approved' && (
+                {(w.status ?? '').toString().trim().toLowerCase() === 'approved' && (w.is_active ?? true) && (
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -5813,8 +5855,29 @@ const WorkflowList = ({ workflows, user, roles: availableRoles, onRefresh, onSta
                   )}>
                     {selectedWorkflow.status}
                   </span>
+                  <span className={cn(
+                    "text-[10px] uppercase font-bold px-2 py-0.5 rounded-full border",
+                    (selectedWorkflow.is_active ?? true)
+                      ? "bg-emerald-50 text-emerald-700 border-emerald-100"
+                      : "bg-zinc-100 text-zinc-500 border-zinc-200"
+                  )}>
+                    {(selectedWorkflow.is_active ?? true) ? 'Active' : 'Inactive'}
+                  </span>
                 </div>
                 <div className="flex items-center gap-2">
+                  {(canCreateTemplates || canApproveTemplates || isAdmin) && !isEditing && (
+                    <button
+                      onClick={() => handleActiveToggle(selectedWorkflow.id, !(selectedWorkflow.is_active ?? true))}
+                      className={cn(
+                        "flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-bold transition-all",
+                        (selectedWorkflow.is_active ?? true)
+                          ? "border-zinc-200 text-zinc-600 hover:bg-zinc-100"
+                          : "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+                      )}
+                    >
+                      {(selectedWorkflow.is_active ?? true) ? 'Deactivate' : 'Activate'}
+                    </button>
+                  )}
                   {(canCreateTemplates || (canApproveTemplates && selectedWorkflow.status === 'pending')) && !isEditing && (
                     <button 
                       onClick={() => {
@@ -6044,7 +6107,7 @@ const WorkflowList = ({ workflows, user, roles: availableRoles, onRefresh, onSta
                     </button>
                   </>
                 )}
-                {selectedWorkflow.status === 'approved' && (
+                {selectedWorkflow.status === 'approved' && (selectedWorkflow.is_active ?? true) && (
                   <button
                     onClick={() => {
                       onStartRequest(selectedWorkflow);
@@ -6690,8 +6753,17 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   const fetchProcurementRequests = async () => {
     setLoading(true);
     try {
-      const query = new URLSearchParams(filters).toString();
-      const data = await api.request(`/api/procurement/requests?${query}`, { skipEntity: true });
+      const mergedFilters = {
+        ...filters,
+        entity: (filters.entity || entityScope || '').trim(),
+      };
+      const params = new URLSearchParams();
+      for (const [k, v] of Object.entries(mergedFilters)) {
+        const s = v == null ? '' : String(v).trim();
+        if (s !== '') params.set(k, s);
+      }
+      const qs = params.toString();
+      const data = await api.request(`/api/procurement/requests${qs ? `?${qs}` : ''}`, { skipEntity: true });
       setRequests(data);
     } catch (err) {
       toast.error('Failed to fetch procurement requests');
@@ -7224,55 +7296,55 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
       {/* Table */}
       <div className="bg-white rounded-2xl border border-zinc-200 shadow-sm overflow-hidden flex-1 min-h-0">
         <div className="w-full h-full overflow-auto min-w-0">
-        <table className="w-full table-fixed text-left border-collapse text-[11px] sm:text-xs">
+        <table className="w-full min-w-[1100px] table-auto text-left border-collapse text-[11px] sm:text-xs">
           <thead>
             <tr className="bg-zinc-50 border-b border-zinc-200 sticky top-0 z-[1] shadow-[0_1px_0_0_rgb(228_228_231)]">
-              <th className="px-2 py-2 w-[6%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
-                <button type="button" onClick={() => toggleProcurementSort('id')} className="hover:text-zinc-700 transition-colors text-left w-full">
+              <th className="px-3 py-2 min-w-[10.5rem] whitespace-nowrap text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('id')} className="hover:text-zinc-700 transition-colors text-left">
                   ID{procurementSortIndicator('id')}
                 </button>
               </th>
-              <th className="px-2 py-2 w-[13%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
-                <button type="button" onClick={() => toggleProcurementSort('type')} className="hover:text-zinc-700 transition-colors text-left w-full">
+              <th className="px-3 py-2 min-w-[13rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('type')} className="hover:text-zinc-700 transition-colors text-left">
                   Type{procurementSortIndicator('type')}
                 </button>
               </th>
-              <th className="px-2 py-2 w-[10%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
-                <button type="button" onClick={() => toggleProcurementSort('entity')} className="hover:text-zinc-700 transition-colors text-left w-full">
+              <th className="px-3 py-2 min-w-[7rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('entity')} className="hover:text-zinc-700 transition-colors text-left">
                   Entity{procurementSortIndicator('entity')}
                 </button>
               </th>
-              <th className="px-2 py-2 w-[10%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
-                <button type="button" onClick={() => toggleProcurementSort('requester')} className="hover:text-zinc-700 transition-colors text-left w-full">
+              <th className="px-3 py-2 min-w-[8.5rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('requester')} className="hover:text-zinc-700 transition-colors text-left">
                   Requester{procurementSortIndicator('requester')}
                 </button>
               </th>
-              <th className="px-2 py-2 w-[14%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
-                <button type="button" onClick={() => toggleProcurementSort('items')} className="hover:text-zinc-700 transition-colors text-left w-full">
+              <th className="px-3 py-2 min-w-[10rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('items')} className="hover:text-zinc-700 transition-colors text-left">
                   Items{procurementSortIndicator('items')}
                 </button>
               </th>
-              <th className="px-2 py-2 w-[10%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
-                <button type="button" onClick={() => toggleProcurementSort('supplier')} className="hover:text-zinc-700 transition-colors text-left w-full">
+              <th className="px-3 py-2 min-w-[8.5rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('supplier')} className="hover:text-zinc-700 transition-colors text-left">
                   Supplier{procurementSortIndicator('supplier')}
                 </button>
               </th>
-              <th className="px-2 py-2 w-[8%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
-                <button type="button" onClick={() => toggleProcurementSort('total')} className="hover:text-zinc-700 transition-colors text-left w-full">
+              <th className="px-3 py-2 min-w-[5.5rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('total')} className="hover:text-zinc-700 transition-colors text-left">
                   Total{procurementSortIndicator('total')}
                 </button>
               </th>
-              <th className="px-2 py-2 w-[9%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
-                <button type="button" onClick={() => toggleProcurementSort('status')} className="hover:text-zinc-700 transition-colors text-left w-full">
+              <th className="px-3 py-2 min-w-[6.5rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('status')} className="hover:text-zinc-700 transition-colors text-left">
                   Status{procurementSortIndicator('status')}
                 </button>
               </th>
-              <th className="px-2 py-2 w-[8%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
-                <button type="button" onClick={() => toggleProcurementSort('date')} className="hover:text-zinc-700 transition-colors text-left w-full">
+              <th className="px-3 py-2 min-w-[5.5rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('date')} className="hover:text-zinc-700 transition-colors text-left">
                   Date{procurementSortIndicator('date')}
                 </button>
               </th>
-              <th className="px-2 py-2 w-[12%] min-w-0 text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider text-right align-bottom">Action</th>
+              <th className="px-3 py-2 min-w-[9rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider text-right align-bottom">Action</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-100">
@@ -7303,12 +7375,14 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                       fetchDetails(r.id);
                     }}
                   >
-                    <td className="px-2 py-2 font-mono text-zinc-500 tabular-nums whitespace-nowrap">#{displayRequestSerial(r)}</td>
-                    <td className="px-2 py-2 min-w-0">
-                      <p className="font-bold text-zinc-900 line-clamp-2 leading-snug break-words">{r.template_name}</p>
-                      <p className="text-zinc-500 line-clamp-1 mt-0.5 break-words">{r.title}</p>
+                    <td className="px-3 py-2 align-top font-mono text-zinc-500 tabular-nums whitespace-nowrap min-w-[10.5rem]">
+                      #{displayRequestSerial(r)}
                     </td>
-                    <td className="px-2 py-2 min-w-0">
+                    <td className="px-3 py-2 align-top min-w-[13rem] max-w-md">
+                      <p className="font-bold text-zinc-900 leading-snug break-words">{r.template_name}</p>
+                      <p className="text-zinc-500 mt-0.5 break-words text-[10px] sm:text-xs leading-snug">{r.title}</p>
+                    </td>
+                    <td className="px-3 py-2 align-top min-w-[7rem]">
                       <div className="flex flex-col gap-0.5 break-words leading-tight">
                         <span className="text-[10px] sm:text-xs font-bold text-indigo-600 uppercase tracking-wide">
                           {String(r.entity || '-')}
@@ -7318,14 +7392,14 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                         </span>
                       </div>
                     </td>
-                    <td className="px-2 py-2 min-w-0">
+                    <td className="px-3 py-2 align-top min-w-[8.5rem]">
                       <p className="text-zinc-700 font-medium break-words leading-tight">{r.requester_name}</p>
                       <p className="text-[9px] text-zinc-400 font-bold uppercase">{r.department}</p>
                     </td>
-                    <td className="px-2 py-2 min-w-0">
+                    <td className="px-3 py-2 align-top min-w-[10rem]">
                       <div className="space-y-0.5">
                         {r.line_items?.slice(0, 2).map((item, idx) => (
-                          <div key={item.id || idx} className="text-zinc-700 line-clamp-2 leading-tight break-words">
+                          <div key={item.id || idx} className="text-zinc-700 leading-tight break-words">
                             <span className="font-bold text-indigo-600">{item.Quantity || item.quantity || 0}x</span>{' '}
                             {item.Item || item.item || 'Item'}
                           </div>
@@ -7338,17 +7412,17 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                         )}
                       </div>
                     </td>
-                    <td className="px-2 py-2 min-w-0">
-                      <p className="text-zinc-700 font-medium line-clamp-2 leading-tight break-words">
+                    <td className="px-3 py-2 align-top min-w-[8.5rem]">
+                      <p className="text-zinc-700 font-medium leading-tight break-words">
                         {prSuggestedSupplierDisplay(r) || '-'}
                       </p>
                     </td>
-                    <td className="px-2 py-2 whitespace-nowrap">
+                    <td className="px-3 py-2 align-top whitespace-nowrap min-w-[5.5rem]">
                       <p className="font-bold text-zinc-900 tabular-nums">
                         {totalAmount > 0 ? `${procurementCurrencyPrefix(r.currency)}${totalAmount.toLocaleString()}`.trim() : '-'}
                       </p>
                     </td>
-                    <td className="px-2 py-2 min-w-0">
+                    <td className="px-3 py-2 align-top min-w-[6.5rem]">
                       <span className={cn(
                         'inline-flex text-[9px] sm:text-[10px] uppercase font-bold px-1.5 py-0.5 rounded-full leading-tight',
                         workflowRequestStatusBadgeClass(r)
@@ -7356,8 +7430,10 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                         {formatWorkflowRequestStatusLabel(r)}
                       </span>
                     </td>
-                    <td className="px-2 py-2 text-zinc-500 whitespace-nowrap">{new Date(r.created_at).toLocaleDateString()}</td>
-                    <td className="px-2 py-2 text-right min-w-0">
+                    <td className="px-3 py-2 align-top text-zinc-500 whitespace-nowrap min-w-[5.5rem]">
+                      {new Date(r.created_at).toLocaleDateString()}
+                    </td>
+                    <td className="px-3 py-2 align-top text-right min-w-[9rem]">
                       <div className="flex flex-col items-end gap-1">
                         {canShowConvertPRToPO(r, user) && (
                           <button
