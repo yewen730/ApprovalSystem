@@ -13,6 +13,7 @@ import {
   resolveStoredPath,
   saveRequestAttachmentFile,
   tryUnlinkStoredFile,
+  validateAttachmentUpload,
 } from "./attachmentStorage";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -139,6 +140,19 @@ const isPOName = (name: string) => {
   const n = name.toLowerCase();
   return n.includes("purchase order") || n.includes("po");
 };
+
+/** PR / SR / PO generated form PDF — same on-disk folder as quotation uploads (`saveRequestAttachmentFile`). */
+function procurementGeneratedFormKindFromRow(row: {
+  template_name?: string | null;
+  template_category?: string | null;
+}): "PR" | "SR" | "PO" | null {
+  if (String(row.template_category || "").toLowerCase() !== "procurement") return null;
+  const name = String(row.template_name || "").toLowerCase();
+  if (name.includes("purchase order") || name.includes("po")) return "PO";
+  if (name.includes("stock requisition") || (name.includes("stock") && name.includes("requisition"))) return "SR";
+  if ((name.includes("purchase request") || name.includes("pr")) && !name.includes("order")) return "PR";
+  return null;
+}
 
 function isXlsxFileName(fileName: string): boolean {
   return path.extname(String(fileName || "").trim()).toLowerCase() === ".xlsx";
@@ -2330,7 +2344,7 @@ async function startServer() {
               buf,
               String(att.type || "")
             );
-            rel = saved.relativePath;
+            rel = saved.storedPath;
             att.name = saved.storedFileName;
             att.type = saved.mimeType;
           } catch (e: any) {
@@ -2439,6 +2453,82 @@ async function startServer() {
       };
     });
     return res.json(list);
+  });
+
+  app.post("/api/workflow-requests/:id/generated-form-pdf", authenticate, requireEntityContext, async (req: any, res) => {
+    const requestId = Number(req.params.id);
+    if (!Number.isFinite(requestId) || requestId <= 0) {
+      return res.status(400).json({ error: "Invalid request id" });
+    }
+    const pdfData = String(req.body?.pdf_data ?? "").trim();
+    if (!pdfData) {
+      return res.status(400).json({ error: "pdf_data is required (data URL or base64 PDF)" });
+    }
+    try {
+      const rr = await sqlPool.request().input("id", sql.Int, requestId).query(`
+        SELECT r.*, w.category AS template_category, w.name AS template_name
+        FROM workflow_requests r
+        INNER JOIN workflows w ON r.template_id = w.id
+        WHERE r.id = @id
+      `);
+      const requestRow: any = rr.recordset?.[0];
+      if (!assertWorkflowRequestAccess(req, res, requestRow, requestRow?.template_category)) return;
+      const kind = procurementGeneratedFormKindFromRow({
+        template_name: requestRow.template_name,
+        template_category: requestRow.template_category,
+      });
+      if (!kind) {
+        return res.status(400).json({ error: "Generated form PDF is only stored for procurement PR, SR, or PO" });
+      }
+      const buf = decodeAttachmentPayload(pdfData);
+      if (!buf.length) {
+        return res.status(400).json({ error: "Empty PDF payload" });
+      }
+      const serialRaw = String(requestRow.formatted_id || "").trim() || `request_${requestId}`;
+      const logicalStem = `${kind}_${serialRaw}_Form`;
+      const logicalName = `${logicalStem}.pdf`;
+      let validated: { safeFileName: string; displayFileName: string; mimeType: string };
+      try {
+        validated = validateAttachmentUpload(logicalName, "application/pdf", buf);
+      } catch (e: any) {
+        return res.status(400).json({ error: e?.message || "Invalid PDF" });
+      }
+      const existing = await sqlPool
+        .request()
+        .input("request_id", sql.Int, requestId)
+        .input("fn", sql.NVarChar, validated.displayFileName)
+        .query("SELECT id, file_path FROM request_attachments WHERE request_id = @request_id AND file_name = @fn");
+      for (const ex of existing.recordset || []) {
+        tryUnlinkStoredFile((ex as any).file_path);
+        await sqlPool.request().input("eid", sql.Int, Number((ex as any).id)).query("DELETE FROM request_attachments WHERE id = @eid");
+      }
+      const saved = saveRequestAttachmentFile(
+        String(requestRow.entity || "").trim() || req.entityContext,
+        requestRow.department,
+        requestRow.formatted_id,
+        requestId,
+        logicalName,
+        buf,
+        validated.mimeType
+      );
+      await sqlPool
+        .request()
+        .input("request_id", sql.Int, requestId)
+        .input("file_name", sql.NVarChar, saved.storedFileName)
+        .input("file_type", sql.NVarChar, saved.mimeType)
+        .input("file_data", sql.NVarChar(sql.MAX), null)
+        .input("file_path", sql.NVarChar, saved.storedPath)
+        .query(
+          "INSERT INTO request_attachments (request_id, file_name, file_type, file_data, file_path) VALUES (@request_id, @file_name, @file_type, @file_data, @file_path)"
+        );
+      approvalEventLog(
+        `REQUEST_FORM_PDF_STORED ${formatActor(req)} request_id=${requestId} file=${approvalLogSanitize(saved.storedFileName, 120)}`
+      );
+      return res.json({ success: true, file_name: saved.storedFileName });
+    } catch (e: any) {
+      console.error("generated-form-pdf:", e?.message || e);
+      return res.status(500).json({ error: "Failed to store generated form PDF" });
+    }
   });
 
   app.get("/api/workflow-requests/:id/approvals", authenticate, requireEntityContext, async (req: any, res) => {
@@ -2734,7 +2824,7 @@ async function startServer() {
                 buf,
                 String(att?.type || "")
               );
-              rel = saved.relativePath;
+              rel = saved.storedPath;
               att.name = saved.storedFileName;
               att.type = saved.mimeType;
             } catch (e: any) {
@@ -3113,7 +3203,7 @@ async function startServer() {
             att.file_name
           );
           if (copied) {
-            relOut = copied.relativePath;
+            relOut = copied.storedPath;
           } else if (att.file_data) {
             const buf = decodeAttachmentPayload(att.file_data);
             if (buf.length > 0) {
@@ -3124,7 +3214,7 @@ async function startServer() {
                 newRequestId,
                 String(att.file_name || "file"),
                 buf
-              ).relativePath;
+              ).storedPath;
             }
           }
           await sqlPool
@@ -3219,7 +3309,7 @@ async function startServer() {
           att.file_name
         );
         if (copied) {
-          relOut = copied.relativePath;
+          relOut = copied.storedPath;
         } else if (att.file_data) {
           const buf = decodeAttachmentPayload(att.file_data);
           if (buf.length > 0) {
@@ -3230,7 +3320,7 @@ async function startServer() {
               newRequestId,
               String(att.file_name || "file"),
               buf
-            ).relativePath;
+            ).storedPath;
           }
         }
         await sqlPool

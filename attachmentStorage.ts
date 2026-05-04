@@ -33,6 +33,23 @@ function safeBaseName(originalName: string, max = 80): string {
   );
 }
 
+/** Windows / UNC reserved characters only — keeps preparer spelling, spaces, and Unicode in the basename. */
+const FILENAME_FORBIDDEN_CHARS = /[<>:"/\\|?*\u0000-\u001f]/g;
+
+/**
+ * Visible `file_name` for DB and downloads: basename from upload, strip path, only remove illegal
+ * filename characters (do not replace spaces or unicode with underscores).
+ */
+export function displayFileNameFromUpload(originalName: string, extLower: string): string {
+  const ext = extLower.startsWith(".") ? extLower.toLowerCase() : `.${extLower.toLowerCase()}`;
+  const trimmed = String(originalName || "").trim();
+  let base = path.basename(trimmed, path.extname(trimmed));
+  base = base.replace(FILENAME_FORBIDDEN_CHARS, "_").replace(/[. ]+$/g, "").trim();
+  if (!base) base = "file";
+  const maxBase = 220;
+  return `${base.slice(0, maxBase)}${ext}`;
+}
+
 function detectMagic(buffer: Buffer): "pdf" | "png" | "jpg" | "zip" | "ole" | "unknown" {
   if (buffer.length >= 5 && buffer.slice(0, 5).equals(Buffer.from([0x25, 0x50, 0x44, 0x46, 0x2d]))) return "pdf"; // %PDF-
   if (buffer.length >= 8 && buffer.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])))
@@ -90,7 +107,7 @@ export function validateAttachmentUpload(
   originalName: string,
   claimedMimeType: string | null | undefined,
   buffer: Buffer
-): { safeFileName: string; fileExt: string; mimeType: string } {
+): { safeFileName: string; displayFileName: string; fileExt: string; mimeType: string } {
   if (!buffer.length) throw new Error("Empty file upload");
   if (!Number.isFinite(MAX_ATTACHMENT_BYTES) || MAX_ATTACHMENT_BYTES <= 0) {
     throw new Error("MAX_ATTACHMENT_BYTES must be a positive integer");
@@ -118,7 +135,13 @@ export function validateAttachmentUpload(
   }
 
   const safeName = safeBaseName(originalName);
-  return { safeFileName: `${safeName}${ext}`, fileExt: ext, mimeType: cfg.mime };
+  const displayFileName = displayFileNameFromUpload(originalName, ext);
+  return {
+    safeFileName: `${safeName}${ext}`,
+    displayFileName,
+    fileExt: ext,
+    mimeType: cfg.mime,
+  };
 }
 
 /** Decode `data:mime;base64,...` or raw base64 into a buffer. */
@@ -130,16 +153,32 @@ export function decodeAttachmentPayload(data: string): Buffer {
   return Buffer.from(s, "base64");
 }
 
-export function resolveStoredPath(relativePath: string): string {
-  const rel = String(relativePath || "").replace(/\\/g, "/").replace(/^\/+/, "");
-  if (!rel || rel.includes("..")) throw new Error("Invalid stored path");
-  const full = path.join(getAttachmentsRoot(), ...rel.split("/"));
-  const root = path.resolve(getAttachmentsRoot());
-  const resolved = path.resolve(full);
-  if (!resolved.startsWith(root + path.sep) && resolved !== root) {
+/**
+ * Resolve a path stored in `request_attachments.file_path`: supports full UNC/absolute paths
+ * (new) and legacy paths relative to `getAttachmentsRoot()`.
+ */
+export function resolveStoredPath(storedPath: string): string {
+  const raw = String(storedPath || "").trim();
+  if (!raw || raw.includes("..")) throw new Error("Invalid stored path");
+  const rootRaw = getAttachmentsRoot();
+  const rootResolved = path.resolve(rootRaw);
+
+  const normalizedInput = raw.replace(/\//g, path.sep);
+  let candidate: string;
+  if (path.isAbsolute(normalizedInput)) {
+    candidate = path.resolve(normalizedInput);
+  } else {
+    const rel = normalizedInput.replace(/^[\\/]+/, "");
+    candidate = path.resolve(path.join(rootResolved, ...rel.split(/[/\\]+/)));
+  }
+
+  const rootLc = rootResolved.toLowerCase();
+  const candLc = candidate.toLowerCase();
+  const rootPrefix = rootLc.endsWith(path.sep) ? rootLc : rootLc + path.sep;
+  if (candLc !== rootLc && !candLc.startsWith(rootPrefix)) {
     throw new Error("Path escapes attachments root");
   }
-  return resolved;
+  return candidate;
 }
 
 export function saveRequestAttachmentFile(
@@ -150,7 +189,7 @@ export function saveRequestAttachmentFile(
   originalName: string,
   buffer: Buffer,
   claimedMimeType?: string | null
-): { relativePath: string; mimeType: string; storedFileName: string } {
+): { storedPath: string; mimeType: string; storedFileName: string } {
   const validated = validateAttachmentUpload(originalName, claimedMimeType, buffer);
   const folderId =
     String(formattedId || "").trim() || `request_${Number.isFinite(requestId) ? String(requestId) : "unknown"}`;
@@ -165,14 +204,14 @@ export function saveRequestAttachmentFile(
   const filename = `${unique}_${validated.safeFileName}`;
   const full = path.join(dir, filename);
   fs.writeFileSync(full, buffer);
-  const rel = path.relative(getAttachmentsRoot(), full).split(path.sep).join("/");
-  return { relativePath: rel, mimeType: validated.mimeType, storedFileName: validated.safeFileName };
+  const storedPath = path.normalize(path.resolve(full));
+  return { storedPath, mimeType: validated.mimeType, storedFileName: validated.displayFileName };
 }
 
-export function tryUnlinkStoredFile(relativePath: string | null | undefined): void {
-  if (!relativePath) return;
+export function tryUnlinkStoredFile(storedPath: string | null | undefined): void {
+  if (!storedPath) return;
   try {
-    const full = resolveStoredPath(relativePath);
+    const full = resolveStoredPath(storedPath);
     if (fs.existsSync(full)) fs.unlinkSync(full);
   } catch {
     // ignore
@@ -186,7 +225,7 @@ export function copyStoredFileToRequest(
   newRequestId: number,
   sourceRelativePath: string | null | undefined,
   originalFileName: string
-): { relativePath: string } | null {
+): { storedPath: string } | null {
   if (!sourceRelativePath) return null;
   try {
     const src = resolveStoredPath(sourceRelativePath);

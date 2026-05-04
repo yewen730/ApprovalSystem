@@ -216,10 +216,24 @@ const PdfViewer = ({
   );
 };
 
-function buildPdfPreview(doc: jsPDF, fileName: string): { url: string; fileName: string } {
+function buildPdfPreview(doc: jsPDF, fileName: string): { url: string; fileName: string; pdfDataUrl: string } {
+  const pdfDataUrl = doc.output("dataurlstring");
   const blob = doc.output("blob");
   const url = URL.createObjectURL(blob);
-  return { url, fileName };
+  return { url, fileName, pdfDataUrl };
+}
+
+/** Saves PR/SR/PO form PDF next to quotation uploads (same UNC folder per request). */
+async function persistGeneratedProcurementFormPdf(requestId: number, pdfDataUrl: string): Promise<void> {
+  if (!requestId || !pdfDataUrl) return;
+  try {
+    await api.request(`/api/workflow-requests/${requestId}/generated-form-pdf`, {
+      method: "POST",
+      body: JSON.stringify({ pdf_data: pdfDataUrl }),
+    });
+  } catch (e) {
+    console.error("Failed to archive form PDF to server:", e);
+  }
 }
 
 function toUpperSerial(value: string | number | null | undefined): string {
@@ -999,6 +1013,66 @@ const isProcurementQuantityGridColumn = (col: string) => {
   const c = col.trim().toLowerCase();
   return c === 'quantity' || c === 'min quantity' || c === 'max quantity';
 };
+
+const isProcurementLineItemDateColumn = (col: string) => {
+  const c = col.trim().toLowerCase();
+  return c === 'delivery date' || c === 'request to be delivered on';
+};
+
+/** Normalize stored line-item dates to `YYYY-MM-DD` for `<input type="date">`. */
+function htmlDateValueFromStored(raw: unknown): string {
+  const s = String(raw ?? '').trim();
+  if (!s) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const head = s.slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(head) && (s.length === 10 || s[10] === 'T' || s[10] === ' ')) return head;
+  const m = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(s);
+  if (m) {
+    const p1 = parseInt(m[1], 10);
+    const p2 = parseInt(m[2], 10);
+    const y = parseInt(m[3], 10);
+    let day: number;
+    let month: number;
+    if (p1 > 12) {
+      day = p1;
+      month = p2;
+    } else if (p2 > 12) {
+      month = p1;
+      day = p2;
+    } else {
+      day = p1;
+      month = p2;
+    }
+    if (y >= 1900 && y <= 2100 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const d = new Date(y, month - 1, day);
+      if (!Number.isNaN(d.getTime()) && d.getFullYear() === y && d.getMonth() === month - 1 && d.getDate() === day) {
+        return `${y}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      }
+    }
+  }
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  return '';
+}
+
+function normalizeLineItemsForDateInputs(items: any[], columns: string[]): any[] {
+  if (!Array.isArray(items) || items.length === 0) return items;
+  const dateCols = columns.filter((col) => isProcurementLineItemDateColumn(col));
+  if (dateCols.length === 0) return items;
+  return items.map((it) => {
+    if (!it || typeof it !== 'object') return it;
+    const next = { ...it };
+    for (const col of dateCols) {
+      const cur = next[col];
+      if (cur != null && String(cur).trim() !== '') {
+        next[col] = htmlDateValueFromStored(cur);
+      }
+    }
+    return next;
+  });
+}
 
 const lineItemRemarksDisplay = (item: any) =>
   String(item?.[REMARKS_LINE_COL] ?? item?.['Remarks (Purpose)'] ?? '').trim();
@@ -2537,7 +2611,7 @@ function mergeRequestApprovalsForPdf(
   return request;
 }
 
-function createWorkflowRequestPdfPreview(request: WorkflowRequest): { url: string; fileName: string } {
+function createWorkflowRequestPdfPreview(request: WorkflowRequest): { url: string; fileName: string; pdfDataUrl: string } {
   if (isPR_Only(request)) return printProcurementPRFormPdf(request);
   if (isSR_Only(request)) return printProcurementSRFormPdf(request);
   return printWorkflowRequestReportPdf(request);
@@ -3695,18 +3769,22 @@ const WorkflowRequestList = ({
 
   const handlePrintPR = (request: WorkflowRequest) => {
     const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
+    const preview = createWorkflowRequestPdfPreview(merged);
+    void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
     setViewingPdf((prev) => {
       if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return createWorkflowRequestPdfPreview(merged);
+      return { url: preview.url, fileName: preview.fileName };
     });
     toast.success('PDF ready to view');
   };
 
   const handleShowRequestPdfInline = (request: WorkflowRequest) => {
     const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
+    const preview = createWorkflowRequestPdfPreview(merged);
+    void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
     setDetailsPdfPreview((prev) => {
       if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return createWorkflowRequestPdfPreview(merged);
+      return { url: preview.url, fileName: preview.fileName };
     });
     setDetailsViewMode('pdf');
   };
@@ -4354,7 +4432,10 @@ const WorkflowRequestList = ({
                         setEditData({ 
                           title: selectedRequest.title, 
                           details: selectedRequest.details, 
-                          line_items: [...(selectedRequest.line_items || [])],
+                          line_items: normalizeLineItemsForDateInputs(
+                            [...(selectedRequest.line_items || [])],
+                            getColumns(selectedRequest)
+                          ),
                           tax_rate: procurementUnitRateToPercent(selectedRequest.tax_rate, 0.18),
                           discount_rate: procurementUnitRateToPercent(selectedRequest.discount_rate, 0),
                           currency: selectedRequest.currency?.trim() ?? '',
@@ -4611,6 +4692,17 @@ const WorkflowRequestList = ({
                                             loading={costCentersLoading}
                                             loadFailed={costCentersLoadFailed}
                                             loadErrorHint={costCentersFetchError}
+                                          />
+                                        ) : isProcurementLineItemDateColumn(col) ? (
+                                          <input
+                                            type="date"
+                                            className="w-full px-2 py-1 rounded border border-zinc-200 text-xs outline-none focus:ring-1 focus:ring-indigo-500 bg-white"
+                                            value={htmlDateValueFromStored(item[col])}
+                                            onChange={(e) => {
+                                              const newItems = [...editData.line_items];
+                                              newItems[idx] = { ...newItems[idx], [col]: e.target.value };
+                                              setEditData({ ...editData, line_items: newItems });
+                                            }}
                                           />
                                         ) : (
                                           <input
@@ -6924,18 +7016,22 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
 
   const handlePrintPR = (request: WorkflowRequest) => {
     const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
+    const preview = createWorkflowRequestPdfPreview(merged);
+    void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
     setViewingPdf((prev) => {
       if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return createWorkflowRequestPdfPreview(merged);
+      return { url: preview.url, fileName: preview.fileName };
     });
     toast.success('PDF ready to view');
   };
 
   const handleShowRequestPdfInline = (request: WorkflowRequest) => {
     const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
+    const preview = createWorkflowRequestPdfPreview(merged);
+    void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
     setDetailsPdfPreview((prev) => {
       if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return createWorkflowRequestPdfPreview(merged);
+      return { url: preview.url, fileName: preview.fileName };
     });
     setDetailsViewMode('pdf');
   };
@@ -7534,7 +7630,10 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                         setEditData({ 
                           title: selectedRequest.title, 
                           details: selectedRequest.details, 
-                          line_items: [...(selectedRequest.line_items || [])],
+                          line_items: normalizeLineItemsForDateInputs(
+                            [...(selectedRequest.line_items || [])],
+                            procurementGridColumns(selectedRequest)
+                          ),
                           tax_rate: procurementUnitRateToPercent(selectedRequest.tax_rate, 0.18),
                           discount_rate: procurementUnitRateToPercent(selectedRequest.discount_rate, 0),
                           currency: selectedRequest.currency?.trim() ?? '',
@@ -7558,7 +7657,10 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                             setEditData({ 
                               title: selectedRequest.title, 
                               details: selectedRequest.details, 
-                              line_items: [...(selectedRequest.line_items || [])],
+                              line_items: normalizeLineItemsForDateInputs(
+                                [...(selectedRequest.line_items || [])],
+                                procurementGridColumns(selectedRequest)
+                              ),
                               tax_rate: procurementUnitRateToPercent(selectedRequest.tax_rate, 0.18),
                               discount_rate: procurementUnitRateToPercent(selectedRequest.discount_rate, 0),
                               currency: selectedRequest.currency?.trim() ?? '',
@@ -7821,6 +7923,17 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                             loading={costCentersLoading}
                                             loadFailed={costCentersLoadFailed}
                                             loadErrorHint={costCentersFetchError}
+                                          />
+                                        ) : isProcurementLineItemDateColumn(col) ? (
+                                          <input
+                                            type="date"
+                                            className="w-full px-2 py-1.5 rounded border border-zinc-100 text-xs focus:ring-1 focus:ring-indigo-500 outline-none"
+                                            value={htmlDateValueFromStored(item[col])}
+                                            onChange={(e) => {
+                                              const newItems = [...editData.line_items];
+                                              newItems[idx] = { ...newItems[idx], [col]: e.target.value };
+                                              setEditData({ ...editData, line_items: newItems });
+                                            }}
                                           />
                                         ) : (
                                           <input
