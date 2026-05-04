@@ -54,6 +54,8 @@ export interface WorkflowRequest {
   id: number;
   template_id: number;
   requester_id: number;
+  /** Login/username stored on the request row (workflow_requests.requester_username). */
+  requester_username?: string | null;
   requester_name: string;
   department: string;
   template_name: string;
@@ -66,6 +68,12 @@ export interface WorkflowRequest {
   entity?: string; // The entity this request belongs to
   /** GCCM: requester-selected user id for approver-role steps (see server rules). */
   assigned_approver_id?: number | null;
+  /** Resolved: stored workflow_requests.assigned_approver_name if set, else live user from assigned_approver_id. */
+  assigned_approver_name?: string | null;
+  assigned_approver_designation?: string | null;
+  /** Values persisted on the row only (empty if never stored); list/procurement API. */
+  assigned_approver_name_saved?: string | null;
+  assigned_approver_designation_saved?: string | null;
   /** List API: request total (MYR) when pending on approver step (for limit / escalation UI). */
   request_total_myr_snapshot?: number | null;
   /** Persisted request total amount in MYR (stored in SQL workflow_requests.total_amount_myr). */
@@ -75,6 +83,8 @@ export interface WorkflowRequest {
   /** List API: true when amount exceeds chosen approver's cap (another same-dept higher-limit approver may sign). */
   assigned_approval_shortfall?: boolean;
   formatted_id?: string; // The auto-generated PR ID
+  /** Full on-disk path to the auto-saved PR/SR/PO form PDF (see `generated-form-pdf` API). */
+  generated_form_pdf_path?: string | null;
   currency?: string;
   cost_center?: string;
   section?: string;

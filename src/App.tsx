@@ -1421,13 +1421,30 @@ const isSRRequest = (request: WorkflowRequest) => {
 const isProcurementPRorPORequest = (req: WorkflowRequest | null | undefined) =>
   !!req && req.category === 'procurement' && (isPRRequest(req) || isPO_Only(req) || isSRRequest(req));
 
+/** List/export "Supplier" column: PR/SR suggested supplier; PO finalized supplier per line. */
+function procurementSupplierColumnDisplay(request: WorkflowRequest): string {
+  if (isPO_Only(request)) {
+    const suppliers = new Set<string>();
+    for (const item of request.line_items || []) {
+      const v = String((item as Record<string, unknown>)?.['Final Supplier'] ?? '').trim();
+      if (v) suppliers.add(v);
+    }
+    if (suppliers.size === 0) return '-';
+    return [...suppliers].join(', ');
+  }
+  const pr = prSuggestedSupplierDisplay(request);
+  return pr ? pr : '-';
+}
+
 const procurementGridColumns = (req: WorkflowRequest) => {
   if (isPRRequest(req)) return PR_COLUMNS;
   if (isSRRequest(req)) return SR_COLUMNS;
+  if (isPO_Only(req)) return PO_COLUMNS;
   return req.table_columns || [];
 };
 
-const procurementRowShowsLineTotal = (req: WorkflowRequest) => isPRRequest(req) || isSRRequest(req);
+const procurementRowShowsLineTotal = (req: WorkflowRequest) =>
+  isPRRequest(req) || isSRRequest(req) || isPO_Only(req);
 
 const parseDepartmentCsv = (value: string | undefined) =>
   String(value || '')
@@ -1581,6 +1598,16 @@ const formatWorkflowRequestStatusLabel = (r: WorkflowRequest) => {
   if (n === 'cancelled') return 'Cancelled';
   if (n === 'pending') return 'Pending';
   return r.status ?? '—';
+};
+
+const requestHasChosenApprover = (r: WorkflowRequest): boolean => {
+  const id = r.assigned_approver_id;
+  return id != null && Number.isFinite(Number(id)) && Number(id) > 0;
+};
+
+const chosenApproverNameLabel = (r: WorkflowRequest): string => {
+  const n = String(r.assigned_approver_name ?? '').trim();
+  return n || '—';
 };
 
 /** PR already has a PO request created from it (one PR → one PO). */
@@ -3587,7 +3614,9 @@ const WorkflowRequestList = ({
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [filterDept, setFilterDept] = useState<string>('all');
   const [filterEntity, setFilterEntity] = useState<string>('all');
-  const [sortBy, setSortBy] = useState<'request' | 'entity' | 'department' | 'requester' | 'status' | 'date'>('date');
+  const [sortBy, setSortBy] = useState<
+    'request' | 'entity' | 'department' | 'requester' | 'chosenApprover' | 'status' | 'date'
+  >('date');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
   const [isEditing, setIsEditing] = useState(false);
   const [editData, setEditData] = useState({
@@ -3600,6 +3629,8 @@ const WorkflowRequestList = ({
     suggested_supplier: '',
     tax_rate: 18,
     discount_rate: 0,
+    requester_username: '',
+    requester_name: '',
   });
   const [editAttachmentKeep, setEditAttachmentKeep] = useState<Attachment[]>([]);
   const [editAttachmentAdd, setEditAttachmentAdd] = useState<{ id: string; name: string; type: string; data: string }[]>([]);
@@ -3713,7 +3744,9 @@ const WorkflowRequestList = ({
     return statusMatch && deptMatch && entityMatch;
   });
 
-  const toggleSort = (next: 'request' | 'entity' | 'department' | 'requester' | 'status' | 'date') => {
+  const toggleSort = (
+    next: 'request' | 'entity' | 'department' | 'requester' | 'chosenApprover' | 'status' | 'date'
+  ) => {
     if (sortBy === next) {
       setSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
       return;
@@ -3736,10 +3769,15 @@ const WorkflowRequestList = ({
     if (sortBy === 'entity') return byText(String(a.entity || ''), String(b.entity || ''));
     if (sortBy === 'department') return byText(String(a.department || ''), String(b.department || ''));
     if (sortBy === 'requester') return byText(String(a.requester_name || ''), String(b.requester_name || ''));
+    if (sortBy === 'chosenApprover') {
+      return byText(chosenApproverNameLabel(a), chosenApproverNameLabel(b));
+    }
     return byText(formatWorkflowRequestStatusLabel(a), formatWorkflowRequestStatusLabel(b));
   });
 
-  const sortIndicator = (key: 'request' | 'entity' | 'department' | 'requester' | 'status' | 'date') =>
+  const sortIndicator = (
+    key: 'request' | 'entity' | 'department' | 'requester' | 'chosenApprover' | 'status' | 'date'
+  ) =>
     sortBy === key ? (sortDirection === 'asc' ? ' ↑' : ' ↓') : '';
 
   const handleViewRequest = async (request: WorkflowRequest) => {
@@ -3753,7 +3791,9 @@ const WorkflowRequestList = ({
       cost_center: request.cost_center || '',
       section: sectionSelectionFromStored(request.section),
       tax_rate: procurementUnitRateToPercent(request.tax_rate, 0.18),
-      discount_rate: procurementUnitRateToPercent(request.discount_rate, 0)
+      discount_rate: procurementUnitRateToPercent(request.discount_rate, 0),
+      requester_username: String(request.requester_username ?? '').trim(),
+      requester_name: String(request.requester_name ?? '').trim(),
     });
     setComment('');
     setApproverSignature(null);
@@ -4186,8 +4226,9 @@ const WorkflowRequestList = ({
 
   const canEdit = selectedRequest && (
     (isWorkflowRequestPending(selectedRequest) && (
-      user.id === selectedRequest.requester_id || 
-      (canApprove && hasPermission('edit_requests'))
+      user.id === selectedRequest.requester_id ||
+      (canApprove && hasPermission('edit_requests')) ||
+      (isPurchasing && isPO_Only(selectedRequest))
     )) ||
     // Requester may edit rejected PRs before resubmitting.
     (isWorkflowRequestRejected(selectedRequest) && isPR_Only(selectedRequest) && user.id === selectedRequest.requester_id) ||
@@ -4264,7 +4305,7 @@ const WorkflowRequestList = ({
 
       <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden shadow-sm flex-1 min-h-0 flex flex-col min-w-0">
         <div className="overflow-auto flex-1 min-h-0 min-w-0">
-          <table className="w-full min-w-[1024px] table-auto border-collapse text-left text-[11px] sm:text-xs">
+          <table className="w-full min-w-[1120px] table-auto border-collapse text-left text-[11px] sm:text-xs">
             <thead className="bg-zinc-50 text-zinc-500 text-[10px] sm:text-xs uppercase font-bold sticky top-0 z-[1] shadow-[0_1px_0_0_rgb(228_228_231)]">
               <tr>
                 <th className="px-3 py-2 min-w-[14rem] align-bottom">
@@ -4287,6 +4328,11 @@ const WorkflowRequestList = ({
                     Requester{sortIndicator('requester')}
                   </button>
                 </th>
+                <th className="px-3 py-2 min-w-[8.5rem] align-bottom">
+                  <button type="button" onClick={() => toggleSort('chosenApprover')} className="hover:text-zinc-700 transition-colors text-left">
+                    Chosen approver{sortIndicator('chosenApprover')}
+                  </button>
+                </th>
                 <th className="px-3 py-2 min-w-[6.5rem] align-bottom">
                   <button type="button" onClick={() => toggleSort('status')} className="hover:text-zinc-700 transition-colors text-left">
                     Status{sortIndicator('status')}
@@ -4305,7 +4351,7 @@ const WorkflowRequestList = ({
             <tbody className="divide-y divide-zinc-100">
               {sortedFilteredRequests.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="px-3 py-12 text-center text-zinc-400 italic">
+                  <td colSpan={10} className="px-3 py-12 text-center text-zinc-400 italic">
                     No requests found matching filters.
                   </td>
                 </tr>
@@ -4338,6 +4384,9 @@ const WorkflowRequestList = ({
                       {r.department}
                     </td>
                     <td className="px-3 py-2 align-top min-w-[8.5rem] text-zinc-700 break-words leading-tight">{r.requester_name}</td>
+                    <td className="px-3 py-2 align-top min-w-[8.5rem] text-zinc-700 break-words leading-tight">
+                      {requestHasChosenApprover(r) ? chosenApproverNameLabel(r) : '—'}
+                    </td>
                     <td className="px-3 py-2 align-top min-w-[6.5rem]">
                       <span
                         className={cn(
@@ -4442,6 +4491,8 @@ const WorkflowRequestList = ({
                           cost_center: selectedRequest.cost_center || '',
                           section: sectionSelectionFromStored(selectedRequest.section),
                           suggested_supplier: prSuggestedSupplierDisplay(selectedRequest),
+                          requester_username: String(selectedRequest.requester_username ?? '').trim(),
+                          requester_name: String(selectedRequest.requester_name ?? '').trim(),
                         } as any);
                         setEditAttachmentKeep(attachments);
                         setEditAttachmentAdd([]);
@@ -4615,6 +4666,34 @@ const WorkflowRequestList = ({
                             onChange={(e) => setEditData({ ...editData, title: e.target.value })}
                           />
                         </div>
+                        {isPO_Only(selectedRequest) && isPurchasing && isWorkflowRequestPending(selectedRequest) && (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-3xl">
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Requester login</label>
+                              <input
+                                type="text"
+                                className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                autoComplete="off"
+                                placeholder="Username in system"
+                                value={editData.requester_username}
+                                onChange={(e) => setEditData({ ...editData, requester_username: e.target.value })}
+                              />
+                            </div>
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Requester name</label>
+                              <input
+                                type="text"
+                                className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                placeholder="Name on document"
+                                value={editData.requester_name}
+                                onChange={(e) => setEditData({ ...editData, requester_name: e.target.value })}
+                              />
+                            </div>
+                            <p className="text-xs text-zinc-500 sm:col-span-2">
+                              Changing login reassigns the requester and sets department from their profile. Changing only the name updates department from the profile of the current requester.
+                            </p>
+                          </div>
+                        )}
                         {!isProcurementPRorPORequest(selectedRequest) && (
                         <div>
                           <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Details</label>
@@ -4828,7 +4907,7 @@ const WorkflowRequestList = ({
                                   ? 'Purchase Order'
                                   : 'Workflow Request'}
                           </h1>
-                          <p className="text-sm text-zinc-500 font-medium">Ref: #{selectedRequest.id.toString().padStart(6, '0')}</p>
+                          <p className="text-sm text-zinc-500 font-medium">Ref: #{displayRequestSerial(selectedRequest)}</p>
                         </div>
                         <div className="flex items-center gap-4">
                           <button 
@@ -4898,6 +4977,16 @@ const WorkflowRequestList = ({
                         <p className="text-sm text-zinc-500">Category: {selectedRequest.category || 'General'}</p>
                       </div>
                     </div>
+
+                    {requestHasChosenApprover(selectedRequest) ? (
+                      <div className="mt-6 pt-6 border-t border-zinc-100">
+                        <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Chosen approver</label>
+                        <p className="font-bold text-zinc-900">{chosenApproverNameLabel(selectedRequest)}</p>
+                        {String(selectedRequest.assigned_approver_designation ?? '').trim() ? (
+                          <p className="text-sm text-zinc-500">{String(selectedRequest.assigned_approver_designation).trim()}</p>
+                        ) : null}
+                      </div>
+                    ) : null}
 
                     {isProcurementPRorPORequest(selectedRequest) && (
                       <div className="grid grid-cols-2 gap-8 mt-8 pt-8 border-t border-zinc-100">
@@ -6735,6 +6824,10 @@ async function downloadProcurementCenterExcel(
       'Entity name': entityLegalDisplayName(r.entity),
       Department: r.department ?? '',
       Requester: r.requester_name ?? '',
+      'Chosen approver ID': r.assigned_approver_id ?? '',
+      'Chosen approver': chosenApproverNameLabel(r),
+      'Chosen approver (at submit)': String(r.assigned_approver_name_saved ?? '').trim(),
+      'Chosen approver designation (at submit)': String(r.assigned_approver_designation_saved ?? '').trim(),
       Status: formatWorkflowRequestStatusLabel(r),
       'Created': r.created_at ?? '',
       Currency: r.currency ?? '',
@@ -6745,7 +6838,7 @@ async function downloadProcurementCenterExcel(
       'Total (display)': m.total > 0 ? `${curp}${m.total.toLocaleString()}`.trim() : '',
       'Item count': r.line_items?.length ?? 0,
       'Line summary': lines.join(' | '),
-      Supplier: prSuggestedSupplierDisplay(r),
+      Supplier: procurementSupplierColumnDisplay(r),
       'Cost center': r.cost_center ?? '',
       Section: r.section ?? '',
       'Linked PO request ID': linkedPo != null && Number(linkedPo) > 0 ? Number(linkedPo) : '',
@@ -6802,7 +6895,9 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     search: '',
     entity: ''
   });
-  const [tableSortBy, setTableSortBy] = useState<'id' | 'type' | 'entity' | 'requester' | 'items' | 'supplier' | 'total' | 'status' | 'date'>('date');
+  const [tableSortBy, setTableSortBy] = useState<
+    'id' | 'type' | 'entity' | 'requester' | 'chosenApprover' | 'items' | 'supplier' | 'total' | 'status' | 'date'
+  >('date');
   const [tableSortDirection, setTableSortDirection] = useState<'asc' | 'desc'>('desc');
   const [selectedRequest, setSelectedRequest] = useState<WorkflowRequest | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -6818,6 +6913,8 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     cost_center: '',
     section: '',
     suggested_supplier: '',
+    requester_username: '',
+    requester_name: '',
   });
   const [editAttachmentKeep, setEditAttachmentKeep] = useState<Attachment[]>([]);
   const [editAttachmentAdd, setEditAttachmentAdd] = useState<{ id: string; name: string; type: string; data: string }[]>([]);
@@ -6836,13 +6933,19 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   const isPurchasing = user.roles?.some(r => r.toLowerCase() === 'purchasing');
   const isAdmin = user.roles?.some(r => r.toLowerCase() === 'admin') || user.permissions?.includes('admin');
   const canEdit = selectedRequest && (
-    (isWorkflowRequestPending(selectedRequest) && (user.id === selectedRequest.requester_id || user.permissions?.includes('admin'))) ||
+    (isWorkflowRequestPending(selectedRequest) &&
+      (user.id === selectedRequest.requester_id ||
+        user.permissions?.includes('admin') ||
+        (isPurchasing && isPO_Only(selectedRequest)))) ||
+    (isWorkflowRequestRejected(selectedRequest) &&
+      isPR_Only(selectedRequest) &&
+      user.id === selectedRequest.requester_id) ||
     (isWorkflowRequestFullyApproved(selectedRequest) && isPR_Only(selectedRequest) && isPurchasing)
   );
   const canRequesterCancelSelected =
     !!selectedRequest && canRequesterCancelPendingRequest(selectedRequest, user, approvals);
 
-  const fetchProcurementRequests = async () => {
+  const fetchProcurementRequests = async (): Promise<WorkflowRequest[]> => {
     setLoading(true);
     try {
       const mergedFilters = {
@@ -6857,8 +6960,10 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
       const qs = params.toString();
       const data = await api.request(`/api/procurement/requests${qs ? `?${qs}` : ''}`, { skipEntity: true });
       setRequests(data);
+      return data;
     } catch (err) {
       toast.error('Failed to fetch procurement requests');
+      return [];
     } finally {
       setLoading(false);
     }
@@ -6953,21 +7058,25 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
       toast.success('Request updated');
       setIsEditing(false);
       setEditAttachmentAdd([]);
-      fetchProcurementRequests();
-      // Update local selected request
-      setSelectedRequest({
-        ...selectedRequest,
-        ...editData,
-        line_items: normalizedLineItems,
-        tax_rate: taxUnit,
-        discount_rate: discUnit,
-        currency: curOut !== undefined ? curOut : selectedRequest.currency,
-        details: detailsOut,
-        section: sectionOut,
-        ...(isPRRequest(selectedRequest)
-          ? { suggested_supplier: String(editData.suggested_supplier ?? '').trim() }
-          : {}),
-      });
+      const refreshed = await fetchProcurementRequests();
+      const nextSel = refreshed.find((x) => x.id === selectedRequest.id);
+      if (nextSel) {
+        setSelectedRequest(nextSel);
+      } else {
+        setSelectedRequest({
+          ...selectedRequest,
+          ...editData,
+          line_items: normalizedLineItems,
+          tax_rate: taxUnit,
+          discount_rate: discUnit,
+          currency: curOut !== undefined ? curOut : selectedRequest.currency,
+          details: detailsOut,
+          section: sectionOut,
+          ...(isPRRequest(selectedRequest)
+            ? { suggested_supplier: String(editData.suggested_supplier ?? '').trim() }
+            : {}),
+        });
+      }
       await fetchDetails(selectedRequest.id);
     } catch (err: any) {
       toast.error(err.message);
@@ -7216,7 +7325,17 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   });
 
   const toggleProcurementSort = (
-    next: 'id' | 'type' | 'entity' | 'requester' | 'items' | 'supplier' | 'total' | 'status' | 'date'
+    next:
+      | 'id'
+      | 'type'
+      | 'entity'
+      | 'requester'
+      | 'chosenApprover'
+      | 'items'
+      | 'supplier'
+      | 'total'
+      | 'status'
+      | 'date'
   ) => {
     if (tableSortBy === next) {
       setTableSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
@@ -7235,6 +7354,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     if (tableSortBy === 'type') return byText(`${a.template_name} ${a.title || ''}`, `${b.template_name} ${b.title || ''}`);
     if (tableSortBy === 'entity') return byText(String(a.entity || ''), String(b.entity || ''));
     if (tableSortBy === 'requester') return byText(String(a.requester_name || ''), String(b.requester_name || ''));
+    if (tableSortBy === 'chosenApprover') return byText(chosenApproverNameLabel(a), chosenApproverNameLabel(b));
     if (tableSortBy === 'items') return ((a.line_items?.length || 0) - (b.line_items?.length || 0)) * dir;
     if (tableSortBy === 'supplier') return byText(supplierOf(a), supplierOf(b));
     if (tableSortBy === 'total') return (procurementMoneyTotals(a).total - procurementMoneyTotals(b).total) * dir;
@@ -7242,7 +7362,17 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   });
 
   const procurementSortIndicator = (
-    key: 'id' | 'type' | 'entity' | 'requester' | 'items' | 'supplier' | 'total' | 'status' | 'date'
+    key:
+      | 'id'
+      | 'type'
+      | 'entity'
+      | 'requester'
+      | 'chosenApprover'
+      | 'items'
+      | 'supplier'
+      | 'total'
+      | 'status'
+      | 'date'
   ) => (tableSortBy === key ? (tableSortDirection === 'asc' ? ' ↑' : ' ↓') : '');
 
   const emptyProcurementListMessage =
@@ -7392,7 +7522,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
       {/* Table */}
       <div className="bg-white rounded-2xl border border-zinc-200 shadow-sm overflow-hidden flex-1 min-h-0">
         <div className="w-full h-full overflow-auto min-w-0">
-        <table className="w-full min-w-[1100px] table-auto text-left border-collapse text-[11px] sm:text-xs">
+        <table className="w-full min-w-[1200px] table-auto text-left border-collapse text-[11px] sm:text-xs">
           <thead>
             <tr className="bg-zinc-50 border-b border-zinc-200 sticky top-0 z-[1] shadow-[0_1px_0_0_rgb(228_228_231)]">
               <th className="px-3 py-2 min-w-[10.5rem] whitespace-nowrap text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
@@ -7413,6 +7543,11 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
               <th className="px-3 py-2 min-w-[8.5rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
                 <button type="button" onClick={() => toggleProcurementSort('requester')} className="hover:text-zinc-700 transition-colors text-left">
                   Requester{procurementSortIndicator('requester')}
+                </button>
+              </th>
+              <th className="px-3 py-2 min-w-[8.5rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
+                <button type="button" onClick={() => toggleProcurementSort('chosenApprover')} className="hover:text-zinc-700 transition-colors text-left">
+                  Chosen approver{procurementSortIndicator('chosenApprover')}
                 </button>
               </th>
               <th className="px-3 py-2 min-w-[10rem] text-[10px] sm:text-xs font-bold text-zinc-500 uppercase tracking-wider align-bottom">
@@ -7446,11 +7581,11 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           <tbody className="divide-y divide-zinc-100">
             {loading ? (
               <tr>
-                <td colSpan={10} className="px-3 py-12 text-center text-zinc-400 italic">Loading requests...</td>
+                <td colSpan={11} className="px-3 py-12 text-center text-zinc-400 italic">Loading requests...</td>
               </tr>
             ) : sortedFilteredRequests.length === 0 ? (
               <tr>
-                <td colSpan={10} className="px-3 py-12 text-center text-zinc-400 italic">{emptyProcurementListMessage}</td>
+                <td colSpan={11} className="px-3 py-12 text-center text-zinc-400 italic">{emptyProcurementListMessage}</td>
               </tr>
             ) : (
               sortedFilteredRequests.map((r) => {
@@ -7492,6 +7627,11 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                       <p className="text-zinc-700 font-medium break-words leading-tight">{r.requester_name}</p>
                       <p className="text-[9px] text-zinc-400 font-bold uppercase">{r.department}</p>
                     </td>
+                    <td className="px-3 py-2 align-top min-w-[8.5rem]">
+                      <p className="text-zinc-700 font-medium break-words leading-tight">
+                        {requestHasChosenApprover(r) ? chosenApproverNameLabel(r) : '—'}
+                      </p>
+                    </td>
                     <td className="px-3 py-2 align-top min-w-[10rem]">
                       <div className="space-y-0.5">
                         {r.line_items?.slice(0, 2).map((item, idx) => (
@@ -7510,7 +7650,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                     </td>
                     <td className="px-3 py-2 align-top min-w-[8.5rem]">
                       <p className="text-zinc-700 font-medium leading-tight break-words">
-                        {prSuggestedSupplierDisplay(r) || '-'}
+                        {procurementSupplierColumnDisplay(r)}
                       </p>
                     </td>
                     <td className="px-3 py-2 align-top whitespace-nowrap min-w-[5.5rem]">
@@ -7640,7 +7780,11 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                           cost_center: selectedRequest.cost_center || '',
                           section: sectionSelectionFromStored(selectedRequest.section),
                           suggested_supplier: prSuggestedSupplierDisplay(selectedRequest),
+                          requester_username: String(selectedRequest.requester_username ?? '').trim(),
+                          requester_name: String(selectedRequest.requester_name ?? '').trim(),
                         });
+                        setEditAttachmentKeep(attachments);
+                        setEditAttachmentAdd([]);
                         setIsEditing(true);
                       }}
                       className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-indigo-200 text-indigo-600 text-xs font-bold hover:bg-indigo-50 transition-all"
@@ -7667,6 +7811,8 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                               cost_center: selectedRequest.cost_center || '',
                               section: sectionSelectionFromStored(selectedRequest.section),
                               suggested_supplier: prSuggestedSupplierDisplay(selectedRequest),
+                              requester_username: String(selectedRequest.requester_username ?? '').trim(),
+                              requester_name: String(selectedRequest.requester_name ?? '').trim(),
                             });
                             setEditAttachmentKeep(attachments);
                             setEditAttachmentAdd([]);
@@ -7847,6 +7993,34 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                             onChange={(e) => setEditData({ ...editData, title: e.target.value })}
                           />
                         </div>
+                        {isPO_Only(selectedRequest) && isPurchasing && isWorkflowRequestPending(selectedRequest) && (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-3xl">
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Requester login</label>
+                              <input
+                                type="text"
+                                className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                autoComplete="off"
+                                placeholder="Username in system"
+                                value={editData.requester_username}
+                                onChange={(e) => setEditData({ ...editData, requester_username: e.target.value })}
+                              />
+                            </div>
+                            <div>
+                              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Requester name</label>
+                              <input
+                                type="text"
+                                className="w-full px-4 py-3 rounded-xl border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                placeholder="Name on document"
+                                value={editData.requester_name}
+                                onChange={(e) => setEditData({ ...editData, requester_name: e.target.value })}
+                              />
+                            </div>
+                            <p className="text-xs text-zinc-500 sm:col-span-2">
+                              Changing login reassigns the requester and sets department from their profile. Changing only the name updates department from the profile of the current requester.
+                            </p>
+                          </div>
+                        )}
                         {!isProcurementPRorPORequest(selectedRequest) && (
                         <div>
                           <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2 block">Details</label>
@@ -8060,7 +8234,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                   ? 'Purchase Order'
                                   : 'Workflow Request'}
                         </h1>
-                        <p className="text-sm text-zinc-500 font-medium">Ref: #{selectedRequest.id.toString().padStart(6, '0')}</p>
+                        <p className="text-sm text-zinc-500 font-medium">Ref: #{displayRequestSerial(selectedRequest)}</p>
                       </div>
                       <div className="text-right">
                         <span className={cn(
@@ -8118,6 +8292,16 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                         <p className="text-sm text-zinc-500">Category: {selectedRequest.category || 'General'}</p>
                       </div>
                     </div>
+
+                    {requestHasChosenApprover(selectedRequest) ? (
+                      <div className="mt-6 pt-6 border-t border-zinc-100">
+                        <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest block mb-1">Chosen approver</label>
+                        <p className="font-bold text-zinc-900">{chosenApproverNameLabel(selectedRequest)}</p>
+                        {String(selectedRequest.assigned_approver_designation ?? '').trim() ? (
+                          <p className="text-sm text-zinc-500">{String(selectedRequest.assigned_approver_designation).trim()}</p>
+                        ) : null}
+                      </div>
+                    ) : null}
 
                     {isProcurementPRorPORequest(selectedRequest) && (
                       <div className="grid grid-cols-2 gap-8 mt-8 pt-8 border-t border-zinc-100">

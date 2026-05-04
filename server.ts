@@ -11,6 +11,7 @@ import {
   decodeAttachmentPayload,
   getAttachmentsRoot,
   resolveStoredPath,
+  saveGeneratedProcurementFormPdf,
   saveRequestAttachmentFile,
   tryUnlinkStoredFile,
   validateAttachmentUpload,
@@ -45,6 +46,19 @@ function signatureFilePathForUser(user: any): string {
   const uname = sanitizeFileComponent(user?.username || "user");
   const file = Number.isFinite(id) && id > 0 ? `${id}-${uname}.png` : `${uname}.png`;
   return path.join(SIGNATURE_STORAGE_PATH, file);
+}
+
+/** Same image as GET /api/me/signature — used when stamping preparer on PO at PR→PO convert. */
+async function loadSavedSignatureDataUrlForUser(user: any): Promise<string | null> {
+  try {
+    const filePath = signatureFilePathForUser(user);
+    if (!fs.existsSync(filePath)) return null;
+    const buf = await fs.promises.readFile(filePath);
+    if (!buf.length) return null;
+    return `data:image/png;base64,${buf.toString("base64")}`;
+  } catch {
+    return null;
+  }
 }
 
 function parsePngDataUrl(dataUrl: string): Buffer {
@@ -574,6 +588,53 @@ async function fetchSqlUsersettingById(pool: sql.ConnectionPool, userId: number)
   }
 }
 
+/** Merge workflow_requests.template_name (stored) with joined workflows.name — avoids duplicate `template_name` in SELECT r.*, w.name. */
+function hydrateWorkflowRequestTemplateName(row: any) {
+  if (!row) return;
+  const join = String(row._join_workflow_template_name ?? "").trim();
+  const stored = String(row.template_name ?? "").trim();
+  row.template_name = stored || join || String(row.template_name ?? "");
+  delete row._join_workflow_template_name;
+}
+
+/**
+ * Display department: use `usersetting.department` for this row's `requester_id` when set, else stored `workflow_requests.department`.
+ * (Same column as User Management / SSMS `usersetting` — not a client-side guess.)
+ */
+function resolvedDepartmentFromUsersettingJoin(liveFromJoin: unknown, storedOnRow: unknown): string {
+  const live = String(liveFromJoin ?? "").trim();
+  if (live) return live;
+  return String(storedOnRow ?? "").trim();
+}
+
+/**
+ * When `requester_id` matches `usersetting` but `workflow_requests.department` is stale (e.g. profile updated, or old convert),
+ * persist `usersetting.department` so SSMS/reports match the preparer's real department.
+ */
+async function reconcileWorkflowRequestDepartmentsFromUsersetting(
+  pool: sql.ConnectionPool,
+  rows: Array<{ id?: unknown; department?: unknown; _join_requester_department?: unknown }>
+): Promise<void> {
+  for (const r of rows) {
+    const uDep = String(r._join_requester_department ?? "").trim();
+    if (!uDep) continue;
+    const rDep = String(r.department ?? "").trim();
+    if (uDep === rDep) continue;
+    const id = Number(r.id);
+    if (!Number.isFinite(id) || id <= 0) continue;
+    try {
+      await pool
+        .request()
+        .input("id", sql.Int, id)
+        .input("dep", sql.NVarChar, uDep)
+        .query(`UPDATE workflow_requests SET department = @dep WHERE id = @id`);
+      r.department = uDep;
+    } catch (e: any) {
+      console.warn("reconcile workflow_requests.department from usersetting:", id, e?.message || e);
+    }
+  }
+}
+
 /** Load one user row from SQL Server `usersetting`. */
 const fetchSqlUsersettingByUsername = async (pool: sql.ConnectionPool, username: string): Promise<any | null> => {
   const base = `SELECT TOP 1 id, username, password, role, department, entities FROM ${SQLSERVER_USERS_TABLE} WHERE username = @username`;
@@ -774,10 +835,6 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
         ALTER TABLE request_approvals ADD approver_role_snapshot NVARCHAR(255) NULL;
       IF COL_LENGTH('request_approvals', 'signed_by_user_id') IS NULL
         ALTER TABLE request_approvals ADD signed_by_user_id INT NULL;
-      IF COL_LENGTH('workflow_requests', 'requester_username_snapshot') IS NULL
-        ALTER TABLE workflow_requests ADD requester_username_snapshot NVARCHAR(255) NULL;
-      IF COL_LENGTH('workflow_requests', 'template_name_snapshot') IS NULL
-        ALTER TABLE workflow_requests ADD template_name_snapshot NVARCHAR(255) NULL;
       IF COL_LENGTH('workflow_requests', 'requester_name') IS NULL
         ALTER TABLE workflow_requests ADD requester_name NVARCHAR(255) NULL;
       IF COL_LENGTH('workflow_requests', 'checked_at') IS NULL
@@ -800,6 +857,8 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
         ALTER TABLE workflow_requests ADD converted_po_request_id INT NULL;
       IF COL_LENGTH('workflow_requests', 'total_amount_myr') IS NULL
         ALTER TABLE workflow_requests ADD total_amount_myr DECIMAL(18, 2) NULL;
+      IF COL_LENGTH('workflow_requests', 'generated_form_pdf_path') IS NULL
+        ALTER TABLE workflow_requests ADD generated_form_pdf_path NVARCHAR(1024) NULL;
     `);
   } catch (e: any) {
     console.warn("SQL workflow column ensure skipped:", e?.message || e);
@@ -836,6 +895,61 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
     `);
   } catch (e: any) {
     console.warn("SQL assigned_approver_id column:", e?.message || e);
+  }
+  try {
+    await pool.request().query(`
+      IF COL_LENGTH('workflow_requests', 'requester_username_snapshot') IS NOT NULL
+         AND COL_LENGTH('workflow_requests', 'requester_username') IS NULL
+        EXEC sp_rename N'dbo.workflow_requests.requester_username_snapshot', N'requester_username', N'COLUMN';
+      IF COL_LENGTH('workflow_requests', 'template_name_snapshot') IS NOT NULL
+         AND COL_LENGTH('workflow_requests', 'template_name') IS NULL
+        EXEC sp_rename N'dbo.workflow_requests.template_name_snapshot', N'template_name', N'COLUMN';
+      IF COL_LENGTH('workflow_requests', 'assigned_approver_name_snapshot') IS NOT NULL
+         AND COL_LENGTH('workflow_requests', 'assigned_approver_name') IS NULL
+        EXEC sp_rename N'dbo.workflow_requests.assigned_approver_name_snapshot', N'assigned_approver_name', N'COLUMN';
+      IF COL_LENGTH('workflow_requests', 'assigned_approver_designation_snapshot') IS NOT NULL
+         AND COL_LENGTH('workflow_requests', 'assigned_approver_designation') IS NULL
+        EXEC sp_rename N'dbo.workflow_requests.assigned_approver_designation_snapshot', N'assigned_approver_designation', N'COLUMN';
+    `);
+  } catch (e: any) {
+    console.warn("SQL rename workflow_requests columns (snapshot → short names):", e?.message || e);
+  }
+  try {
+    await pool.request().query(`
+      IF COL_LENGTH('workflow_requests', 'requester_username') IS NULL
+        ALTER TABLE workflow_requests ADD requester_username NVARCHAR(255) NULL;
+      IF COL_LENGTH('workflow_requests', 'template_name') IS NULL
+        ALTER TABLE workflow_requests ADD template_name NVARCHAR(255) NULL;
+    `);
+  } catch (e: any) {
+    console.warn("SQL workflow_requests requester_username / template_name ensure:", e?.message || e);
+  }
+  try {
+    await pool.request().query(`
+      IF COL_LENGTH('workflow_requests', 'assigned_approver_name') IS NULL
+        ALTER TABLE workflow_requests ADD assigned_approver_name NVARCHAR(255) NULL;
+      IF COL_LENGTH('workflow_requests', 'assigned_approver_designation') IS NULL
+        ALTER TABLE workflow_requests ADD assigned_approver_designation NVARCHAR(255) NULL;
+    `);
+  } catch (e: any) {
+    console.warn("SQL assigned_approver name/designation columns:", e?.message || e);
+  }
+  try {
+    await pool.request().query(`
+      UPDATE r
+      SET
+        r.assigned_approver_name = u.username,
+        r.assigned_approver_designation = u.designation
+      FROM workflow_requests r
+      INNER JOIN ${SQLSERVER_USERS_TABLE} u ON r.assigned_approver_id = u.id
+      WHERE r.assigned_approver_id IS NOT NULL
+        AND (
+          r.assigned_approver_name IS NULL
+          OR LTRIM(RTRIM(CAST(r.assigned_approver_name AS NVARCHAR(255)))) = N''
+        );
+    `);
+  } catch (e: any) {
+    console.warn("SQL backfill assigned_approver name/designation:", e?.message || e);
   }
   try {
     await pool.request().query(`
@@ -2098,23 +2212,47 @@ async function startServer() {
             po_link.formatted_id AS linked_po_formatted_id,
             po_link.status AS linked_po_status,
             COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.requester_name AS NVARCHAR(255)))), N''), u.username) AS computed_requester_name,
+            u.department AS _join_requester_department,
             u.designation AS requester_designation,
-            w.name AS template_name,
+            aa.username AS _join_assigned_username,
+            aa.designation AS _join_assigned_designation,
+            w.name AS _join_workflow_template_name,
             COALESCE(r.request_steps, w.steps) AS template_steps, w.table_columns AS table_columns,
             w.attachments_required AS attachments_required, w.category AS category
           FROM workflow_requests r
           INNER JOIN ${userJoinSql} u ON r.requester_id = u.id
           INNER JOIN workflows w ON r.template_id = w.id
+          LEFT JOIN ${userJoinSql} aa ON r.assigned_approver_id = aa.id
           LEFT JOIN workflow_requests po_link ON po_link.id = r.converted_po_request_id
           WHERE 1=1${entityClause}${deptClause}
           ORDER BY r.created_at DESC
         `);
       const requests = rs.recordset || [];
+      await reconcileWorkflowRequestDepartmentsFromUsersetting(sqlPool, requests);
       const mapped = requests.map((r: any) => {
-        const { computed_requester_name, ...row } = r;
+        const {
+          computed_requester_name,
+          _join_requester_department,
+          _join_assigned_username,
+          _join_assigned_designation,
+          _join_workflow_template_name,
+          ...row
+        } = r;
+        const storedApproverName = String(row.assigned_approver_name ?? "").trim();
+        const storedApproverDes = String(row.assigned_approver_designation ?? "").trim();
+        const joinApproverName = String(_join_assigned_username ?? "").trim();
+        const joinApproverDes = String(_join_assigned_designation ?? "").trim();
+        const storedTmpl = String(row.template_name ?? "").trim();
+        const joinTmpl = String(_join_workflow_template_name ?? "").trim();
         return {
           ...row,
+          department: resolvedDepartmentFromUsersettingJoin(_join_requester_department, row.department),
           requester_name: computed_requester_name ?? row.requester_name,
+          template_name: storedTmpl || joinTmpl || row.template_name,
+          assigned_approver_name: storedApproverName || joinApproverName || null,
+          assigned_approver_designation: storedApproverDes || joinApproverDes || null,
+          assigned_approver_name_saved: storedApproverName || null,
+          assigned_approver_designation_saved: storedApproverDes || null,
           template_steps: JSON.parse(row.template_steps),
           table_columns: row.table_columns ? JSON.parse(row.table_columns) : [],
           line_items: row.line_items ? JSON.parse(row.line_items) : [],
@@ -2256,6 +2394,8 @@ async function startServer() {
 
     const entityUpper = String(req.entityContext || "").trim().toUpperCase();
     let assignedApproverSql: number | null = null;
+    let assignedApproverNameSnapshot: string | null = null;
+    let assignedApproverDesignationSnapshot: string | null = null;
     if (stepsJsonIncludesApproverRole(requestStepsJson)) {
       const aid = Number(assigned_approver_id);
       if (!Number.isFinite(aid) || aid <= 0) {
@@ -2275,6 +2415,10 @@ async function startServer() {
         return res.status(400).json({ error: "Chosen approver must be in one of your departments." });
       }
       assignedApproverSql = aid;
+      const snapName = String(approverRow.username ?? "").trim();
+      assignedApproverNameSnapshot = snapName || null;
+      const snapDes = approverRow.designation != null ? String(approverRow.designation).trim() : "";
+      assignedApproverDesignationSnapshot = snapDes || null;
     }
 
     const taxVal = tax_rate !== undefined ? tax_rate : 0.18;
@@ -2290,9 +2434,9 @@ async function startServer() {
         .request()
         .input("template_id", sql.Int, Number(template_id))
         .input("requester_id", sql.Int, Number(req.user.id))
-        .input("requester_username_snapshot", sql.NVarChar, req.user.username || "")
+        .input("requester_username", sql.NVarChar, req.user.username || "")
         .input("requester_name", sql.NVarChar, req.user.username || "")
-        .input("template_name_snapshot", sql.NVarChar, template.name || "")
+        .input("template_name", sql.NVarChar, template.name || "")
         .input("department", sql.NVarChar, req.user.department)
         .input("title", sql.NVarChar, title)
         .input("details", sql.NVarChar, detailsForDb)
@@ -2310,17 +2454,21 @@ async function startServer() {
         .input("formatted_id", sql.NVarChar, formatted_id)
         .input("request_steps", sql.NVarChar(sql.MAX), requestStepsJson)
         .input("assigned_approver_id", sql.Int, assignedApproverSql)
+        .input("assigned_approver_name", sql.NVarChar, assignedApproverNameSnapshot)
+        .input("assigned_approver_designation", sql.NVarChar, assignedApproverDesignationSnapshot)
         .query(`
             INSERT INTO workflow_requests (
-              template_id, requester_id, requester_username_snapshot, requester_name, template_name_snapshot,
+              template_id, requester_id, requester_username, requester_name, template_name,
               department, title, details, line_items, requester_signature, requester_signed_at, tax_rate, discount_rate, currency, cost_center, section,
-              suggested_supplier, total_amount_myr, entity, formatted_id, request_steps, assigned_approver_id
+              suggested_supplier, total_amount_myr, entity, formatted_id, request_steps, assigned_approver_id,
+              assigned_approver_name, assigned_approver_designation
             ) VALUES (
-              @template_id, @requester_id, @requester_username_snapshot, @requester_name, @template_name_snapshot,
+              @template_id, @requester_id, @requester_username, @requester_name, @template_name,
               @department, @title, @details, @line_items, @requester_signature,
               CASE WHEN @requester_signed_flag = 1 THEN SYSUTCDATETIME() ELSE NULL END,
               @tax_rate, @discount_rate, @currency, @cost_center, @section,
-              @suggested_supplier, @total_amount_myr, @entity, @formatted_id, @request_steps, @assigned_approver_id
+              @suggested_supplier, @total_amount_myr, @entity, @formatted_id, @request_steps, @assigned_approver_id,
+              @assigned_approver_name, @assigned_approver_designation
             );
             SELECT CAST(SCOPE_IDENTITY() AS INT) AS id;
           `);
@@ -2466,12 +2614,13 @@ async function startServer() {
     }
     try {
       const rr = await sqlPool.request().input("id", sql.Int, requestId).query(`
-        SELECT r.*, w.category AS template_category, w.name AS template_name
+        SELECT r.*, w.category AS template_category, w.name AS _join_workflow_template_name
         FROM workflow_requests r
         INNER JOIN workflows w ON r.template_id = w.id
         WHERE r.id = @id
       `);
       const requestRow: any = rr.recordset?.[0];
+      hydrateWorkflowRequestTemplateName(requestRow);
       if (!assertWorkflowRequestAccess(req, res, requestRow, requestRow?.template_category)) return;
       const kind = procurementGeneratedFormKindFromRow({
         template_name: requestRow.template_name,
@@ -2484,25 +2633,37 @@ async function startServer() {
       if (!buf.length) {
         return res.status(400).json({ error: "Empty PDF payload" });
       }
-      const serialRaw = String(requestRow.formatted_id || "").trim() || `request_${requestId}`;
-      const logicalStem = `${kind}_${serialRaw}_Form`;
-      const logicalName = `${logicalStem}.pdf`;
+      const serialRaw =
+        String(requestRow.formatted_id || "")
+          .trim()
+          .toUpperCase() || `REQUEST_${requestId}`;
+      const logicalName = `${kind}_${serialRaw}.pdf`;
+      const legacyFormName = `${kind}_${serialRaw}_Form.pdf`;
       let validated: { safeFileName: string; displayFileName: string; mimeType: string };
       try {
         validated = validateAttachmentUpload(logicalName, "application/pdf", buf);
       } catch (e: any) {
         return res.status(400).json({ error: e?.message || "Invalid PDF" });
       }
-      const existing = await sqlPool
-        .request()
-        .input("request_id", sql.Int, requestId)
-        .input("fn", sql.NVarChar, validated.displayFileName)
-        .query("SELECT id, file_path FROM request_attachments WHERE request_id = @request_id AND file_name = @fn");
-      for (const ex of existing.recordset || []) {
+      const exReq = sqlPool.request();
+      exReq.input("request_id", sql.Int, requestId);
+      exReq.input("fnNew", sql.NVarChar, validated.displayFileName);
+      exReq.input("fnLegacy", sql.NVarChar, legacyFormName);
+      exReq.input("fnLikePattern", sql.NVarChar, `${kind}_${serialRaw}%`);
+      const existingRows = (await exReq.query(`
+          SELECT id, file_path, file_name FROM request_attachments
+          WHERE request_id = @request_id
+            AND (
+              file_name = @fnNew
+              OR file_name = @fnLegacy
+              OR LOWER(LTRIM(RTRIM(file_name))) LIKE LOWER(@fnLikePattern)
+            )
+        `)).recordset || [];
+      for (const ex of existingRows) {
         tryUnlinkStoredFile((ex as any).file_path);
         await sqlPool.request().input("eid", sql.Int, Number((ex as any).id)).query("DELETE FROM request_attachments WHERE id = @eid");
       }
-      const saved = saveRequestAttachmentFile(
+      const saved = saveGeneratedProcurementFormPdf(
         String(requestRow.entity || "").trim() || req.entityContext,
         requestRow.department,
         requestRow.formatted_id,
@@ -2521,10 +2682,19 @@ async function startServer() {
         .query(
           "INSERT INTO request_attachments (request_id, file_name, file_type, file_data, file_path) VALUES (@request_id, @file_name, @file_type, @file_data, @file_path)"
         );
+      await sqlPool
+        .request()
+        .input("id", sql.Int, requestId)
+        .input("generated_path", sql.NVarChar, saved.storedPath)
+        .query("UPDATE workflow_requests SET generated_form_pdf_path = @generated_path WHERE id = @id");
       approvalEventLog(
-        `REQUEST_FORM_PDF_STORED ${formatActor(req)} request_id=${requestId} file=${approvalLogSanitize(saved.storedFileName, 120)}`
+        `REQUEST_FORM_PDF_STORED ${formatActor(req)} request_id=${requestId} file=${approvalLogSanitize(saved.storedFileName, 120)} path=${approvalLogSanitize(saved.storedPath, 160)}`
       );
-      return res.json({ success: true, file_name: saved.storedFileName });
+      return res.json({
+        success: true,
+        file_name: saved.storedFileName,
+        file_path: saved.storedPath,
+      });
     } catch (e: any) {
       console.error("generated-form-pdf:", e?.message || e);
       return res.status(500).json({ error: "Failed to store generated form PDF" });
@@ -2584,12 +2754,17 @@ async function startServer() {
       let q = `
       SELECT r.*,
         COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.requester_name AS NVARCHAR(255)))), N''), u.username) AS computed_requester_name,
+        u.department AS _join_requester_department,
         u.designation AS requester_designation,
-        w.name AS template_name, COALESCE(r.request_steps, w.steps) AS template_steps,
+        aa.username AS _join_assigned_username,
+        aa.designation AS _join_assigned_designation,
+        w.name AS _join_workflow_template_name,
+        COALESCE(r.request_steps, w.steps) AS template_steps,
         w.table_columns AS table_columns, w.attachments_required AS attachments_required, w.category AS category
       FROM workflow_requests r
       INNER JOIN ${userJoinSql} u ON r.requester_id = u.id
       INNER JOIN workflows w ON r.template_id = w.id
+      LEFT JOIN ${userJoinSql} aa ON r.assigned_approver_id = aa.id
       WHERE w.category = N'procurement'${entityClause}
     `;
       if (!crossDept) {
@@ -2601,7 +2776,7 @@ async function startServer() {
         reqSql.input("status", sql.NVarChar, String(status));
       }
       if (crossDept && department) {
-        q += " AND r.department = @filterDepartment";
+        q += " AND (r.department = @filterDepartment OR u.department = @filterDepartment)";
         reqSql.input("filterDepartment", sql.NVarChar, String(department));
       }
       if (search) {
@@ -2611,9 +2786,23 @@ async function startServer() {
       q += " ORDER BY r.created_at DESC";
       const rs = await reqSql.query(q);
       const requests = rs.recordset || [];
+      await reconcileWorkflowRequestDepartmentsFromUsersetting(sqlPool, requests);
       const mapped = await Promise.all(
         requests.map(async (r: any) => {
-          const { computed_requester_name, ...row } = r;
+          const {
+            computed_requester_name,
+            _join_requester_department,
+            _join_assigned_username,
+            _join_assigned_designation,
+            _join_workflow_template_name,
+            ...row
+          } = r;
+          const storedApproverName = String(row.assigned_approver_name ?? "").trim();
+          const storedApproverDes = String(row.assigned_approver_designation ?? "").trim();
+          const joinApproverName = String(_join_assigned_username ?? "").trim();
+          const joinApproverDes = String(_join_assigned_designation ?? "").trim();
+          const storedTmpl = String(row.template_name ?? "").trim();
+          const joinTmpl = String(_join_workflow_template_name ?? "").trim();
           const approvalsRs = await sqlPool
             .request()
             .input("rid", sql.Int, Number(r.id))
@@ -2628,7 +2817,13 @@ async function startServer() {
           `);
           return {
             ...row,
+            department: resolvedDepartmentFromUsersettingJoin(_join_requester_department, row.department),
             requester_name: computed_requester_name ?? row.requester_name,
+            template_name: storedTmpl || joinTmpl || row.template_name,
+            assigned_approver_name: storedApproverName || joinApproverName || null,
+            assigned_approver_designation: storedApproverDes || joinApproverDes || null,
+            assigned_approver_name_saved: storedApproverName || null,
+            assigned_approver_designation_saved: storedApproverDes || null,
             template_steps: JSON.parse(row.template_steps),
             table_columns: row.table_columns ? JSON.parse(row.table_columns) : [],
             line_items: row.line_items ? JSON.parse(row.line_items) : [],
@@ -2662,16 +2857,19 @@ async function startServer() {
     const requestId = req.params.id;
 
     const rq = await sqlPool.request().input("id", sql.Int, Number(requestId)).query(`
-        SELECT r.*, COALESCE(r.request_steps, w.steps) AS template_steps, w.name AS template_name, w.category AS template_category
+        SELECT r.*, COALESCE(r.request_steps, w.steps) AS template_steps, w.name AS _join_workflow_template_name, w.category AS template_category
         FROM workflow_requests r
         INNER JOIN workflows w ON r.template_id = w.id
         WHERE r.id = @id
       `);
     const request: any = rq.recordset?.[0];
+    hydrateWorkflowRequestTemplateName(request);
 
     if (!assertWorkflowRequestAccess(req, res, request, request?.template_category)) return;
 
     const isPR = isPRName(request.template_name) && request.template_category === "procurement";
+    const isPOProcurementEarly =
+      isPOName(request.template_name) && request.template_category === "procurement";
     const isPurchasing = req.user.roles && req.user.roles.some((r: string) => r.toLowerCase() === "purchasing");
     const userIsRequester = req.user.id === request.requester_id;
     const userHasEditPermission =
@@ -2707,6 +2905,7 @@ async function startServer() {
       !userHasEditPermissionResolved &&
       !userIsRequesterResolved &&
       !(request.status === "approved" && isPR && isPurchasing) &&
+      !(request.status === "pending" && isPOProcurementEarly && isPurchasing) &&
       !allowRequesterRejectedPrEdit &&
       !allowAdminRejectedPrEdit
     ) {
@@ -2718,7 +2917,8 @@ async function startServer() {
       userHasEditPermissionResolved &&
       !userIsCurrentApprover &&
       !userIsRequesterResolved &&
-      !req.user.permissions.includes("admin")
+      !req.user.permissions.includes("admin") &&
+      !(isPOProcurementEarly && isPurchasing)
     ) {
       return res.status(403).json({ error: "Only the current approver or the requester can edit this request" });
     }
@@ -2728,7 +2928,62 @@ async function startServer() {
     const isProcurementPRorPO =
       request.template_category === "procurement" &&
       (isPRName(request.template_name) || isPOName(request.template_name) || isSRName(request.template_name));
+    const isAdminPatch = !!(req.user.permissions && req.user.permissions.includes("admin"));
+    const bodyReqIdRaw = req.body.requester_id;
+    const bodyReqUsername =
+      req.body.requester_username != null ? String(req.body.requester_username).trim() : "";
+    const bodyReqName = req.body.requester_name != null ? String(req.body.requester_name).trim() : "";
+    const purchasingCanPatchRequesterFields =
+      request.template_category === "procurement" &&
+      (isPR || isPO) &&
+      (isPurchasing || isAdminPatch) &&
+      (request.status === "pending" || (request.status === "approved" && isPR && isPurchasing));
+
     try {
+      if (purchasingCanPatchRequesterFields) {
+        const hasUserId =
+          bodyReqIdRaw !== undefined &&
+          Number.isFinite(Number(bodyReqIdRaw)) &&
+          Number(bodyReqIdRaw) > 0;
+        const hasUsername = bodyReqUsername.length > 0;
+        if (hasUserId || hasUsername) {
+          let targetUser: any = null;
+          if (hasUserId) targetUser = await fetchSqlUsersettingById(sqlPool, Number(bodyReqIdRaw));
+          else targetUser = await fetchSqlUsersettingByUsername(sqlPool, bodyReqUsername);
+          if (!targetUser) {
+            return res.status(400).json({ error: "Could not resolve requester (check user id or login username)." });
+          }
+          const entU = String(request.entity ?? "").trim().toUpperCase();
+          if (!userRowHasEntityAccess(targetUser, entU)) {
+            return res.status(400).json({ error: "That user is not assigned to this entity." });
+          }
+          const dispName = bodyReqName || String(targetUser.username ?? "");
+          await sqlPool
+            .request()
+            .input("requester_id", sql.Int, Number(targetUser.id))
+            .input("requester_username", sql.NVarChar, String(targetUser.username ?? ""))
+            .input("requester_name", sql.NVarChar, dispName)
+            .input("department", sql.NVarChar, String(targetUser.department ?? ""))
+            .input("id", sql.Int, rid)
+            .query(
+              "UPDATE workflow_requests SET requester_id=@requester_id, requester_username=@requester_username, requester_name=@requester_name, department=@department WHERE id=@id"
+            );
+        } else if (bodyReqName) {
+          const curUid = Number(request.requester_id);
+          const uSelf =
+            Number.isFinite(curUid) && curUid > 0 ? await fetchSqlUsersettingById(sqlPool, curUid) : null;
+          if (!uSelf) {
+            return res.status(400).json({ error: "Cannot update requester display name without a valid requester account." });
+          }
+          await sqlPool
+            .request()
+            .input("requester_name", sql.NVarChar, bodyReqName)
+            .input("department", sql.NVarChar, String(uSelf.department ?? ""))
+            .input("id", sql.Int, rid)
+            .query("UPDATE workflow_requests SET requester_name=@requester_name, department=@department WHERE id=@id");
+        }
+      }
+
       if (title) {
         await sqlPool.request().input("title", sql.NVarChar, title).input("id", sql.Int, rid).query("UPDATE workflow_requests SET title = @title WHERE id = @id");
       }
@@ -2887,12 +3142,13 @@ async function startServer() {
   app.post("/api/workflow-requests/:id/resubmit", authenticate, requireEntityContext, async (req: any, res) => {
     const requestId = req.params.id;
     const rq = await sqlPool.request().input("id", sql.Int, Number(requestId)).query(`
-        SELECT r.*, w.name AS template_name, w.category AS template_category
+        SELECT r.*, w.name AS _join_workflow_template_name, w.category AS template_category
         FROM workflow_requests r
         INNER JOIN workflows w ON r.template_id = w.id
         WHERE r.id = @id
       `);
     const request: any = rq.recordset?.[0];
+    hydrateWorkflowRequestTemplateName(request);
 
     if (!assertWorkflowRequestAccess(req, res, request, request?.template_category)) return;
     if (request.status !== "rejected") return res.status(400).json({ error: "Only rejected requests can be resubmitted" });
@@ -3040,12 +3296,13 @@ async function startServer() {
     }
 
     const rq = await sqlPool.request().input("id", sql.Int, Number(requestId)).query(`
-        SELECT r.*, w.name AS template_name, w.category AS template_category
+        SELECT r.*, w.name AS _join_workflow_template_name, w.category AS template_category
         FROM workflow_requests r
         INNER JOIN workflows w ON r.template_id = w.id
         WHERE r.id = @id
       `);
     const request: any = rq.recordset?.[0];
+    hydrateWorkflowRequestTemplateName(request);
 
     if (!assertWorkflowRequestAccess(req, res, request, request?.template_category)) return;
     if (request.status !== "approved") return res.status(400).json({ error: "Only approved requests can be converted" });
@@ -3235,19 +3492,27 @@ async function startServer() {
         return res.json({ id: newRequestId, formatted_id, merged_into_existing: true });
       }
 
+      // Preparer / "Requested By" on the PO = purchasing user who runs the conversion (not the PR submitter).
+      const converterRow = await fetchSqlUsersettingById(sqlPool, Number(req.user.id));
+      const poRequesterId = Number(req.user.id);
+      const poRequesterUsername = String(converterRow?.username ?? req.user.username ?? "").trim();
+      const poRequesterName = poRequesterUsername;
+      const poDepartment = String(converterRow?.department ?? req.user.department ?? "").trim();
+      const converterSavedSig = await loadSavedSignatureDataUrlForUser(req.user);
+
       const ins = await sqlPool
         .request()
         .input("template_id", sql.Int, Number(poTemplate.id))
-        .input("requester_id", sql.Int, Number(req.user.id))
-        .input("requester_username_snapshot", sql.NVarChar, req.user.username || "")
-        .input("requester_name", sql.NVarChar, req.user.username || "")
-        .input("template_name_snapshot", sql.NVarChar, "Purchase Order")
-        .input("department", sql.NVarChar, request.department)
+        .input("requester_id", sql.Int, poRequesterId)
+        .input("requester_username", sql.NVarChar, poRequesterUsername)
+        .input("requester_name", sql.NVarChar, poRequesterName)
+        .input("template_name", sql.NVarChar, "Purchase Order")
+        .input("department", sql.NVarChar, poDepartment)
         .input("title", sql.NVarChar, `PO for: ${request.title}`)
         .input("details", sql.NVarChar, "")
         .input("line_items", sql.NVarChar(sql.MAX), lineJson)
-        .input("requester_signature", sql.NVarChar(sql.MAX), request.requester_signature ?? null)
-        .input("po_requester_signed_flag", sql.Bit, request.requester_signed_at || request.requester_signature ? 1 : 0)
+        .input("requester_signature", sql.NVarChar(sql.MAX), converterSavedSig)
+        .input("po_requester_signed_flag", sql.Bit, converterSavedSig ? 1 : 0)
         .input("tax_rate", sql.Decimal(10, 6), request.tax_rate)
         .input("discount_rate", sql.Decimal(10, 6), request.discount_rate !== undefined && request.discount_rate !== null ? request.discount_rate : 0)
         .input("currency", sql.NVarChar, request.currency)
@@ -3260,11 +3525,11 @@ async function startServer() {
         .input("total_amount_myr", sql.Decimal(18, 2), totalMyr)
         .query(`
             INSERT INTO workflow_requests (
-              template_id, requester_id, requester_username_snapshot, requester_name, template_name_snapshot,
+              template_id, requester_id, requester_username, requester_name, template_name,
               department, title, details, line_items, requester_signature, requester_signed_at, tax_rate, discount_rate, currency, cost_center, section,
               entity, formatted_id, request_steps, assigned_approver_id, total_amount_myr
             ) VALUES (
-              @template_id, @requester_id, @requester_username_snapshot, @requester_name, @template_name_snapshot,
+              @template_id, @requester_id, @requester_username, @requester_name, @template_name,
               @department, @title, @details, @line_items, @requester_signature,
               CASE WHEN @po_requester_signed_flag = 1 THEN SYSUTCDATETIME() ELSE NULL END,
               @tax_rate, @discount_rate, @currency, @cost_center, @section,
@@ -3302,7 +3567,7 @@ async function startServer() {
         let relOut: string | null = null;
         const copied = copyStoredFileToRequest(
           ent,
-          request.department,
+          poDepartment,
           formatted_id,
           newRequestId,
           att.file_path,
@@ -3315,7 +3580,7 @@ async function startServer() {
           if (buf.length > 0) {
             relOut = saveRequestAttachmentFile(
               ent,
-              request.department,
+              poDepartment,
               formatted_id,
               newRequestId,
               String(att.file_name || "file"),
@@ -3352,7 +3617,7 @@ async function startServer() {
     if (!Number.isFinite(requestId) || requestId <= 0) return res.status(400).json({ error: "Invalid request id" });
     const rqAppr = await sqlPool.request().input("id", sql.Int, requestId).query(`
         SELECT r.*, COALESCE(r.request_steps, w.steps) AS template_steps, w.category AS template_category,
-          COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.template_name_snapshot AS NVARCHAR(255)))), N''), w.name) AS template_name_resolved
+          COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.template_name AS NVARCHAR(255)))), N''), w.name) AS template_name_resolved
         FROM workflow_requests r
         INNER JOIN workflows w ON r.template_id = w.id
         WHERE r.id = @id
@@ -3413,7 +3678,7 @@ async function startServer() {
 
     const rqAppr = await sqlPool.request().input("id", sql.Int, Number(requestId)).query(`
         SELECT r.*, COALESCE(r.request_steps, w.steps) AS template_steps, w.category AS template_category,
-          COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.template_name_snapshot AS NVARCHAR(255)))), N''), w.name) AS template_name_resolved
+          COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.template_name AS NVARCHAR(255)))), N''), w.name) AS template_name_resolved
         FROM workflow_requests r
         INNER JOIN workflows w ON r.template_id = w.id
         WHERE r.id = @id
@@ -3586,12 +3851,13 @@ async function startServer() {
     }
 
     const rq = await sqlPool.request().input("id", sql.Int, requestId).query(`
-      SELECT r.*, COALESCE(r.request_steps, w.steps) AS template_steps, w.name AS template_name, w.category AS template_category
+      SELECT r.*, COALESCE(r.request_steps, w.steps) AS template_steps, w.name AS _join_workflow_template_name, w.category AS template_category
       FROM workflow_requests r
       INNER JOIN workflows w ON r.template_id = w.id
       WHERE r.id = @id
     `);
     const request: any = rq.recordset?.[0];
+    hydrateWorkflowRequestTemplateName(request);
     if (!assertWorkflowRequestAccess(req, res, request, request?.template_category)) return;
     if (!request) return res.status(404).json({ error: "Request not found" });
     if (request.status !== "approved") return res.status(400).json({ error: "Only approved PR can be rejected/cancelled by purchasing" });

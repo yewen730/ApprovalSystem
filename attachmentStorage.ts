@@ -208,6 +208,41 @@ export function saveRequestAttachmentFile(
   return { storedPath, mimeType: validated.mimeType, storedFileName: validated.displayFileName };
 }
 
+/**
+ * Same folder layout as {@link saveRequestAttachmentFile} (`entity` / `department` / `formatted_id` /),
+ * but uses a fixed PDF basename (e.g. `PR_PRGC26-00001.pdf`) and overwrites the previous file.
+ * Matches on-disk layout under `COMPANY_FILE_STORAGE_ROOT` (e.g. `…/GCCM/Maintenance/PRGC26-00001/`).
+ */
+export function saveGeneratedProcurementFormPdf(
+  entity: string,
+  department: string | null | undefined,
+  formattedId: string | null | undefined,
+  requestId: number,
+  originalName: string,
+  buffer: Buffer,
+  claimedMimeType?: string | null
+): { storedPath: string; mimeType: string; storedFileName: string } {
+  const validated = validateAttachmentUpload(originalName, claimedMimeType, buffer);
+  const folderId =
+    String(formattedId || "").trim() || `request_${Number.isFinite(requestId) ? String(requestId) : "unknown"}`;
+  const dir = path.join(
+    getAttachmentsRoot(),
+    safeSegment(entity),
+    safeSegment(String(department || "general")),
+    safeSegment(folderId, 128)
+  );
+  fs.mkdirSync(dir, { recursive: true });
+  const full = path.join(dir, validated.safeFileName);
+  try {
+    if (fs.existsSync(full)) fs.unlinkSync(full);
+  } catch {
+    // ignore
+  }
+  fs.writeFileSync(full, buffer);
+  const storedPath = path.normalize(path.resolve(full));
+  return { storedPath, mimeType: validated.mimeType, storedFileName: validated.displayFileName };
+}
+
 export function tryUnlinkStoredFile(storedPath: string | null | undefined): void {
   if (!storedPath) return;
   try {

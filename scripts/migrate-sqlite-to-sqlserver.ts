@@ -48,10 +48,10 @@ async function ensureColumns(pool: sql.ConnectionPool) {
       ALTER TABLE request_approvals ADD request_formatted_id_snapshot NVARCHAR(255) NULL;
     IF COL_LENGTH('request_approvals', 'approver_role_snapshot') IS NULL
       ALTER TABLE request_approvals ADD approver_role_snapshot NVARCHAR(255) NULL;
-    IF COL_LENGTH('workflow_requests', 'requester_username_snapshot') IS NULL
-      ALTER TABLE workflow_requests ADD requester_username_snapshot NVARCHAR(255) NULL;
-    IF COL_LENGTH('workflow_requests', 'template_name_snapshot') IS NULL
-      ALTER TABLE workflow_requests ADD template_name_snapshot NVARCHAR(255) NULL;
+    IF COL_LENGTH('workflow_requests', 'requester_username') IS NULL
+      ALTER TABLE workflow_requests ADD requester_username NVARCHAR(255) NULL;
+    IF COL_LENGTH('workflow_requests', 'template_name') IS NULL
+      ALTER TABLE workflow_requests ADD template_name NVARCHAR(255) NULL;
     IF COL_LENGTH('workflow_requests', 'requester_name') IS NULL
       ALTER TABLE workflow_requests ADD requester_name NVARCHAR(255) NULL;
     IF COL_LENGTH('workflow_requests', 'checked_at') IS NULL
@@ -207,6 +207,7 @@ async function main() {
       continue;
     }
     const requesterName =
+      r.requester_username ||
       r.requester_username_snapshot ||
       r.requester_name ||
       sqliteUserById.get(Number(r.requester_id)) ||
@@ -233,19 +234,19 @@ async function main() {
       .input("cost_center", sql.NVarChar, r.cost_center || "")
       .input("request_steps", sql.NVarChar(sql.MAX), r.request_steps ?? null)
       .input("created_at", sql.DateTime2, r.created_at ? new Date(r.created_at) : new Date())
-      .input("requester_username_snapshot", sql.NVarChar, r.requester_username_snapshot || requesterName)
-      .input("template_name_snapshot", sql.NVarChar, r.template_name_snapshot ?? null)
+      .input("requester_username", sql.NVarChar, r.requester_username || r.requester_username_snapshot || requesterName)
+      .input("template_name", sql.NVarChar, r.template_name ?? r.template_name_snapshot ?? null)
       .input("requester_name", sql.NVarChar, requesterName)
       .query(`
         SET IDENTITY_INSERT workflow_requests ON;
         INSERT INTO workflow_requests (
           id, template_id, requester_id, department, title, details, line_items, entity, formatted_id,
           status, current_step_index, requester_signature, requester_signed_at, tax_rate, discount_rate, currency, cost_center, request_steps, created_at,
-          requester_username_snapshot, template_name_snapshot, requester_name
+          requester_username, template_name, requester_name
         ) VALUES (
           @id, @template_id, @requester_id, @department, @title, @details, @line_items, @entity, @formatted_id,
           @status, @current_step_index, @requester_signature, @requester_signed_at, @tax_rate, @discount_rate, @currency, @cost_center, @request_steps, @created_at,
-          @requester_username_snapshot, @template_name_snapshot, @requester_name
+          @requester_username, @template_name, @requester_name
         );
         SET IDENTITY_INSERT workflow_requests OFF;
       `);
