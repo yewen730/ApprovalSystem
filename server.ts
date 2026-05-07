@@ -155,6 +155,24 @@ const isPOName = (name: string) => {
   return n.includes("purchase order") || n.includes("po");
 };
 
+async function syncLinkedPrPoStatus(
+  pool: sql.ConnectionPool,
+  poRequestId: number,
+  poStatus: string | null | undefined
+): Promise<void> {
+  const normalized = String(poStatus ?? "").trim().toLowerCase();
+  const value = normalized || null;
+  await pool
+    .request()
+    .input("poId", sql.Int, Number(poRequestId))
+    .input("po_status", sql.NVarChar, value)
+    .query(`
+      UPDATE workflow_requests
+      SET po_status = @po_status
+      WHERE converted_po_request_id = @poId
+    `);
+}
+
 /** PR / SR / PO generated form PDF — same on-disk folder as quotation uploads (`saveRequestAttachmentFile`). */
 function procurementGeneratedFormKindFromRow(row: {
   template_name?: string | null;
@@ -859,9 +877,23 @@ const ensureSqlServerWorkflowColumns = async (pool: sql.ConnectionPool) => {
         ALTER TABLE workflow_requests ADD total_amount_myr DECIMAL(18, 2) NULL;
       IF COL_LENGTH('workflow_requests', 'generated_form_pdf_path') IS NULL
         ALTER TABLE workflow_requests ADD generated_form_pdf_path NVARCHAR(1024) NULL;
+      IF COL_LENGTH('workflow_requests', 'po_status') IS NULL
+        ALTER TABLE workflow_requests ADD po_status NVARCHAR(50) NULL;
     `);
   } catch (e: any) {
     console.warn("SQL workflow column ensure skipped:", e?.message || e);
+  }
+  try {
+    await pool.request().query(`
+      UPDATE pr
+      SET po_status = po.status
+      FROM workflow_requests pr
+      INNER JOIN workflow_requests po ON po.id = pr.converted_po_request_id
+      WHERE pr.converted_po_request_id IS NOT NULL
+        AND (pr.po_status IS NULL OR LTRIM(RTRIM(CAST(pr.po_status AS NVARCHAR(50)))) = N'')
+    `);
+  } catch (e: any) {
+    console.warn("SQL backfill workflow_requests.po_status:", e?.message || e);
   }
   /** Base64 PDFs exceed typical NVARCHAR(4000) schemas; widen so inserts match sql.NVarChar(sql.MAX). */
   const widenAttachmentFileData = [
@@ -2210,7 +2242,7 @@ async function startServer() {
       const rs = await reqSql.query(`
           SELECT r.*,
             po_link.formatted_id AS linked_po_formatted_id,
-            po_link.status AS linked_po_status,
+            COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.po_status AS NVARCHAR(50)))), N''), po_link.status) AS linked_po_status,
             COALESCE(NULLIF(LTRIM(RTRIM(CAST(r.requester_name AS NVARCHAR(255)))), N''), u.username) AS computed_requester_name,
             u.department AS _join_requester_department,
             u.designation AS requester_designation,
@@ -3202,6 +3234,9 @@ async function startServer() {
       .input("id", sql.Int, rid)
       .input("total_amount_myr", sql.Decimal(18, 2), resubmitTotalMyr)
       .query("UPDATE workflow_requests SET status = N'pending', current_step_index = 0, total_amount_myr = @total_amount_myr WHERE id = @id");
+    if (isPOName(String(request.template_name || "")) && request.template_category === "procurement") {
+      await syncLinkedPrPoStatus(sqlPool, rid, "pending");
+    }
     approvalEventLog(`REQUEST_RESUBMIT ${formatActor(req)} request_id=${rid} formatted_id=${approvalLogSanitize(String(request.formatted_id || ""), 64)}`);
     res.json({ success: true });
   });
@@ -3249,6 +3284,9 @@ async function startServer() {
         .request()
         .input("id", sql.Int, requestId)
         .query("UPDATE workflow_requests SET status = N'cancelled' WHERE id = @id");
+      if (isPOName(String(request.template_name || "")) && request.template_category === "procurement") {
+        await syncLinkedPrPoStatus(sqlPool, requestId, "cancelled");
+      }
 
       await sqlPool
         .request()
@@ -3431,9 +3469,10 @@ async function startServer() {
           .request()
           .input("prId", sql.Int, Number(requestId))
           .input("poId", sql.Int, Number(newRequestId))
+          .input("po_status", sql.NVarChar, "pending")
           .query(`
             UPDATE workflow_requests
-            SET converted_po_request_id = @poId
+            SET converted_po_request_id = @poId, po_status = @po_status
             WHERE id = @prId AND (converted_po_request_id IS NULL OR converted_po_request_id = 0);
           `);
         const rowsAff = linkRs.rowsAffected as number[] | undefined;
@@ -3542,9 +3581,10 @@ async function startServer() {
         .request()
         .input("prId", sql.Int, Number(requestId))
         .input("poId", sql.Int, Number(newRequestId))
+        .input("po_status", sql.NVarChar, "pending")
         .query(`
           UPDATE workflow_requests
-          SET converted_po_request_id = @poId
+          SET converted_po_request_id = @poId, po_status = @po_status
           WHERE id = @prId AND (converted_po_request_id IS NULL OR converted_po_request_id = 0);
         `);
       const rowsAff = linkRs.rowsAffected as number[] | undefined;
@@ -3791,6 +3831,9 @@ async function startServer() {
           `);
       if (status === "rejected") {
         await sqlPool.request().input("id", sql.Int, rid).query("UPDATE workflow_requests SET status = N'rejected' WHERE id = @id");
+        if (isPOName(tplName) && request.template_category === "procurement") {
+          await syncLinkedPrPoStatus(sqlPool, rid, "rejected");
+        }
       } else {
         const nextStepIndex = request.current_step_index + 1;
         const stepRoleLower = String(currentStep?.approverRole || "").toLowerCase();
@@ -3809,6 +3852,9 @@ async function startServer() {
             .query(
               "UPDATE workflow_requests SET status = N'approved', approved_at = SYSUTCDATETIME(), approver_name = @approver_name WHERE id = @id"
             );
+          if (isPOName(tplName) && request.template_category === "procurement") {
+            await syncLinkedPrPoStatus(sqlPool, rid, "approved");
+          }
         } else {
           await sqlPool
             .request()

@@ -2644,6 +2644,30 @@ function createWorkflowRequestPdfPreview(request: WorkflowRequest): { url: strin
   return printWorkflowRequestReportPdf(request);
 }
 
+/**
+ * When the last workflow step is approved, persist the F-PU-003 PR / SR form PDF to the request’s
+ * attachment folder (same as “View PR/SR form”). No-op for non–PR/SR or mid-chain approvals.
+ */
+async function persistPrSrFormPdfAfterWorkflowCompleted(
+  requestId: number,
+  requestBeforeTransition: WorkflowRequest
+): Promise<void> {
+  if (!isPR_Only(requestBeforeTransition) && !isSR_Only(requestBeforeTransition)) return;
+  const stepsLen = (requestBeforeTransition.template_steps || []).length;
+  if (stepsLen === 0) return;
+  if (requestBeforeTransition.current_step_index + 1 < stepsLen) return;
+  const ent = String(requestBeforeTransition.entity || '').trim();
+  if (ent) api.setActiveEntity(ent);
+  try {
+    const appData = await api.request(`/api/workflow-requests/${requestId}/approvals`);
+    const merged = mergeRequestApprovalsForPdf(requestBeforeTransition, requestId, appData);
+    const preview = createWorkflowRequestPdfPreview(merged);
+    await persistGeneratedProcurementFormPdf(requestId, preview.pdfDataUrl);
+  } catch (e) {
+    console.error('Failed to auto-archive procurement form PDF:', e);
+  }
+}
+
 const FIXED_PR_STEPS = [{ id: 'step-1', label: 'Approver', approverRole: 'approver' }];
 
 /** PO template definition (director step is omitted per request when total ≤ RM30k equivalent). */
@@ -3967,6 +3991,9 @@ const WorkflowRequestList = ({
             : {}),
         }),
       });
+      if (status === 'approved' && selectedRequest) {
+        void persistPrSrFormPdfAfterWorkflowCompleted(id, selectedRequest);
+      }
       toast.success(`Request ${status}`);
       onRefresh();
       setSelectedRequest(null);

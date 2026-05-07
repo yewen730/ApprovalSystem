@@ -66,6 +66,8 @@ async function ensureColumns(pool: sql.ConnectionPool) {
       ALTER TABLE workflow_requests ADD requester_signed_at DATETIME2(3) NULL;
     IF COL_LENGTH('workflow_requests', 'discount_rate') IS NULL
       ALTER TABLE workflow_requests ADD discount_rate DECIMAL(10, 6) NULL;
+    IF COL_LENGTH('workflow_requests', 'po_status') IS NULL
+      ALTER TABLE workflow_requests ADD po_status NVARCHAR(50) NULL;
   `);
 }
 
@@ -225,6 +227,11 @@ async function main() {
       .input("entity", sql.NVarChar, r.entity || "")
       .input("formatted_id", sql.NVarChar, r.formatted_id || null)
       .input("status", sql.NVarChar, r.status || "pending")
+      .input(
+        "po_status",
+        sql.NVarChar,
+        String(r.template_name || "").toLowerCase().includes("purchase order") ? (r.status || "pending") : null
+      )
       .input("current_step_index", sql.Int, r.current_step_index ?? 0)
       .input("requester_signature", sql.NVarChar(sql.MAX), r.requester_signature ?? null)
       .input("requester_signed_at", sql.DateTime2, r.requester_signature ? new Date(r.created_at) : null)
@@ -241,11 +248,11 @@ async function main() {
         SET IDENTITY_INSERT workflow_requests ON;
         INSERT INTO workflow_requests (
           id, template_id, requester_id, department, title, details, line_items, entity, formatted_id,
-          status, current_step_index, requester_signature, requester_signed_at, tax_rate, discount_rate, currency, cost_center, request_steps, created_at,
+          status, po_status, current_step_index, requester_signature, requester_signed_at, tax_rate, discount_rate, currency, cost_center, request_steps, created_at,
           requester_username, template_name, requester_name
         ) VALUES (
           @id, @template_id, @requester_id, @department, @title, @details, @line_items, @entity, @formatted_id,
-          @status, @current_step_index, @requester_signature, @requester_signed_at, @tax_rate, @discount_rate, @currency, @cost_center, @request_steps, @created_at,
+          @status, @po_status, @current_step_index, @requester_signature, @requester_signed_at, @tax_rate, @discount_rate, @currency, @cost_center, @request_steps, @created_at,
           @requester_username, @template_name, @requester_name
         );
         SET IDENTITY_INSERT workflow_requests OFF;

@@ -96,6 +96,8 @@ export interface WorkflowRequest {
   linked_po_formatted_id?: string | null;
   /** Populated on list API for PR rows: workflow status of the linked PO request. */
   linked_po_status?: string | null;
+  /** Persisted on PR rows: current status of the linked PO request (kept in sync by server). */
+  po_status?: string | null;
   line_items?: any[];
   tax_rate?: number;
   /** Document-level discount 0–1 (e.g. 0.05 = 5% off subtotal before tax). PR-focused; PO may carry from PR convert. */
