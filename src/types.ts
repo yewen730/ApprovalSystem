@@ -104,7 +104,7 @@ export interface WorkflowRequest {
   discount_rate?: number | null;
   status: 'Pending' | 'Approved' | 'Rejected' | 'Cancelled';
   current_step_index: number;
-  /** Requester pad image as data URL; persisted in SQL as NVARCHAR(MAX) for PDFs. */
+  /** Requester pad image as data URL (loaded from `workflow_request_requester_signatures` on detail API; legacy rows may still read from DB). */
   requester_signature?: string;
   /** Timestamp when the requester completed the signature pad (image also in requester_signature when stored). */
   requester_signed_at?: string | null;

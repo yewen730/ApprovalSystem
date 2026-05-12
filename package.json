@@ -12,7 +12,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "migrate:sqlite": "tsx scripts/migrate-sqlite-to-sqlserver.ts"
+    "migrate:sqlite": "tsx scripts/migrate-sqlite-to-sqlserver.ts",
+    "export-approved-pr-pdfs": "tsx scripts/export-approved-pr-form-pdfs.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

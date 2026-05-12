@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { buildProcurementPrFormPdfDoc } from './procurement/prFormPdfGenerator';
 import { 
   LayoutDashboard, 
   PlusCircle, 
@@ -114,6 +115,22 @@ const api = {
     return text ? { message: text } : {};
   }
 };
+
+const MALAYSIA_TIME_ZONE = 'Asia/Kuala_Lumpur';
+
+function formatDateMYT(value: string | number | Date | null | undefined): string {
+  if (value == null || value === '') return '';
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleDateString(undefined, { timeZone: MALAYSIA_TIME_ZONE });
+}
+
+function formatDateTimeMYT(value: string | number | Date | null | undefined): string {
+  if (value == null || value === '') return '';
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleString(undefined, { timeZone: MALAYSIA_TIME_ZONE });
+}
 
 /** Open or download a request attachment (disk-backed `file_url` or legacy `file_data`). */
 async function openWorkflowRequestAttachment(
@@ -264,6 +281,12 @@ type ConvertPoModalTarget = {
   entityCode: string;
 };
 
+type ConvertPoUploadPayload = {
+  name: string;
+  type: string;
+  data: string;
+};
+
 type PurchasingDecisionModalTarget = {
   id: number;
   decision: 'cancelled' | 'rejected';
@@ -388,11 +411,15 @@ const ConvertPrToPoModal = ({
   target: ConvertPoModalTarget | null;
   loading: boolean;
   onClose: () => void;
-  onConfirm: (poNumber: string) => void;
+  onConfirm: (poNumber: string, upload?: ConvertPoUploadPayload) => void;
 }) => {
   const [poNumber, setPoNumber] = useState('');
+  const [poUpload, setPoUpload] = useState<ConvertPoUploadPayload | null>(null);
   useEffect(() => {
-    if (target) setPoNumber('');
+    if (target) {
+      setPoNumber('');
+      setPoUpload(null);
+    }
   }, [target?.id]);
 
   if (!target) return null;
@@ -437,6 +464,48 @@ const ConvertPrToPoModal = ({
         <p className="text-xs text-zinc-500 mt-2">
           Required. If this PO number already exists as a pending PO in the same entity, this PR will be appended into that PO.
         </p>
+        <label htmlFor="official-po-upload" className="block text-sm font-medium text-zinc-700 mt-5">
+          PO document upload (optional)
+        </label>
+        <input
+          id="official-po-upload"
+          type="file"
+          className="mt-1.5 block w-full text-sm text-zinc-700 file:mr-3 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:bg-zinc-100 file:text-zinc-700 hover:file:bg-zinc-200"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (!file) {
+              setPoUpload(null);
+              return;
+            }
+            const reader = new FileReader();
+            reader.onload = () => {
+              const data = typeof reader.result === 'string' ? reader.result : '';
+              if (!data) {
+                toast.error('Failed to read selected file.');
+                return;
+              }
+              setPoUpload({
+                name: file.name,
+                type: file.type || 'application/octet-stream',
+                data,
+              });
+            };
+            reader.onerror = () => {
+              toast.error('Failed to read selected file.');
+              setPoUpload(null);
+            };
+            reader.readAsDataURL(file);
+          }}
+          disabled={loading}
+        />
+        <p className="text-xs text-zinc-500 mt-2">
+          Optional. You can upload now or add the PO file later from the PO request details.
+        </p>
+        {poUpload ? (
+          <p className="text-xs text-zinc-600 mt-1">
+            Selected: <span className="font-medium">{poUpload.name}</span>
+          </p>
+        ) : null}
         <div className="flex justify-end gap-2 mt-6">
           <button
             type="button"
@@ -455,7 +524,7 @@ const ConvertPrToPoModal = ({
                 toast.error('Enter the official PO number.');
                 return;
               }
-              onConfirm(t);
+              onConfirm(t, poUpload || undefined);
             }}
             className="px-4 py-2 rounded-xl text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50"
           >
@@ -911,6 +980,17 @@ function clampUnitRate(n: number): number {
   return n;
 }
 
+/** Round to 2 decimal places (currency sen). */
+function roundMoney2(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 100) / 100;
+}
+
+/** Locale grouping with exactly 2 fraction digits (avoids 3dp from raw floats / default toLocaleString). */
+function formatProcurementMoney(n: number): string {
+  return roundMoney2(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 /** User enters percent (e.g. 10 = 10%); API/storage use unit rate 0–1. */
 function procurementPercentToUnitRate(percent: number): number {
   return clampUnitRate(percent / 100);
@@ -936,7 +1016,7 @@ function lineItemQtyForDisplay(item: any): number {
   return 0;
 }
 
-/** Subtotal, discount (on subtotal), tax (on amount after discount), total — matches server `computeRequestTotalMyr` logic. */
+/** Subtotal, discount (on subtotal), tax (on amount after discount), total — same order as server `computeRequestTotalMyr`; amounts rounded to 2 dp (sen). */
 function procurementMoneyTotals(req: Pick<WorkflowRequest, 'line_items' | 'tax_rate' | 'discount_rate'>) {
   let subtotal = 0;
   for (const item of req.line_items || []) {
@@ -946,11 +1026,20 @@ function procurementMoneyTotals(req: Pick<WorkflowRequest, 'line_items' | 'tax_r
   }
   const dr = clampUnitRate(req.discount_rate !== undefined && req.discount_rate !== null ? Number(req.discount_rate) : 0);
   const tr = clampUnitRate(req.tax_rate !== undefined && req.tax_rate !== null ? Number(req.tax_rate) : 0.18);
-  const discountAmount = subtotal * dr;
-  const taxableBase = subtotal * (1 - dr);
-  const taxAmount = taxableBase * tr;
-  const total = taxableBase + taxAmount;
-  return { subtotal, discountRate: dr, discountAmount, taxableBase, taxRate: tr, taxAmount, total };
+  const subtotalRounded = roundMoney2(subtotal);
+  const discountAmount = roundMoney2(subtotalRounded * dr);
+  const taxableBase = roundMoney2(subtotalRounded - discountAmount);
+  const taxAmount = roundMoney2(taxableBase * tr);
+  const total = roundMoney2(taxableBase + taxAmount);
+  return {
+    subtotal: subtotalRounded,
+    discountRate: dr,
+    discountAmount,
+    taxableBase,
+    taxRate: tr,
+    taxAmount,
+    total,
+  };
 }
 
 const PR_COLUMNS = [
@@ -1097,7 +1186,7 @@ function isSignatureImageDataUrl(s: string | undefined | null): boolean {
 function formatSignatureProofTimestamp(iso: string | undefined | null): string {
   if (!iso) return '';
   try {
-    return new Date(iso).toLocaleString();
+    return formatDateTimeMYT(iso);
   } catch {
     return '';
   }
@@ -1695,19 +1784,6 @@ const workflowApprovedApprovals = (request: WorkflowRequest): RequestApproval[] 
 };
 
 /**
- * PR form (two columns): preparer + HOD/approver only — never the checker in the right column.
- */
-const prHodApprovalForPdf = (request: WorkflowRequest): RequestApproval | undefined => {
-  const steps = request.template_steps || [];
-  const list = workflowApprovedApprovals(request);
-  const hod = [...list].reverse().find((a) => approvalStepRoleLower(a, steps) === 'approver');
-  if (hod) return hod;
-  const nonChecker = list.filter((a) => approvalStepRoleLower(a, steps) !== 'checker');
-  if (nonChecker.length) return nonChecker[nonChecker.length - 1];
-  return undefined;
-};
-
-/**
  * SR form (three columns): map signatures to existing boxes — checker → middle, else approver → middle; som → right, else approver when middle is checker.
  */
 const srSignatureColumnsForPdf = (
@@ -1737,343 +1813,9 @@ const pdfDesignationLines = (
   return doc.splitTextToSize(s, maxW);
 };
 
-/** F-PU-003 style form PDF — only for procurement Purchase Request (see isPR_Only). Landscape for wider table. */
+/** F-PU-003 style form PDF � body in {@link buildProcurementPrFormPdfDoc}. */
 const printProcurementPRFormPdf = (request: WorkflowRequest) => {
-  const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
-  const pageW = 297;
-  const pageH = 210;
-  const left = 10;
-  const right = pageW - 10;
-  const tableLeft = left;
-  const tableRight = right;
-  const pageBottomSafe = pageH - 12;
-  /** Column widths (mm); sum === tableRight − tableLeft (277mm). Supplier is in header, not grid. */
-  const colWidths = [10, 108, 16, 36, 36, 71];
-  const colXs: number[] = [];
-  {
-    let x = tableLeft;
-    colWidths.forEach((w) => {
-      colXs.push(x);
-      x += w;
-    });
-    colXs.push(tableRight);
-  }
-
-  const padX = 1.2;
-  const padY = 1.8;
-  const headerFont = 7;
-  const bodyFont = 6;
-  const lineStepHeader = 3.0;
-  const lineStepBody = 2.75;
-  const minRowH = 6.5;
-  const totalsBlockH = 26;
-  /** Below chrome (incl. suggested supplier line). */
-  const tableTopY = 42;
-  const taxLabel = procurementTaxLabelForEntity(request.entity);
-  const PR_MAX_ROWS_PER_PAGE = 5;
-
-  /** Footer signature box is always drawn on every page. */
-  const signatureBlockH = 56;
-  const signatureBoxInnerH = 52;
-  const signTopFixed = pageBottomSafe - signatureBoxInnerH;
-  const tableBottomSafe = signTopFixed - 4;
-
-  const getItemValue = (item: any, keys: string[]) => {
-    const foundKey = Object.keys(item || {}).find((k) => keys.includes(k.toLowerCase()));
-    if (!foundKey) return '';
-    return String(item[foundKey] ?? '');
-  };
-
-  const lineItems = request.line_items || [];
-  const money = procurementMoneyTotals(request);
-  const { subtotal, discountRate, discountAmount, taxRate, taxAmount: tax, total } = money;
-
-  const headerLabels = [
-    'No',
-    'Item',
-    'Qty',
-    'Cost Center Account No.',
-    'Request to be delivered on',
-    'Remarks'
-  ];
-
-  const wrap = (text: string, colIndex: number, fontSize: number) => {
-    doc.setFontSize(fontSize);
-    const maxW = Math.max(4, colWidths[colIndex] - padX * 2);
-    return doc.splitTextToSize(text || '-', maxW);
-  };
-
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(headerFont);
-  const headerLineArrays = headerLabels.map((label, i) => wrap(label, i, headerFont));
-  const headerRowH =
-    Math.max(1, ...headerLineArrays.map((lines) => lines.length)) * lineStepHeader + padY * 2;
-
-  type RowBlock = { kind: 'data'; cells: string[][]; h: number } | { kind: 'totals'; h: number };
-
-  const dataBlocks: RowBlock[] = [];
-
-  lineItems.forEach((item, idx) => {
-    doc.setFontSize(bodyFont);
-    const qty = getItemValue(item, ['quantity', 'qty']);
-    const itemName = getItemValue(item, ['item', 'description']);
-    const cc = getItemValue(item, ['cost center', 'cost center account no.', 'cost centre']) || request.cost_center || '-';
-    const eta = getItemValue(item, ['request to be delivered on', 'delivery date', 'date of delivery']);
-    /** PR grid "Remarks" / "Remarks (Purpose)" only — not `_lineRemarks` line notes. */
-    const tableRemarks = lineItemRemarksDisplay(item);
-    const lineOnlyRemarks = item && item[LINE_ITEM_REMARKS_KEY] ? String(item[LINE_ITEM_REMARKS_KEY]).trim() : '';
-    const itemCellText = lineOnlyRemarks ? `${itemName}\n\n${lineOnlyRemarks}` : itemName;
-
-    const cells: string[][] = [
-      wrap(String(idx + 1), 0, bodyFont),
-      wrap(itemCellText, 1, bodyFont),
-      wrap(qty || '-', 2, bodyFont),
-      wrap(cc, 3, bodyFont),
-      wrap(eta, 4, bodyFont),
-      wrap(tableRemarks || '-', 5, bodyFont),
-    ];
-    const linesPerCol = cells.map((lines) => lines.length);
-    const h = Math.max(minRowH, Math.max(...linesPerCol, 1) * lineStepBody + padY * 2);
-    dataBlocks.push({ kind: 'data', cells, h });
-  });
-
-  const drawPageChrome = (tableTop: number) => {
-    doc.setLineWidth(0.3);
-    doc.rect(left, 8, right - left, pageH - 16);
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(11);
-    doc.text(entityLegalDisplayName(request.entity).toUpperCase(), pageW / 2, 15, { align: 'center' });
-    doc.setFontSize(9);
-    doc.text('PURCHASE REQUISITION FORM: F-PU-003 (REV 0)', pageW / 2, 23, { align: 'center' });
-    doc.setFontSize(8);
-    doc.text('Department :', 14, 28);
-    doc.setFont('helvetica', 'normal');
-    doc.text(request.department || '-', 34, 28);
-    doc.text(`Date: ${new Date(request.created_at).toLocaleDateString()}`, tableRight - padX, 28, { align: 'right' });
-    doc.setFont('helvetica', 'bold');
-    doc.text('Suggested supplier:', 14, 33);
-    doc.setFont('helvetica', 'normal');
-    const supLines = doc.splitTextToSize(prSuggestedSupplierDisplay(request) || '—', tableRight - 52 - padX);
-    let sy = 33;
-    for (let i = 0; i < Math.min(2, supLines.length); i++) {
-      doc.text(supLines[i], 50, sy);
-      sy += 3.5;
-    }
-    doc.text(`PR No: ${displayRequestSerial(request)}`, tableRight - padX, 38, { align: 'right' });
-    doc.line(tableLeft, tableTop, tableRight, tableTop);
-  };
-
-  const drawVerticalRules = (y0: number, y1: number) => {
-    colXs.forEach((x) => doc.line(x, y0, x, y1));
-  };
-
-  const drawHeaderRow = (yTop: number) => {
-    const yBot = yTop + headerRowH;
-    doc.line(tableLeft, yBot, tableRight, yBot);
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(headerFont);
-    headerLineArrays.forEach((lines, i) => {
-      let y = yTop + padY + lineStepHeader * 0.85;
-      lines.forEach((line) => {
-        doc.text(line, colXs[i] + padX, y);
-        y += lineStepHeader;
-      });
-    });
-    return yBot;
-  };
-
-  const drawDataRow = (yTop: number, rowH: number, cells: string[][]) => {
-    const yBot = yTop + rowH;
-    doc.line(tableLeft, yBot, tableRight, yBot);
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(bodyFont);
-    cells.forEach((lines, i) => {
-      let y = yTop + padY + lineStepBody * 0.85;
-      lines.forEach((line) => {
-        doc.text(line, colXs[i] + padX, y);
-        y += lineStepBody;
-      });
-    });
-    return yBot;
-  };
-
-  const addSignatureImageFit = (dataUrl: string, xMm: number, yTopMm: number, maxW: number, maxH: number) => {
-    if (!dataUrl) return;
-    const lower = dataUrl.toLowerCase();
-    const fmtGuess: 'PNG' | 'JPEG' =
-      lower.includes('image/jpeg') || lower.includes('image/jpg') ? 'JPEG' : 'PNG';
-    const fitToBox = (iw: number, ih: number) => {
-      let w = maxW;
-      let h = (w * ih) / iw;
-      if (h > maxH) {
-        h = maxH;
-        w = (h * iw) / ih;
-      }
-      return { w, h };
-    };
-    try {
-      const { width: iw, height: ih } = doc.getImageProperties(dataUrl);
-      if (iw > 0 && ih > 0) {
-        const { w, h } = fitToBox(iw, ih);
-        try {
-          doc.addImage(dataUrl, fmtGuess, xMm, yTopMm, w, h);
-        } catch {
-          doc.addImage(dataUrl, fmtGuess === 'PNG' ? 'JPEG' : 'PNG', xMm, yTopMm, w, h);
-        }
-        return;
-      }
-    } catch {
-      /* fall through */
-    }
-    const { w, h } = fitToBox(400, 150);
-    for (const fmt of ['PNG', 'JPEG'] as const) {
-      try {
-        doc.addImage(dataUrl, fmt, xMm, yTopMm, w, h);
-        return;
-      } catch {
-        /* try next format */
-      }
-    }
-  };
-
-  const drawSignatureBlock = (signTop: number) => {
-    const signBottom = signTop + signatureBoxInnerH;
-    const hodApproval = prHodApprovalForPdf(request);
-
-    doc.rect(left, signTop, right - left, signBottom - signTop);
-    const mid = (left + right) / 2;
-    doc.line(mid, signTop, mid, signBottom);
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8);
-    doc.text('Requested By:', left + 2, signTop + 6);
-    doc.text('Approved By:', mid + 2, signTop + 6);
-
-    const sigPadX = 3;
-    const sigMaxW = mid - left - sigPadX * 2;
-    const sigMaxH = 22;
-    const sigImgY = signTop + 8;
-
-    const reqSigUrl = isSignatureImageDataUrl(request.requester_signature) ? request.requester_signature! : '';
-    if (reqSigUrl) {
-      addSignatureImageFit(reqSigUrl, left + sigPadX, sigImgY, sigMaxW, sigMaxH);
-    } else if (request.requester_signed_at) {
-      doc.setFontSize(7);
-      doc.text('Electronic signature', left + sigPadX, sigImgY + 5);
-      doc.text(formatSignatureProofTimestamp(request.requester_signed_at), left + sigPadX, sigImgY + 11);
-      doc.setFontSize(8);
-    }
-
-    const apprSigUrl =
-      hodApproval?.approver_signature && isSignatureImageDataUrl(hodApproval.approver_signature)
-        ? hodApproval.approver_signature!
-        : '';
-    if (apprSigUrl) {
-      addSignatureImageFit(apprSigUrl, mid + sigPadX, sigImgY, sigMaxW, sigMaxH);
-    } else if (hodApproval && hodApproval.status.toLowerCase() === 'approved') {
-      doc.setFontSize(7);
-      doc.text('Electronic signature', mid + sigPadX, sigImgY + 5);
-      doc.text(formatSignatureProofTimestamp(hodApproval.created_at), mid + sigPadX, sigImgY + 11);
-      doc.setFontSize(8);
-    }
-
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8);
-    doc.text(`Name : ${request.requester_name || ''}`, left + 2, signBottom - 15);
-    let yDesPr = signBottom - 11;
-    pdfDesignationLines(doc, 'Designation: ', request.requester_designation, sigMaxW - 2, 6.5).forEach((ln) => {
-      doc.text(ln, left + 2, yDesPr);
-      yDesPr += 3.2;
-    });
-    doc.setFontSize(8);
-    doc.text(`Name: ${hodApproval?.approver_name || ''}`, mid + 2, signBottom - 15);
-    yDesPr = signBottom - 11;
-    pdfDesignationLines(doc, 'Designation: ', hodApproval?.approver_designation ?? null, sigMaxW - 2, 6.5).forEach((ln) => {
-      doc.text(ln, mid + 2, yDesPr);
-      yDesPr += 3.2;
-    });
-    const proxyName = String(hodApproval?.signed_by_name ?? '').trim();
-    if (proxyName) {
-      doc.setFontSize(7);
-      doc.setTextColor(67, 56, 202);
-      doc.text(`Signed by proxy: ${proxyName}`, mid + 2, yDesPr);
-      doc.setTextColor(0, 0, 0);
-      doc.setFontSize(8);
-      yDesPr += 3.2;
-    }
-    doc.setFontSize(8);
-    doc.text(new Date(request.created_at).toLocaleDateString(), left + 2, signBottom - 2);
-    doc.text(
-      hodApproval?.created_at
-        ? new Date(hodApproval.created_at).toLocaleDateString()
-        : new Date().toLocaleDateString(),
-      mid + 2,
-      signBottom - 2
-    );
-  };
-
-  const drawTotalsBlock = (yTop: number) => {
-    const yBot = yTop + totalsBlockH;
-    doc.line(tableLeft, yBot, tableRight, yBot);
-    const splitAt = colWidths.length - 2;
-    const lastColStart = colXs[colWidths.length - 1];
-    doc.line(colXs[splitAt], yTop, colXs[splitAt], yBot);
-    doc.line(lastColStart, yTop + 20, tableRight, yTop + 20);
-    doc.setFontSize(8);
-    doc.text('Subtotal', colXs[splitAt] + padX, yTop + 5);
-    doc.text(subtotal.toFixed(2), tableRight - padX, yTop + 5, { align: 'right' });
-    doc.text(`Discount (${(discountRate * 100).toFixed(0)}%)`, colXs[splitAt] + padX, yTop + 11);
-    doc.text(discountAmount.toFixed(2), tableRight - padX, yTop + 11, { align: 'right' });
-    doc.text(`${taxLabel} ${(taxRate * 100).toFixed(0)}%`, colXs[splitAt] + padX, yTop + 17);
-    doc.text(`${(tax || 0).toFixed(2)}`, tableRight - padX, yTop + 17, { align: 'right' });
-    doc.text((request.currency?.trim() || '—').toUpperCase(), lastColStart + padX, yBot - 3);
-    doc.text(total.toFixed(2), tableRight - padX, yBot - 3, { align: 'right' });
-    return yBot;
-  };
-
-  const drawNewPage = () => {
-    drawPageChrome(tableTopY);
-    const headerBottom = drawHeaderRow(tableTopY);
-    drawVerticalRules(tableTopY, headerBottom);
-    return headerBottom;
-  };
-
-  let pageIndex = 0;
-  let rowOnPage = 0;
-  let y = tableTopY;
-  y = drawNewPage();
-
-  for (let i = 0; i < dataBlocks.length; i++) {
-    const block = dataBlocks[i];
-    if (block.kind !== 'data') continue;
-
-    const needNewPage =
-      rowOnPage >= PR_MAX_ROWS_PER_PAGE || (y + block.h > tableBottomSafe);
-    if (needNewPage) {
-      // Close previous page with signature before continuing.
-      drawSignatureBlock(signTopFixed);
-      doc.addPage('a4', 'l');
-      pageIndex += 1;
-      rowOnPage = 0;
-      y = drawNewPage();
-    }
-
-    y = drawDataRow(y, block.h, block.cells);
-    drawVerticalRules(tableTopY, y);
-    rowOnPage += 1;
-  }
-
-  // Totals: place on the last page above signatures; if it doesn't fit, move totals to a new page.
-  const totalsNeedNewPage = y + totalsBlockH > tableBottomSafe;
-  if (totalsNeedNewPage) {
-    drawSignatureBlock(signTopFixed);
-    doc.addPage('a4', 'l');
-    pageIndex += 1;
-    y = drawNewPage();
-  }
-  y = drawTotalsBlock(y);
-  drawVerticalRules(tableTopY, y);
-  drawSignatureBlock(signTopFixed);
-
+  const doc = buildProcurementPrFormPdfDoc(request);
   return buildPdfPreview(doc, `PR_${displayRequestSerial(request)}.pdf`);
 };
 
@@ -2154,7 +1896,7 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
     const priceRaw = getItemValue(item, ['unit price', 'price', 'amount']);
     const priceNum = Number(priceRaw);
     const priceDisp =
-      priceRaw !== '' && !Number.isNaN(priceNum) ? `${curPfx}${priceNum.toLocaleString()}`.trim() : '-';
+      priceRaw !== '' && !Number.isNaN(priceNum) ? `${curPfx}${formatProcurementMoney(priceNum)}`.trim() : '-';
     const supplier = getItemValue(item, [
       'purchase from (supplier)',
       'purchase from',
@@ -2222,7 +1964,7 @@ const printProcurementSRFormPdf = (request: WorkflowRequest) => {
     doc.setFont('helvetica', 'bold');
     doc.text('Date:', left + 2, 29);
     doc.setFont('helvetica', 'normal');
-    doc.text(new Date(request.created_at).toLocaleDateString(), left + 20, 29);
+    doc.text(formatDateMYT(request.created_at), left + 20, 29);
     doc.setFont('helvetica', 'bold');
     doc.text('Subsidiary:', tableRight - 2, 22, { align: 'right' });
     doc.setFont('helvetica', 'normal');
@@ -2475,7 +2217,7 @@ const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
   doc.setFont('helvetica', 'normal');
   const entCode = request.entity?.trim() || '-';
   doc.text(`Entity: ${entityLegalDisplayName(request.entity)} (${entCode})`, margin, y);
-  doc.text(`Date: ${new Date(request.created_at).toLocaleDateString()}`, 150, y);
+  doc.text(`Date: ${formatDateMYT(request.created_at)}`, 150, y);
   y += 10;
 
   doc.setDrawColor(200);
@@ -2545,7 +2287,7 @@ const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
     columns.forEach((col) => {
       let val = String(item[col] || '-');
       if (col === 'Unit Price' || col === 'Price' || col === 'Amount') {
-        val = `${procurementCurrencyPrefix(request.currency)}${Number(item[col] || 0).toLocaleString()}`.trim();
+        val = `${procurementCurrencyPrefix(request.currency)}${formatProcurementMoney(Number(item[col] || 0))}`.trim();
       }
       doc.text(val, x + 2, y, { maxWidth: colWidth - 4 });
       x += colWidth;
@@ -2556,7 +2298,7 @@ const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
       const price = parseFloat(item['Unit Price'] || '0');
       const total = qty * price;
       subtotal += total;
-      doc.text(`${procurementCurrencyPrefix(request.currency)}${total.toLocaleString()}`.trim(), x + 2, y);
+      doc.text(`${procurementCurrencyPrefix(request.currency)}${formatProcurementMoney(total)}`.trim(), x + 2, y);
     }
     y += 7;
   });
@@ -2566,15 +2308,15 @@ const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
     const m = procurementMoneyTotals(request);
     const curp = procurementCurrencyPrefix(request.currency);
     doc.setFont('helvetica', 'bold');
-    doc.text(`Subtotal: ${curp}${m.subtotal.toLocaleString()}`.trim(), 110, y);
+    doc.text(`Subtotal: ${curp}${formatProcurementMoney(m.subtotal)}`.trim(), 110, y);
     y += 5;
-    doc.text(`Discount (${(m.discountRate * 100).toFixed(0)}%): ${curp}${m.discountAmount.toLocaleString()}`.trim(), 110, y);
+    doc.text(`Discount (${(m.discountRate * 100).toFixed(0)}%): ${curp}${formatProcurementMoney(m.discountAmount)}`.trim(), 110, y);
     y += 5;
     const tlab = procurementTaxLabelForEntity(request.entity);
-    doc.text(`${tlab} (${(m.taxRate * 100).toFixed(0)}%): ${curp}${m.taxAmount.toLocaleString()}`.trim(), 110, y);
+    doc.text(`${tlab} (${(m.taxRate * 100).toFixed(0)}%): ${curp}${formatProcurementMoney(m.taxAmount)}`.trim(), 110, y);
     y += 7;
     doc.setFontSize(12);
-    doc.text(`TOTAL: ${curp}${m.total.toLocaleString()}`.trim(), 110, y);
+    doc.text(`TOTAL: ${curp}${formatProcurementMoney(m.total)}`.trim(), 110, y);
     y += 15;
   }
 
@@ -2593,7 +2335,7 @@ const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
     doc.text(`${step.label}:`, margin, y);
     doc.setFont('helvetica', 'normal');
     if (approval) {
-      doc.text(`${approval.status.toUpperCase()} by ${approval.approver_name} on ${new Date(approval.created_at).toLocaleDateString()}`, margin + 50, y);
+      doc.text(`${approval.status.toUpperCase()} by ${approval.approver_name} on ${formatDateMYT(approval.created_at)}`, margin + 50, y);
       let stepH = 12;
       const proxyNm = String(approval.signed_by_name ?? '').trim();
       if (proxyNm) {
@@ -2650,12 +2392,15 @@ function createWorkflowRequestPdfPreview(request: WorkflowRequest): { url: strin
  */
 async function persistPrSrFormPdfAfterWorkflowCompleted(
   requestId: number,
-  requestBeforeTransition: WorkflowRequest
+  requestBeforeTransition: WorkflowRequest,
+  opts?: { skipFinalStepCheck?: boolean }
 ): Promise<void> {
   if (!isPR_Only(requestBeforeTransition) && !isSR_Only(requestBeforeTransition)) return;
-  const stepsLen = (requestBeforeTransition.template_steps || []).length;
-  if (stepsLen === 0) return;
-  if (requestBeforeTransition.current_step_index + 1 < stepsLen) return;
+  if (!opts?.skipFinalStepCheck) {
+    const stepsLen = (requestBeforeTransition.template_steps || []).length;
+    if (stepsLen === 0) return;
+    if (requestBeforeTransition.current_step_index + 1 < stepsLen) return;
+  }
   const ent = String(requestBeforeTransition.entity || '').trim();
   if (ent) api.setActiveEntity(ent);
   try {
@@ -3638,6 +3383,8 @@ const WorkflowRequestList = ({
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [filterDept, setFilterDept] = useState<string>('all');
   const [filterEntity, setFilterEntity] = useState<string>('all');
+  const [filterChosenApprover, setFilterChosenApprover] = useState<string>('all');
+  const [listSearch, setListSearch] = useState('');
   const [sortBy, setSortBy] = useState<
     'request' | 'entity' | 'department' | 'requester' | 'chosenApprover' | 'status' | 'date'
   >('date');
@@ -3760,12 +3507,45 @@ const WorkflowRequestList = ({
         .filter((e) => !!e)
     )
   );
+  const chosenApproverOptions = Array.from(
+    new Map(
+      requests
+        .filter((r) => requestHasChosenApprover(r))
+        .map((r) => [Number(r.assigned_approver_id), chosenApproverNameLabel(r)] as [number, string])
+    ).entries()
+  )
+    .map(([id, label]) => ({ id, label }))
+    .sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }));
 
+  const searchQ = listSearch.trim().toLowerCase();
   const filteredRequests = requests.filter(r => {
     const statusMatch = filterStatus === 'all' || normalizeWorkflowRequestStatus(r.status) === filterStatus;
     const deptMatch = filterDept === 'all' || r.department === filterDept;
     const entityMatch = filterEntity === 'all' || String(r.entity || '').trim() === filterEntity;
-    return statusMatch && deptMatch && entityMatch;
+    const chosenApproverMatch =
+      filterChosenApprover === 'all' ||
+      (filterChosenApprover === 'none' && !requestHasChosenApprover(r)) ||
+      (filterChosenApprover !== 'none' &&
+        requestHasChosenApprover(r) &&
+        String(r.assigned_approver_id) === filterChosenApprover);
+    const searchMatch =
+      !searchQ ||
+      [
+        r.title,
+        displayRequestSerial(r),
+        String(r.formatted_id ?? ''),
+        r.template_name,
+        r.requester_name,
+        chosenApproverNameLabel(r),
+        String(r.entity ?? ''),
+        r.department,
+        String(r.assigned_approver_designation ?? ''),
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+        .includes(searchQ);
+    return statusMatch && deptMatch && entityMatch && chosenApproverMatch && searchMatch;
   });
 
   const toggleSort = (
@@ -3979,7 +3759,7 @@ const WorkflowRequestList = ({
     setLoading(true);
     try {
       const sendSig = needSig && approverSignature ? approverSignature : undefined;
-      await api.request(`/api/workflow-requests/${id}/approve`, {
+      const approveResult = await api.request(`/api/workflow-requests/${id}/approve`, {
         method: 'POST',
         body: JSON.stringify({
           status,
@@ -3991,8 +3771,8 @@ const WorkflowRequestList = ({
             : {}),
         }),
       });
-      if (status === 'approved' && selectedRequest) {
-        void persistPrSrFormPdfAfterWorkflowCompleted(id, selectedRequest);
+      if (status === 'approved' && selectedRequest && approveResult?.reached_final_approval === true) {
+        await persistPrSrFormPdfAfterWorkflowCompleted(id, selectedRequest, { skipFinalStepCheck: true });
       }
       toast.success(`Request ${status}`);
       onRefresh();
@@ -4111,7 +3891,7 @@ const WorkflowRequestList = ({
 
     doc.setFontSize(10);
     doc.setTextColor(100);
-    doc.text(`Generated on: ${new Date().toLocaleString()}`, margin, y);
+    doc.text(`Generated on: ${formatDateTimeMYT(new Date())}`, margin, y);
     y += 15;
 
     // Request Info
@@ -4161,8 +3941,8 @@ const WorkflowRequestList = ({
       x = margin;
       doc.text(String(item['Item'] || '-'), x + 2, y, { maxWidth: colWidths[0] - 4 });
       doc.text(String(qty), x + colWidths[0] + 2, y);
-      doc.text(`${procurementCurrencyPrefix(request.currency)}${price.toLocaleString()}`.trim(), x + colWidths[0] + colWidths[1] + 2, y);
-      doc.text(`${procurementCurrencyPrefix(request.currency)}${rowTot.toLocaleString()}`.trim(), x + colWidths[0] + colWidths[1] + colWidths[2] + 2, y);
+      doc.text(`${procurementCurrencyPrefix(request.currency)}${formatProcurementMoney(price)}`.trim(), x + colWidths[0] + colWidths[1] + 2, y);
+      doc.text(`${procurementCurrencyPrefix(request.currency)}${formatProcurementMoney(rowTot)}`.trim(), x + colWidths[0] + colWidths[1] + colWidths[2] + 2, y);
       y += 7;
     });
 
@@ -4170,17 +3950,46 @@ const WorkflowRequestList = ({
     const m = procurementMoneyTotals(request);
     const curp = procurementCurrencyPrefix(request.currency);
     doc.setFont('helvetica', 'bold');
-    doc.text(`Subtotal: ${curp}${m.subtotal.toLocaleString()}`.trim(), 110, y);
+    doc.text(`Subtotal: ${curp}${formatProcurementMoney(m.subtotal)}`.trim(), 110, y);
     y += 5;
-    doc.text(`Discount (${(m.discountRate * 100).toFixed(0)}%): ${curp}${m.discountAmount.toLocaleString()}`.trim(), 110, y);
+    doc.text(`Discount (${(m.discountRate * 100).toFixed(0)}%): ${curp}${formatProcurementMoney(m.discountAmount)}`.trim(), 110, y);
     y += 5;
-    doc.text(`${procurementTaxLabelForEntity(request.entity)} (${(m.taxRate * 100).toFixed(0)}%): ${curp}${m.taxAmount.toLocaleString()}`.trim(), 110, y);
+    doc.text(`${procurementTaxLabelForEntity(request.entity)} (${(m.taxRate * 100).toFixed(0)}%): ${curp}${formatProcurementMoney(m.taxAmount)}`.trim(), 110, y);
     y += 7;
     doc.setFontSize(12);
-    doc.text(`TOTAL AMOUNT: ${curp}${m.total.toLocaleString()}`.trim(), 110, y);
+    doc.text(`TOTAL AMOUNT: ${curp}${formatProcurementMoney(m.total)}`.trim(), 110, y);
 
     doc.save(`PO_Draft_${displayRequestSerial(request)}.pdf`);
     toast.success('PO Draft PDF generated');
+  };
+
+  const handleUploadRealPoAttachment = async (file: File) => {
+    if (!selectedRequest || !isPO_Only(selectedRequest)) return;
+    setLoading(true);
+    try {
+      const data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (typeof reader.result === 'string') resolve(reader.result);
+          else reject(new Error('Failed to read selected file'));
+        };
+        reader.onerror = () => reject(new Error('Failed to read selected file'));
+        reader.readAsDataURL(file);
+      });
+      await api.request(`/api/workflow-requests/${selectedRequest.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          attachments_add: [{ name: file.name, type: file.type || 'application/octet-stream', data }],
+        }),
+      });
+      toast.success('PO document uploaded');
+      await fetchDetails(selectedRequest.id);
+      onRefresh();
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to upload PO document');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const openConvertPoModal = (r: WorkflowRequest) => {
@@ -4192,13 +4001,13 @@ const WorkflowRequestList = ({
     });
   };
 
-  const handleConvertToPOConfirm = async (poNumber: string) => {
+  const handleConvertToPOConfirm = async (poNumber: string, poUpload?: ConvertPoUploadPayload) => {
     if (!convertPoModal) return;
     setLoading(true);
     try {
       const result = await api.request(`/api/workflow-requests/${convertPoModal.id}/convert-to-po`, {
         method: 'POST',
-        body: JSON.stringify({ po_number: poNumber }),
+        body: JSON.stringify({ po_number: poNumber, po_upload: poUpload || null }),
       });
       toast.success(
         result?.merged_into_existing
@@ -4271,7 +4080,20 @@ const WorkflowRequestList = ({
           {(isAdmin || isDirector || hasPermission('view_history')) ? 'All Requests' : 'My Requests'}
         </h2>
         
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-col gap-2 w-full md:w-auto md:items-end">
+          <div className="flex items-center gap-2 bg-white border border-zinc-200 rounded-lg px-3 py-1.5 w-full md:w-72 md:max-w-sm">
+            <Search className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+            <input
+              type="search"
+              enterKeyHint="search"
+              placeholder="Search by ref, title, requester, entity…"
+              className="text-xs bg-transparent border-none focus:ring-0 outline-none text-zinc-700 font-medium w-full placeholder:text-zinc-400"
+              value={listSearch}
+              onChange={(e) => setListSearch(e.target.value)}
+              aria-label="Search requests"
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center gap-2 bg-white border border-zinc-200 rounded-lg px-3 py-1.5">
             <Filter className="w-3 h-3 text-zinc-400" />
             <select 
@@ -4314,19 +4136,52 @@ const WorkflowRequestList = ({
             </select>
           </div>
 
+          <div className="flex items-center gap-2 bg-white border border-zinc-200 rounded-lg px-3 py-1.5 min-w-0">
+            <UserPlus className="w-3 h-3 text-zinc-400 shrink-0" />
+            <select
+              className="text-xs bg-transparent border-none focus:ring-0 outline-none text-zinc-600 font-medium max-w-[11rem] sm:max-w-[14rem] truncate"
+              value={filterChosenApprover}
+              onChange={(e) => setFilterChosenApprover(e.target.value)}
+              title="Filter by chosen approver"
+            >
+              <option value="all">All chosen approvers</option>
+              <option value="none">No chosen approver</option>
+              {chosenApproverOptions.map((o) => (
+                <option key={o.id} value={String(o.id)}>{o.label}</option>
+              ))}
+            </select>
+          </div>
+
           <span className="text-[10px] text-zinc-400 font-bold uppercase ml-2">
               {sortedFilteredRequests.length} Results
           </span>
 
-          {(filterStatus !== 'all' || filterDept !== 'all' || filterEntity !== 'all') && (
+          <button
+            type="button"
+            onClick={() => onRefresh()}
+            title="Reload list from server"
+            className="flex items-center gap-1 text-[10px] font-bold text-zinc-600 hover:text-indigo-600 bg-zinc-100 hover:bg-indigo-50 border border-zinc-200 px-2 py-1 rounded-lg transition-colors"
+          >
+            <RefreshCw className="w-3 h-3 shrink-0" />
+            Reload
+          </button>
+
+          {(filterStatus !== 'all' || filterDept !== 'all' || filterEntity !== 'all' || filterChosenApprover !== 'all' || listSearch.trim() !== '') && (
             <button 
-              onClick={() => { setFilterStatus('all'); setFilterDept('all'); setFilterEntity('all'); }}
+              onClick={() => {
+                setFilterStatus('all');
+                setFilterDept('all');
+                setFilterEntity('all');
+                setFilterChosenApprover('all');
+                setListSearch('');
+              }}
               className="flex items-center gap-1 text-[10px] font-bold text-indigo-600 hover:text-indigo-700 bg-indigo-50 px-2 py-1 rounded-full transition-colors"
             >
               <RotateCcw className="w-2.5 h-2.5" />
               Clear Filters
             </button>
           )}
+          </div>
         </div>
       </div>
 
@@ -4444,7 +4299,7 @@ const WorkflowRequestList = ({
                       )}
                     </td>
                     <td className="px-3 py-2 align-top min-w-[5.5rem] text-zinc-500 whitespace-nowrap">
-                      {new Date(r.created_at).toLocaleDateString()}
+                      {formatDateMYT(r.created_at)}
                     </td>
                     <td className="px-3 py-2 align-top text-right min-w-[9rem]">
                       <div className="flex flex-col items-end gap-1">
@@ -4955,7 +4810,7 @@ const WorkflowRequestList = ({
                               {formatWorkflowRequestStatusLabel(selectedRequest)}
                             </span>
                             <p className="text-[10px] text-zinc-400 mt-2 font-bold uppercase tracking-widest">
-                              {new Date(selectedRequest.created_at).toLocaleDateString()}
+                              {formatDateMYT(selectedRequest.created_at)}
                             </p>
                           </div>
                         </div>
@@ -4966,10 +4821,13 @@ const WorkflowRequestList = ({
                         <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
                           <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Total Amount</p>
                           <p className="text-xl font-black text-indigo-600">
-                            {procurementCurrencyPrefix(selectedRequest.currency)}{(isProcurementPRorPORequest(selectedRequest)
-                              ? procurementMoneyTotals(selectedRequest).total
-                              : (selectedRequest.line_items?.reduce((sum, item) => sum + (parseFloat(item['Quantity'] || '0') * parseFloat(item['Unit Price'] || '0')), 0) || 0) * (1 + (selectedRequest.tax_rate !== undefined ? selectedRequest.tax_rate : 0.18))
-                            ).toLocaleString()}
+                            {procurementCurrencyPrefix(selectedRequest.currency)}
+                            {formatProcurementMoney(
+                              isProcurementPRorPORequest(selectedRequest)
+                                ? procurementMoneyTotals(selectedRequest).total
+                                : ((selectedRequest.line_items?.reduce((sum, item) => sum + (parseFloat(item['Quantity'] || '0') * parseFloat(item['Unit Price'] || '0')), 0) || 0) *
+                                    (1 + (selectedRequest.tax_rate !== undefined ? selectedRequest.tax_rate : 0.18)))
+                            )}
                           </p>
                         </div>
                         <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
@@ -5137,7 +4995,7 @@ const WorkflowRequestList = ({
                                     {cols.map(col => (
                                       <td key={col} className="px-4 py-3 text-zinc-700">
                                         {(col === 'Unit Price' || col === 'Price' || col === 'Amount')
-                                          ? `${procurementCurrencyPrefix(selectedRequest.currency)}${Number(item[col] || 0).toLocaleString()}`.trim()
+                                          ? `${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(Number(item[col] || 0))}`.trim()
                                           : (col === REMARKS_LINE_COL
                                             ? (lineItemRemarksDisplay(item) || '-')
                                             : (isCostCenterGridColumn(col) || (isSRRequest(selectedRequest) && isSpareLocationColumn(col)))
@@ -5147,7 +5005,7 @@ const WorkflowRequestList = ({
                                     ))}
                                     {showLineTotal && (
                                       <td className="px-4 py-3 text-right font-bold text-zinc-900">
-                                        {`${procurementCurrencyPrefix(selectedRequest.currency)}${total.toLocaleString()}`.trim()}
+                                        {`${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(total)}`.trim()}
                                       </td>
                                     )}
                                   </tr>
@@ -5171,25 +5029,25 @@ const WorkflowRequestList = ({
                                 <tr>
                                   <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">Subtotal</td>
                                   <td className="px-4 py-2 text-right text-zinc-900">
-                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.subtotal.toLocaleString()}`.trim()}
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(m.subtotal)}`.trim()}
                                   </td>
                                 </tr>
                                 <tr>
                                   <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">Discount ({(m.discountRate * 100).toFixed(0)}%)</td>
                                   <td className="px-4 py-2 text-right text-zinc-900">
-                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.discountAmount.toLocaleString()}`.trim()}
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(m.discountAmount)}`.trim()}
                                   </td>
                                 </tr>
                                 <tr>
                                   <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">{procurementTaxLabelForEntity(selectedRequest.entity)} ({(m.taxRate * 100).toFixed(0)}%)</td>
                                   <td className="px-4 py-2 text-right text-zinc-900">
-                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.taxAmount.toLocaleString()}`.trim()}
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(m.taxAmount)}`.trim()}
                                   </td>
                                 </tr>
                                 <tr className="bg-zinc-100/50 text-lg">
                                   <td colSpan={gc.length + 1} className="px-4 py-4 text-right text-zinc-900 uppercase tracking-tight">Total Amount</td>
                                   <td className="px-4 py-4 text-right text-indigo-600 font-black">
-                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.total.toLocaleString()}`.trim()}
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(m.total)}`.trim()}
                                   </td>
                                 </tr>
                               </tfoot>
@@ -5197,6 +5055,32 @@ const WorkflowRequestList = ({
                             })()}
                           </table>
                         </div>
+                      </section>
+                    )}
+
+                    {isPO_Only(selectedRequest) && isPurchasing && (
+                      <section>
+                        <h4 className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-3 border-b border-zinc-100 pb-2">
+                          Real Purchase Order
+                        </h4>
+                        <label className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-zinc-200 bg-zinc-50 hover:bg-zinc-100 cursor-pointer text-xs font-semibold text-zinc-700 transition-colors">
+                          <Upload className="w-4 h-4" />
+                          {loading ? 'Uploading…' : 'Upload PO file (optional)'}
+                          <input
+                            type="file"
+                            className="hidden"
+                            disabled={loading}
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (!f) return;
+                              void handleUploadRealPoAttachment(f);
+                              e.currentTarget.value = '';
+                            }}
+                          />
+                        </label>
+                        <p className="text-[11px] text-zinc-500 mt-2">
+                          You can upload the official PO now or later.
+                        </p>
                       </section>
                     )}
 
@@ -5254,7 +5138,7 @@ const WorkflowRequestList = ({
                               <div className="pt-2 border-t border-zinc-200">
                                 <p className="text-sm font-bold text-zinc-900">{selectedRequest.requester_name}</p>
                                 <p className="text-xs text-zinc-500">{selectedRequest.department}</p>
-                                <p className="text-[10px] text-zinc-400 mt-1">{new Date(selectedRequest.created_at).toLocaleDateString()}</p>
+                                <p className="text-[10px] text-zinc-400 mt-1">{formatDateMYT(selectedRequest.created_at)}</p>
                               </div>
                             </div>
                           ) : (
@@ -5314,7 +5198,7 @@ const WorkflowRequestList = ({
                                               Signed by proxy: {approval.signed_by_name}
                                             </p>
                                           ) : null}
-                                          <p className="text-[10px] text-zinc-400">{new Date(approval.created_at).toLocaleDateString()}</p>
+                                          <p className="text-[10px] text-zinc-400">{formatDateMYT(approval.created_at)}</p>
                                         </div>
                                       </div>
                                     </div>
@@ -5466,7 +5350,7 @@ const WorkflowRequestList = ({
                             const ra = purchasingRejectApprovalForRequest({ ...selectedRequest, approvals });
                             const reason = String(ra?.comment || '').trim();
                             const who = String(ra?.approver_name || '').trim();
-                            const when = ra?.created_at ? new Date(ra.created_at).toLocaleString() : '';
+                            const when = ra?.created_at ? formatDateTimeMYT(ra.created_at) : '';
                             if (!reason && !who && !when) return null;
                             return (
                               <div className="mb-6 bg-rose-100 border border-rose-300 rounded-xl p-4">
@@ -5503,7 +5387,7 @@ const WorkflowRequestList = ({
                             const ca = requesterCancel || purchasingCancel;
                             const reason = String(ca?.comment || '').trim();
                             const who = String(ca?.approver_name || '').trim();
-                            const when = ca?.created_at ? new Date(ca.created_at).toLocaleString() : '';
+                            const when = ca?.created_at ? formatDateTimeMYT(ca.created_at) : '';
                             const byRequester = !!requesterCancel;
                             return (
                               <div className="space-y-2">
@@ -5774,7 +5658,7 @@ const Dashboard = ({
                     <div>
                       <p className="text-xs font-bold text-zinc-900 group-hover:text-indigo-600 transition-colors line-clamp-1">{activity.requestTitle}</p>
                       <p className="text-[10px] text-zinc-400">
-                        {activity.status === 'Approved' ? 'Approved' : 'Rejected'} on {new Date(activity.created_at).toLocaleDateString()}
+                        {activity.status === 'Approved' ? 'Approved' : 'Rejected'} on {formatDateMYT(activity.created_at)}
                       </p>
                     </div>
                   </div>
@@ -6004,7 +5888,7 @@ const WorkflowList = ({ workflows, user, roles: availableRoles, onRefresh, onSta
                 <div className="flex items-center gap-4 mt-3 text-xs text-zinc-400">
                   <span className="flex items-center gap-1">
                     <Clock className="w-3 h-3" />
-                    {new Date(w.created_at).toLocaleDateString()}
+                    {formatDateMYT(w.created_at)}
                   </span>
                   {isAdmin && (
                     <span className="flex items-center gap-1">
@@ -6053,7 +5937,7 @@ const WorkflowList = ({ workflows, user, roles: availableRoles, onRefresh, onSta
                 <div className="flex items-center gap-3">
                   <div>
                     <h2 className="text-xl font-bold text-zinc-900">{selectedWorkflow.name}</h2>
-                    <p className="text-sm text-zinc-500">Template created on {new Date(selectedWorkflow.created_at).toLocaleString()}</p>
+                    <p className="text-sm text-zinc-500">Template created on {formatDateTimeMYT(selectedWorkflow.created_at)}</p>
                   </div>
                   <span className={cn(
                     "text-[10px] uppercase font-bold px-2 py-0.5 rounded-full",
@@ -6336,9 +6220,319 @@ const WorkflowList = ({ workflows, user, roles: availableRoles, onRefresh, onSta
   );
 };
 
+/** Purchasing (and admins) maintain the entity-scoped cost center catalog (`dbo.cost_center`). */
+function CostCentersAdminPage({ entity }: { entity: string | null }) {
+  const ent = String(entity || '').trim();
+  const [rows, setRows] = useState<
+    Array<{
+      id: number;
+      entity: string;
+      code: string;
+      name: string;
+      gl_account: string | null;
+      status: boolean;
+      created_at?: string;
+    }>
+  >([]);
+  const [loading, setLoading] = useState(false);
+  const [showInactive, setShowInactive] = useState(true);
+  const [newRow, setNewRow] = useState({
+    code: '',
+    name: '',
+    gl_account: '',
+    active: true,
+  });
+  const [editing, setEditing] = useState<{
+    id: number;
+    code: string;
+    name: string;
+    gl_account: string;
+    active: boolean;
+  } | null>(null);
+
+  const load = useCallback(async () => {
+    if (!ent) {
+      setRows([]);
+      return;
+    }
+    setLoading(true);
+    try {
+      const q = showInactive ? '?include_inactive=1' : '';
+      const data = await api.request(`/api/cost-centers${q}`);
+      const list = Array.isArray(data) ? data : [];
+      setRows(
+        list.map((r: any) => ({
+          id: Number(r.id),
+          entity: String(r.entity || ''),
+          code: String(r.code || ''),
+          name: String(r.name || ''),
+          gl_account: r.gl_account != null ? String(r.gl_account) : null,
+          status: !!r.status,
+          created_at: r.created_at,
+        }))
+      );
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : 'Failed to load cost centers');
+      setRows([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [ent, showInactive]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const handleCreate = async () => {
+    const code = newRow.code.trim();
+    const name = newRow.name.trim();
+    if (!code || !name) {
+      toast.error('Code and name are required');
+      return;
+    }
+    try {
+      await api.request('/api/cost-centers', {
+        method: 'POST',
+        body: JSON.stringify({
+          code,
+          name,
+          gl_account: newRow.gl_account.trim() || undefined,
+          status: newRow.active ? 1 : 0,
+        }),
+      });
+      toast.success('Cost center added');
+      setNewRow({ code: '', name: '', gl_account: '', active: true });
+      void load();
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : 'Failed to create');
+    }
+  };
+
+  const saveEdit = async () => {
+    if (!editing) return;
+    const code = editing.code.trim();
+    const name = editing.name.trim();
+    if (!code || !name) {
+      toast.error('Code and name are required');
+      return;
+    }
+    try {
+      await api.request(`/api/cost-centers/${editing.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          code,
+          name,
+          gl_account: editing.gl_account.trim() || null,
+          status: editing.active ? 1 : 0,
+        }),
+      });
+      toast.success('Saved');
+      setEditing(null);
+      void load();
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : 'Failed to save');
+    }
+  };
+
+  if (!ent) {
+    return (
+      <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+        Select an <strong>entity</strong> in the header to load and edit the cost center list for that entity.
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col flex-1 min-h-0 gap-4">
+      <div className="flex flex-wrap items-end justify-between gap-3 shrink-0">
+        <div>
+          <h1 className="text-xl font-bold text-zinc-900">Cost centers</h1>
+          <p className="text-xs text-zinc-500 mt-1">
+            Entity <span className="font-semibold text-zinc-700">{ent}</span> — codes must be unique per entity. Inactive rows stay valid for existing PR/PO lines but are hidden from new picks.
+          </p>
+        </div>
+        <label className="flex items-center gap-2 text-sm text-zinc-600 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            className="rounded border-zinc-300"
+            checked={showInactive}
+            onChange={(e) => setShowInactive(e.target.checked)}
+          />
+          Show inactive
+        </label>
+      </div>
+
+      <div className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm shrink-0">
+        <h2 className="text-sm font-bold text-zinc-900 mb-3">Add cost center</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 items-end">
+          <div className="lg:col-span-1">
+            <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block mb-1">Code</label>
+            <input
+              value={newRow.code}
+              onChange={(e) => setNewRow({ ...newRow, code: e.target.value })}
+              className="w-full rounded-lg border border-zinc-200 px-2.5 py-2 text-sm"
+              placeholder="e.g. 1000"
+            />
+          </div>
+          <div className="lg:col-span-2">
+            <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block mb-1">Name</label>
+            <input
+              value={newRow.name}
+              onChange={(e) => setNewRow({ ...newRow, name: e.target.value })}
+              className="w-full rounded-lg border border-zinc-200 px-2.5 py-2 text-sm"
+              placeholder="Department / description"
+            />
+          </div>
+          <div>
+            <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block mb-1">GL account</label>
+            <input
+              value={newRow.gl_account}
+              onChange={(e) => setNewRow({ ...newRow, gl_account: e.target.value })}
+              className="w-full rounded-lg border border-zinc-200 px-2.5 py-2 text-sm"
+              placeholder="Optional"
+            />
+          </div>
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 text-sm text-zinc-600 cursor-pointer">
+              <input
+                type="checkbox"
+                className="rounded border-zinc-300"
+                checked={newRow.active}
+                onChange={(e) => setNewRow({ ...newRow, active: e.target.checked })}
+              />
+              Active
+            </label>
+            <button
+              type="button"
+              onClick={() => void handleCreate()}
+              className="rounded-lg bg-indigo-600 text-white px-4 py-2 text-sm font-semibold hover:bg-indigo-700 shrink-0"
+            >
+              Add
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-auto rounded-xl border border-zinc-200 bg-white flex flex-col">
+        <div className="px-4 py-2 border-b border-zinc-100 flex items-center justify-between shrink-0">
+          <span className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Catalog</span>
+          <button
+            type="button"
+            onClick={() => void load()}
+            className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-600 hover:text-indigo-800"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            Refresh
+          </button>
+        </div>
+        {loading ? (
+          <div className="p-8 text-center text-sm text-zinc-500">Loading…</div>
+        ) : rows.length === 0 ? (
+          <div className="p-8 text-center text-sm text-zinc-500">No cost centers for this entity yet.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-zinc-100 text-left text-[10px] font-bold uppercase tracking-wider text-zinc-400">
+                  <th className="px-4 py-2">Code</th>
+                  <th className="px-4 py-2">Name</th>
+                  <th className="px-4 py-2">GL</th>
+                  <th className="px-4 py-2">Active</th>
+                  <th className="px-4 py-2 w-36">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <tr key={row.id} className="border-b border-zinc-50 hover:bg-zinc-50/80">
+                    {editing?.id === row.id ? (
+                      <>
+                        <td className="px-4 py-2 align-top">
+                          <input
+                            value={editing.code}
+                            onChange={(e) => setEditing({ ...editing, code: e.target.value })}
+                            className="w-full min-w-[4rem] rounded border border-zinc-200 px-2 py-1 text-sm"
+                          />
+                        </td>
+                        <td className="px-4 py-2 align-top">
+                          <input
+                            value={editing.name}
+                            onChange={(e) => setEditing({ ...editing, name: e.target.value })}
+                            className="w-full min-w-[8rem] rounded border border-zinc-200 px-2 py-1 text-sm"
+                          />
+                        </td>
+                        <td className="px-4 py-2 align-top">
+                          <input
+                            value={editing.gl_account}
+                            onChange={(e) => setEditing({ ...editing, gl_account: e.target.value })}
+                            className="w-full min-w-[5rem] rounded border border-zinc-200 px-2 py-1 text-sm"
+                          />
+                        </td>
+                        <td className="px-4 py-2 align-top">
+                          <input
+                            type="checkbox"
+                            className="rounded border-zinc-300"
+                            checked={editing.active}
+                            onChange={(e) => setEditing({ ...editing, active: e.target.checked })}
+                          />
+                        </td>
+                        <td className="px-4 py-2 align-top whitespace-nowrap">
+                          <button
+                            type="button"
+                            onClick={() => void saveEdit()}
+                            className="text-xs font-semibold text-emerald-600 hover:text-emerald-800 mr-3"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditing(null)}
+                            className="text-xs font-semibold text-zinc-500 hover:text-zinc-800"
+                          >
+                            Cancel
+                          </button>
+                        </td>
+                      </>
+                    ) : (
+                      <>
+                        <td className="px-4 py-2 font-mono text-xs">{row.code}</td>
+                        <td className="px-4 py-2">{row.name}</td>
+                        <td className="px-4 py-2 text-zinc-600">{row.gl_account || '—'}</td>
+                        <td className="px-4 py-2">{row.status ? 'Yes' : 'No'}</td>
+                        <td className="px-4 py-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setEditing({
+                                id: row.id,
+                                code: row.code,
+                                name: row.name,
+                                gl_account: row.gl_account ?? '',
+                                active: row.status,
+                              })
+                            }
+                            className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 inline-flex items-center gap-1"
+                          >
+                            <Edit2 className="w-3.5 h-3.5" />
+                            Edit
+                          </button>
+                        </td>
+                      </>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 const AVAILABLE_PERMISSIONS = [
   { key: 'admin', label: 'Full Admin Access', description: 'Can perform all actions in the system' },
   { key: 'manage_users', label: 'Manage Users', description: 'Can create and edit users' },
+  { key: 'manage_cost_centers', label: 'Manage cost centers', description: 'Create and edit the cost center catalog for the active entity (purchasing)' },
   { key: 'create_templates', label: 'Create Templates', description: 'Can create and manage workflow templates' },
   { key: 'approve_templates', label: 'Approve Templates', description: 'Can approve or reject new workflow templates' },
   { key: 'view_history', label: 'View All History', description: 'Can view all workflow requests across departments' },
@@ -6822,7 +7016,7 @@ async function downloadProcurementCenterExcel(
 
   const infoRows = [
     { Key: 'Title', Value: 'Procurement Center export' },
-    { Key: 'Exported', Value: new Date().toLocaleString() },
+    { Key: 'Exported', Value: formatDateTimeMYT(new Date()) },
     { Key: 'List', Value: tabLabel },
     { Key: 'Search', Value: filters.search.trim() || '—' },
     { Key: 'Status', Value: filters.status.trim() || 'All' },
@@ -6862,7 +7056,7 @@ async function downloadProcurementCenterExcel(
       'Discount %': Number((m.discountRate * 100).toFixed(4)),
       'Tax %': Number((m.taxRate * 100).toFixed(4)),
       Total: m.total,
-      'Total (display)': m.total > 0 ? `${curp}${m.total.toLocaleString()}`.trim() : '',
+      'Total (display)': m.total > 0 ? `${curp}${formatProcurementMoney(m.total)}`.trim() : '',
       'Item count': r.line_items?.length ?? 0,
       'Line summary': lines.join(' | '),
       Supplier: procurementSupplierColumnDisplay(r),
@@ -6912,7 +7106,7 @@ async function downloadProcurementCenterExcel(
   downloadCsvFile(`${base}_LineItems.csv`, rowsToCsv(lineRowsOut as Array<Record<string, unknown>>));
 }
 
-const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: string }) => {
+const ProcurementCenter = ({ user }: { user: User }) => {
   const [requests, setRequests] = useState<WorkflowRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeSubTab, setActiveSubTab] = useState<'pr' | 'sr' | 'po' | 'invoice'>('pr');
@@ -6922,6 +7116,13 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     search: '',
     entity: ''
   });
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
+  const [debouncedProcurementSearch, setDebouncedProcurementSearch] = useState(() => filters.search);
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedProcurementSearch(filters.search), 400);
+    return () => window.clearTimeout(t);
+  }, [filters.search]);
   const [tableSortBy, setTableSortBy] = useState<
     'id' | 'type' | 'entity' | 'requester' | 'chosenApprover' | 'items' | 'supplier' | 'total' | 'status' | 'date'
   >('date');
@@ -6972,29 +7173,38 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   const canRequesterCancelSelected =
     !!selectedRequest && canRequesterCancelPendingRequest(selectedRequest, user, approvals);
 
-  const fetchProcurementRequests = async (): Promise<WorkflowRequest[]> => {
-    setLoading(true);
-    try {
-      const mergedFilters = {
-        ...filters,
-        entity: (filters.entity || entityScope || '').trim(),
-      };
-      const params = new URLSearchParams();
-      for (const [k, v] of Object.entries(mergedFilters)) {
-        const s = v == null ? '' : String(v).trim();
-        if (s !== '') params.set(k, s);
+  const fetchProcurementRequests = useCallback(
+    async (immediateSearch = false): Promise<WorkflowRequest[]> => {
+      const f = filtersRef.current;
+      const searchForQuery = immediateSearch ? f.search : debouncedProcurementSearch;
+      setLoading(true);
+      try {
+        // Do not inherit the header entity: omit `entity` from the query to load all rows for
+        // `user.entities` (server uses IN(...)). The entity filter dropdown uses `user.entities`, not
+        // only entities present in the current page of results.
+        const mergedFilters = {
+          ...f,
+          search: searchForQuery,
+          entity: String(f.entity || '').trim(),
+        };
+        const params = new URLSearchParams();
+        for (const [k, v] of Object.entries(mergedFilters)) {
+          const s = v == null ? '' : String(v).trim();
+          if (s !== '') params.set(k, s);
+        }
+        const qs = params.toString();
+        const data = await api.request(`/api/procurement/requests${qs ? `?${qs}` : ''}`, { skipEntity: true });
+        setRequests(data);
+        return data;
+      } catch (err) {
+        toast.error('Failed to fetch procurement requests');
+        return [];
+      } finally {
+        setLoading(false);
       }
-      const qs = params.toString();
-      const data = await api.request(`/api/procurement/requests${qs ? `?${qs}` : ''}`, { skipEntity: true });
-      setRequests(data);
-      return data;
-    } catch (err) {
-      toast.error('Failed to fetch procurement requests');
-      return [];
-    } finally {
-      setLoading(false);
-    }
-  };
+    },
+    [debouncedProcurementSearch]
+  );
 
   const fetchDetails = async (id: number) => {
     try {
@@ -7006,6 +7216,26 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
       setApprovals(appData);
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  /** List payload omits heavy fields; merge full row for modal (signature, details, steps). */
+  const openProcurementRequestDetail = async (lite: WorkflowRequest) => {
+    const ent = String(lite.entity || '').trim();
+    if (ent) api.setActiveEntity(ent);
+    else api.setActiveEntity(null);
+    setSelectedRequest(lite);
+    setDetailsViewMode('details');
+    setDetailsPdfPreview((prev) => {
+      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+      return null;
+    });
+    void fetchDetails(lite.id);
+    try {
+      const full = (await api.request(`/api/workflow-requests/${lite.id}`)) as WorkflowRequest;
+      setSelectedRequest((prev) => (prev && prev.id === lite.id ? { ...prev, ...full } : prev));
+    } catch (err: any) {
+      toast.error(err?.message || 'Could not load full request details');
     }
   };
 
@@ -7085,7 +7315,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
       toast.success('Request updated');
       setIsEditing(false);
       setEditAttachmentAdd([]);
-      const refreshed = await fetchProcurementRequests();
+      const refreshed = await fetchProcurementRequests(true);
       const nextSel = refreshed.find((x) => x.id === selectedRequest.id);
       if (nextSel) {
         setSelectedRequest(nextSel);
@@ -7119,7 +7349,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
         method: 'POST',
       });
       toast.success('Request resubmitted successfully!');
-      fetchProcurementRequests();
+      void fetchProcurementRequests(true);
       setSelectedRequest(null);
     } catch (err: any) {
       toast.error(err.message);
@@ -7141,7 +7371,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
         body: JSON.stringify({ comment: reason }),
       });
       toast.success('Request cancelled');
-      fetchProcurementRequests();
+      void fetchProcurementRequests(true);
       setSelectedRequest(null);
     } catch (err: any) {
       toast.error(err.message);
@@ -7185,7 +7415,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
 
     doc.setFontSize(10);
     doc.setTextColor(100);
-    doc.text(`Generated on: ${new Date().toLocaleString()}`, margin, y);
+    doc.text(`Generated on: ${formatDateTimeMYT(new Date())}`, margin, y);
     y += 15;
 
     // Request Info
@@ -7235,8 +7465,8 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
       x = margin;
       doc.text(String(item['Item'] || '-'), x + 2, y, { maxWidth: colWidths[0] - 4 });
       doc.text(String(qty), x + colWidths[0] + 2, y);
-      doc.text(`${procurementCurrencyPrefix(request.currency)}${price.toLocaleString()}`.trim(), x + colWidths[0] + colWidths[1] + 2, y);
-      doc.text(`${procurementCurrencyPrefix(request.currency)}${rowTot.toLocaleString()}`.trim(), x + colWidths[0] + colWidths[1] + colWidths[2] + 2, y);
+      doc.text(`${procurementCurrencyPrefix(request.currency)}${formatProcurementMoney(price)}`.trim(), x + colWidths[0] + colWidths[1] + 2, y);
+      doc.text(`${procurementCurrencyPrefix(request.currency)}${formatProcurementMoney(rowTot)}`.trim(), x + colWidths[0] + colWidths[1] + colWidths[2] + 2, y);
       y += 7;
     });
 
@@ -7244,17 +7474,46 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     const m = procurementMoneyTotals(request);
     const curp = procurementCurrencyPrefix(request.currency);
     doc.setFont('helvetica', 'bold');
-    doc.text(`Subtotal: ${curp}${m.subtotal.toLocaleString()}`.trim(), 110, y);
+    doc.text(`Subtotal: ${curp}${formatProcurementMoney(m.subtotal)}`.trim(), 110, y);
     y += 5;
-    doc.text(`Discount (${(m.discountRate * 100).toFixed(0)}%): ${curp}${m.discountAmount.toLocaleString()}`.trim(), 110, y);
+    doc.text(`Discount (${(m.discountRate * 100).toFixed(0)}%): ${curp}${formatProcurementMoney(m.discountAmount)}`.trim(), 110, y);
     y += 5;
-    doc.text(`${procurementTaxLabelForEntity(request.entity)} (${(m.taxRate * 100).toFixed(0)}%): ${curp}${m.taxAmount.toLocaleString()}`.trim(), 110, y);
+    doc.text(`${procurementTaxLabelForEntity(request.entity)} (${(m.taxRate * 100).toFixed(0)}%): ${curp}${formatProcurementMoney(m.taxAmount)}`.trim(), 110, y);
     y += 7;
     doc.setFontSize(12);
-    doc.text(`TOTAL AMOUNT: ${curp}${m.total.toLocaleString()}`.trim(), 110, y);
+    doc.text(`TOTAL AMOUNT: ${curp}${formatProcurementMoney(m.total)}`.trim(), 110, y);
 
     doc.save(`PO_Draft_${displayRequestSerial(request)}.pdf`);
     toast.success('PO Draft PDF generated');
+  };
+
+  const handleUploadRealPoAttachment = async (file: File) => {
+    if (!selectedRequest || !isPO_Only(selectedRequest)) return;
+    setLoading(true);
+    try {
+      const data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (typeof reader.result === 'string') resolve(reader.result);
+          else reject(new Error('Failed to read selected file'));
+        };
+        reader.onerror = () => reject(new Error('Failed to read selected file'));
+        reader.readAsDataURL(file);
+      });
+      await api.request(`/api/workflow-requests/${selectedRequest.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          attachments_add: [{ name: file.name, type: file.type || 'application/octet-stream', data }],
+        }),
+      });
+      toast.success('PO document uploaded');
+      await fetchDetails(selectedRequest.id);
+      await fetchProcurementRequests(true);
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to upload PO document');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const openConvertPoModal = (r: WorkflowRequest) => {
@@ -7266,13 +7525,13 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
     });
   };
 
-  const handleConvertToPOConfirm = async (poNumber: string) => {
+  const handleConvertToPOConfirm = async (poNumber: string, poUpload?: ConvertPoUploadPayload) => {
     if (!convertPoModal) return;
     setLoading(true);
     try {
       const result = await api.request(`/api/workflow-requests/${convertPoModal.id}/convert-to-po`, {
         method: 'POST',
-        body: JSON.stringify({ po_number: poNumber }),
+        body: JSON.stringify({ po_number: poNumber, po_upload: poUpload || null }),
       });
       toast.success(
         result?.merged_into_existing
@@ -7280,7 +7539,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           : `PO created: ${toUpperSerial(result.formatted_id)}`
       );
       setConvertPoModal(null);
-      fetchProcurementRequests();
+      void fetchProcurementRequests(true);
       setSelectedRequest(null);
     } catch (err: any) {
       toast.error(err.message);
@@ -7314,7 +7573,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
         }),
       });
       toast.success(decision === 'cancelled' ? 'PR cancelled' : 'PR rejected by purchasing');
-      fetchProcurementRequests();
+      void fetchProcurementRequests(true);
       setSelectedRequest(null);
       setPurchasingDecisionModal(null);
     } catch (err: any) {
@@ -7325,16 +7584,12 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
   };
 
   useEffect(() => {
-    fetchProcurementRequests();
-  }, [filters, entityScope]);
+    void fetchProcurementRequests(false);
+  }, [fetchProcurementRequests, filters.status, filters.department, filters.entity, debouncedProcurementSearch]);
 
-  const procurementEntities = Array.from(
-    new Set(
-      requests
-        .map((r) => String(r.entity || '').trim())
-        .filter((e) => !!e)
-    )
-  );
+  const procurementEntityFilterOptions = Array.from(
+    new Set((user.entities || []).map((e) => String(e).trim()).filter(Boolean))
+  ).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 
   const filteredRequests = requests.filter((r) => {
     const templateName = r.template_name.toLowerCase();
@@ -7520,7 +7775,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           onChange={(e) => setFilters({ ...filters, entity: e.target.value })}
         >
           <option value="">All Entities</option>
-          {procurementEntities.map((ent) => (
+          {procurementEntityFilterOptions.map((ent) => (
             <option key={ent} value={ent}>{ent}</option>
           ))}
         </select>
@@ -7539,7 +7794,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
           Export to Excel
         </button>
         <button 
-          onClick={fetchProcurementRequests}
+          onClick={() => void fetchProcurementRequests(true)}
           className="px-4 py-2 bg-zinc-900 text-white rounded-xl text-sm font-bold hover:bg-zinc-800 transition-colors"
         >
           Refresh
@@ -7623,14 +7878,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                     key={r.id} 
                     className="hover:bg-zinc-50 transition-colors cursor-pointer group align-top"
                     onClick={() => {
-                      api.setActiveEntity(String(r.entity || '').trim() || null);
-                      setSelectedRequest(r);
-                      setDetailsViewMode('details');
-                      setDetailsPdfPreview((prev) => {
-                        if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-                        return null;
-                      });
-                      fetchDetails(r.id);
+                      void openProcurementRequestDetail(r);
                     }}
                   >
                     <td className="px-3 py-2 align-top font-mono text-zinc-500 tabular-nums whitespace-nowrap min-w-[10.5rem]">
@@ -7682,7 +7930,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                     </td>
                     <td className="px-3 py-2 align-top whitespace-nowrap min-w-[5.5rem]">
                       <p className="font-bold text-zinc-900 tabular-nums">
-                        {totalAmount > 0 ? `${procurementCurrencyPrefix(r.currency)}${totalAmount.toLocaleString()}`.trim() : '-'}
+                        {totalAmount > 0 ? `${procurementCurrencyPrefix(r.currency)}${formatProcurementMoney(totalAmount)}`.trim() : '-'}
                       </p>
                     </td>
                     <td className="px-3 py-2 align-top min-w-[6.5rem]">
@@ -7694,7 +7942,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                       </span>
                     </td>
                     <td className="px-3 py-2 align-top text-zinc-500 whitespace-nowrap min-w-[5.5rem]">
-                      {new Date(r.created_at).toLocaleDateString()}
+                      {formatDateMYT(r.created_at)}
                     </td>
                     <td className="px-3 py-2 align-top text-right min-w-[9rem]">
                       <div className="flex flex-col items-end gap-1">
@@ -7747,14 +7995,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
-                            api.setActiveEntity(String(r.entity || '').trim() || null);
-                            setSelectedRequest(r);
-                            setDetailsViewMode('details');
-                            setDetailsPdfPreview((prev) => {
-                              if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-                              return null;
-                            });
-                            fetchDetails(r.id);
+                            void openProcurementRequestDetail(r);
                           }}
                           title="Request details"
                           className="inline-flex items-center justify-center gap-1 px-2 py-1 bg-indigo-50 text-indigo-600 rounded-md font-bold text-[10px] hover:bg-indigo-100 transition-all border border-indigo-100 shadow-sm whitespace-nowrap"
@@ -8271,7 +8512,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                           {formatWorkflowRequestStatusLabel(selectedRequest)}
                         </span>
                         <p className="text-[10px] text-zinc-400 mt-2 font-bold uppercase tracking-widest">
-                          {new Date(selectedRequest.created_at).toLocaleDateString()}
+                          {formatDateMYT(selectedRequest.created_at)}
                         </p>
                       </div>
                     </div>
@@ -8281,10 +8522,13 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                       <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
                         <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Total Amount</p>
                         <p className="text-xl font-black text-indigo-600">
-                          {procurementCurrencyPrefix(selectedRequest.currency)}{(isProcurementPRorPORequest(selectedRequest)
-                            ? procurementMoneyTotals(selectedRequest).total
-                            : (selectedRequest.line_items?.reduce((sum, item) => sum + (parseFloat(item['Quantity'] || '0') * parseFloat(item['Unit Price'] || '0')), 0) || 0) * (1 + (selectedRequest.tax_rate !== undefined ? selectedRequest.tax_rate : 0.18))
-                          ).toLocaleString()}
+                          {procurementCurrencyPrefix(selectedRequest.currency)}
+                          {formatProcurementMoney(
+                            isProcurementPRorPORequest(selectedRequest)
+                              ? procurementMoneyTotals(selectedRequest).total
+                              : ((selectedRequest.line_items?.reduce((sum, item) => sum + (parseFloat(item['Quantity'] || '0') * parseFloat(item['Unit Price'] || '0')), 0) || 0) *
+                                  (1 + (selectedRequest.tax_rate !== undefined ? selectedRequest.tax_rate : 0.18)))
+                          )}
                         </p>
                       </div>
                       <div className="bg-white p-4 rounded-xl border border-zinc-100 shadow-sm">
@@ -8452,7 +8696,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                     {cols.map(col => (
                                       <td key={col} className="px-4 py-3 text-zinc-700">
                                         {(col === 'Unit Price' || col === 'Price' || col === 'Amount')
-                                          ? `${procurementCurrencyPrefix(selectedRequest.currency)}${Number(item[col] || 0).toLocaleString()}`.trim()
+                                          ? `${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(Number(item[col] || 0))}`.trim()
                                           : (col === REMARKS_LINE_COL
                                             ? (lineItemRemarksDisplay(item) || '-')
                                             : (isCostCenterGridColumn(col) || (isSRRequest(selectedRequest) && isSpareLocationColumn(col)))
@@ -8462,7 +8706,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                     ))}
                                     {showLineTotal && (
                                       <td className="px-4 py-3 text-right font-bold text-zinc-900">
-                                        {`${procurementCurrencyPrefix(selectedRequest.currency)}${total.toLocaleString()}`.trim()}
+                                        {`${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(total)}`.trim()}
                                       </td>
                                     )}
                                   </tr>
@@ -8486,25 +8730,25 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                 <tr>
                                   <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">Subtotal</td>
                                   <td className="px-4 py-2 text-right text-zinc-900">
-                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.subtotal.toLocaleString()}`.trim()}
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(m.subtotal)}`.trim()}
                                   </td>
                                 </tr>
                                 <tr>
                                   <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">Discount ({(m.discountRate * 100).toFixed(0)}%)</td>
                                   <td className="px-4 py-2 text-right text-zinc-900">
-                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.discountAmount.toLocaleString()}`.trim()}
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(m.discountAmount)}`.trim()}
                                   </td>
                                 </tr>
                                 <tr>
                                   <td colSpan={gc.length + 1} className="px-4 py-2 text-right text-zinc-500">{procurementTaxLabelForEntity(selectedRequest.entity)} ({(m.taxRate * 100).toFixed(0)}%)</td>
                                   <td className="px-4 py-2 text-right text-zinc-900">
-                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.taxAmount.toLocaleString()}`.trim()}
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(m.taxAmount)}`.trim()}
                                   </td>
                                 </tr>
                                 <tr className="bg-zinc-100/50 text-lg">
                                   <td colSpan={gc.length + 1} className="px-4 py-4 text-right text-zinc-900 uppercase tracking-tight">Total Amount</td>
                                   <td className="px-4 py-4 text-right text-indigo-600 font-black">
-                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${m.total.toLocaleString()}`.trim()}
+                                    {`${procurementCurrencyPrefix(selectedRequest.currency)}${formatProcurementMoney(m.total)}`.trim()}
                                   </td>
                                 </tr>
                               </tfoot>
@@ -8512,6 +8756,32 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                             })()}
                           </table>
                         </div>
+                      </section>
+                    )}
+
+                    {isPO_Only(selectedRequest) && isPurchasing && (
+                      <section>
+                        <h4 className="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-3 border-b border-zinc-100 pb-2">
+                          Real Purchase Order
+                        </h4>
+                        <label className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-zinc-200 bg-zinc-50 hover:bg-zinc-100 cursor-pointer text-xs font-semibold text-zinc-700 transition-colors">
+                          <Upload className="w-4 h-4" />
+                          {loading ? 'Uploading…' : 'Upload PO file (optional)'}
+                          <input
+                            type="file"
+                            className="hidden"
+                            disabled={loading}
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (!f) return;
+                              void handleUploadRealPoAttachment(f);
+                              e.currentTarget.value = '';
+                            }}
+                          />
+                        </label>
+                        <p className="text-[11px] text-zinc-500 mt-2">
+                          You can upload the official PO now or later.
+                        </p>
                       </section>
                     )}
 
@@ -8569,7 +8839,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                               <div className="pt-2 border-t border-zinc-200">
                                 <p className="text-sm font-bold text-zinc-900">{selectedRequest.requester_name}</p>
                                 <p className="text-xs text-zinc-500">{selectedRequest.department}</p>
-                                <p className="text-[10px] text-zinc-400 mt-1">{new Date(selectedRequest.created_at).toLocaleDateString()}</p>
+                                <p className="text-[10px] text-zinc-400 mt-1">{formatDateMYT(selectedRequest.created_at)}</p>
                               </div>
                             </div>
                           ) : (
@@ -8629,7 +8899,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                                               Signed by proxy: {approval.signed_by_name}
                                             </p>
                                           ) : null}
-                                          <p className="text-[10px] text-zinc-400">{new Date(approval.created_at).toLocaleDateString()}</p>
+                                          <p className="text-[10px] text-zinc-400">{formatDateMYT(approval.created_at)}</p>
                                         </div>
                                       </div>
                                     </div>
@@ -8667,7 +8937,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                             const ra = purchasingRejectApprovalForRequest({ ...selectedRequest, approvals });
                             const reason = String(ra?.comment || '').trim();
                             const who = String(ra?.approver_name || '').trim();
-                            const when = ra?.created_at ? new Date(ra.created_at).toLocaleString() : '';
+                            const when = ra?.created_at ? formatDateTimeMYT(ra.created_at) : '';
                             if (!reason && !who && !when) return null;
                             return (
                               <div className="mb-6 bg-rose-100 border border-rose-300 rounded-xl p-4">
@@ -8704,7 +8974,7 @@ const ProcurementCenter = ({ user, entityScope }: { user: User; entityScope: str
                             const ca = requesterCancel || purchasingCancel;
                             const reason = String(ca?.comment || '').trim();
                             const who = String(ca?.approver_name || '').trim();
-                            const when = ca?.created_at ? new Date(ca.created_at).toLocaleString() : '';
+                            const when = ca?.created_at ? formatDateTimeMYT(ca.created_at) : '';
                             const byRequester = !!requesterCancel;
                             return (
                               <div className="space-y-2">
@@ -8777,7 +9047,9 @@ export default function App() {
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [requests, setRequests] = useState<WorkflowRequest[]>([]);
   const [roles, setRoles] = useState<Role[]>([]);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'create' |'templates'| 'submit' | 'requests' | 'admin' | 'procurement'>('dashboard');
+  const [activeTab, setActiveTab] = useState<
+    'dashboard' | 'create' | 'templates' | 'submit' | 'requests' | 'admin' | 'procurement' | 'cost-centers'
+  >('dashboard');
   const [selectedTemplateForRequest, setSelectedTemplateForRequest] = useState<Workflow | null>(null);
   const [preSelectedRequestId, setPreSelectedRequestId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
@@ -8824,14 +9096,23 @@ export default function App() {
     }
   };
 
-  const fetchRequests = async () => {
+  const fetchRequests = useCallback(async () => {
     try {
       const data = await api.request('/api/workflow-requests', { skipEntity: true });
       setRequests(data);
     } catch (err) {
       console.error(err);
     }
-  };
+  }, []);
+
+  /** Navigate to Approvals and reload the list (covers sidebar re-clicks while already on this tab). */
+  const openRequestsTab = useCallback(() => {
+    setSelectedTemplateForRequest(null);
+    setActiveTab('requests');
+    void fetchRequests();
+  }, [fetchRequests]);
+
+  const lastVisibilityRequestsFetchRef = useRef(0);
 
   const applyEntityForUser = (userData: User) => {
     const ents = userData.entities || [];
@@ -8912,8 +9193,23 @@ export default function App() {
     if (!user || loading) return;
     const ents = user.entities || [];
     if (ents.length === 0) return;
-    fetchRequests();
-  }, [user, selectedEntity, loading]);
+    void fetchRequests();
+  }, [user, selectedEntity, loading, fetchRequests]);
+
+  /** Refetch when returning to the tab/window so multi-tab or background sessions stay aligned. */
+  useEffect(() => {
+    if (!user || loading) return;
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (activeTab !== 'requests') return;
+      const now = Date.now();
+      if (now - lastVisibilityRequestsFetchRef.current < 4000) return;
+      lastVisibilityRequestsFetchRef.current = now;
+      void fetchRequests();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [user, loading, activeTab, fetchRequests]);
 
   useEffect(() => {
     if (!isApproverViewUser && !isPreparerUser && canSeeDashboard) return;
@@ -9073,7 +9369,7 @@ export default function App() {
             {!sidebarCollapsed && <span className="truncate">Submit Request</span>}
           </button>
           <button
-            onClick={() => { setActiveTab('requests'); setSelectedTemplateForRequest(null); }}
+            onClick={openRequestsTab}
             title="Approvals & Requests"
             aria-label="Approvals & Requests"
             className={cn(
@@ -9098,6 +9394,22 @@ export default function App() {
             >
               <ShoppingCart className="w-4 h-4 shrink-0" />
               {!sidebarCollapsed && <span className="truncate">Procurement Center</span>}
+            </button>
+          )}
+
+          {hasPermission('manage_cost_centers') && (
+            <button
+              onClick={() => { setActiveTab('cost-centers'); setSelectedTemplateForRequest(null); }}
+              title="Cost centers"
+              aria-label="Cost centers"
+              className={cn(
+                'w-full flex items-center rounded-xl text-sm font-medium transition-all',
+                sidebarCollapsed ? 'justify-center px-2 py-2.5' : 'gap-3 px-3 py-2.5',
+                activeTab === 'cost-centers' ? 'bg-indigo-50 text-indigo-600' : 'text-zinc-500 hover:bg-zinc-50'
+              )}
+            >
+              <Warehouse className="w-4 h-4 shrink-0" />
+              {!sidebarCollapsed && <span className="truncate">Cost centers</span>}
             </button>
           )}
 
@@ -9161,7 +9473,8 @@ export default function App() {
              activeTab === 'templates' ? 'Workflow Templates' :
              activeTab === 'submit' ? 'Submit New Request' :
              activeTab === 'requests' ? 'Approvals & Requests' : 
-             activeTab === 'procurement' ? 'Procurement Center' : 'Administration'}
+             activeTab === 'procurement' ? 'Procurement Center' :
+             activeTab === 'cost-centers' ? 'Cost centers' : 'Administration'}
           </h2>
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
@@ -9182,14 +9495,14 @@ export default function App() {
               )}
             </div>
             <div className="h-8 w-px bg-zinc-200" />
-            <span className="text-xs text-zinc-400 font-medium">{new Date().toLocaleDateString()}</span>
+            <span className="text-xs text-zinc-400 font-medium">{formatDateMYT(new Date())}</span>
           </div>
         </header>
 
         <div
           className={cn(
             "mx-auto w-full min-h-0",
-            activeTab === 'procurement' || activeTab === 'requests' || activeTab === 'admin'
+            activeTab === 'procurement' || activeTab === 'cost-centers' || activeTab === 'requests' || activeTab === 'admin'
               ? "px-4 sm:px-6 lg:px-8 py-4 max-w-none h-[calc(100vh-4rem)] flex flex-col"
               : activeTab === 'submit' && selectedTemplateForRequest
               ? "flex flex-col h-[calc(100vh-4rem)] max-w-none px-4 sm:px-6 lg:px-8 py-4"
@@ -9214,9 +9527,9 @@ export default function App() {
                   }}
                   onViewRequest={(r) => {
                     setPreSelectedRequestId(r.id);
-                    setActiveTab('requests');
+                    openRequestsTab();
                   }}
-                  onViewAllRequests={() => setActiveTab('requests')}
+                  onViewAllRequests={openRequestsTab}
                 />
               </motion.div>
             )}
@@ -9282,7 +9595,7 @@ export default function App() {
                       <WorkflowRequestCreator 
                         template={selectedTemplateForRequest} 
                         entity={selectedEntity || undefined}
-                        onSuccess={() => { setSelectedTemplateForRequest(null); setActiveTab('requests'); fetchRequests(); }} 
+                        onSuccess={() => { openRequestsTab(); }} 
                       />
                     </div>
                   </div>
@@ -9316,11 +9629,24 @@ export default function App() {
             {activeTab === 'procurement' && hasPermission('view_procurement_center') && (
               <motion.div
                 key="procurement"
+                className="flex flex-col flex-1 min-h-0"
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
               >
-                <ProcurementCenter user={user} entityScope={selectedEntity || ''} />
+                <ProcurementCenter user={user} />
+              </motion.div>
+            )}
+
+            {activeTab === 'cost-centers' && hasPermission('manage_cost_centers') && (
+              <motion.div
+                key="cost-centers"
+                className="flex flex-col flex-1 min-h-0"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+              >
+                <CostCentersAdminPage entity={selectedEntity} />
               </motion.div>
             )}
 

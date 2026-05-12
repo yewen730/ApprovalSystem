@@ -68,6 +68,15 @@ async function ensureColumns(pool: sql.ConnectionPool) {
       ALTER TABLE workflow_requests ADD discount_rate DECIMAL(10, 6) NULL;
     IF COL_LENGTH('workflow_requests', 'po_status') IS NULL
       ALTER TABLE workflow_requests ADD po_status NVARCHAR(50) NULL;
+    IF OBJECT_ID(N'dbo.workflow_request_requester_signatures', N'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.workflow_request_requester_signatures (
+        request_id INT NOT NULL
+          CONSTRAINT PK_workflow_request_requester_signatures PRIMARY KEY
+          CONSTRAINT FK_wrrs_wr REFERENCES dbo.workflow_requests(id) ON DELETE CASCADE,
+        signature_data NVARCHAR(MAX) NOT NULL
+      );
+    END
   `);
 }
 
@@ -233,7 +242,6 @@ async function main() {
         String(r.template_name || "").toLowerCase().includes("purchase order") ? (r.status || "pending") : null
       )
       .input("current_step_index", sql.Int, r.current_step_index ?? 0)
-      .input("requester_signature", sql.NVarChar(sql.MAX), r.requester_signature ?? null)
       .input("requester_signed_at", sql.DateTime2, r.requester_signature ? new Date(r.created_at) : null)
       .input("tax_rate", sql.Decimal(10, 6), r.tax_rate ?? 0.18)
       .input("discount_rate", sql.Decimal(10, 6), (r as any).discount_rate ?? 0)
@@ -248,15 +256,29 @@ async function main() {
         SET IDENTITY_INSERT workflow_requests ON;
         INSERT INTO workflow_requests (
           id, template_id, requester_id, department, title, details, line_items, entity, formatted_id,
-          status, po_status, current_step_index, requester_signature, requester_signed_at, tax_rate, discount_rate, currency, cost_center, request_steps, created_at,
+          status, po_status, current_step_index, requester_signed_at, tax_rate, discount_rate, currency, cost_center, request_steps, created_at,
           requester_username, template_name, requester_name
         ) VALUES (
           @id, @template_id, @requester_id, @department, @title, @details, @line_items, @entity, @formatted_id,
-          @status, @po_status, @current_step_index, @requester_signature, @requester_signed_at, @tax_rate, @discount_rate, @currency, @cost_center, @request_steps, @created_at,
+          @status, @po_status, @current_step_index, @requester_signed_at, @tax_rate, @discount_rate, @currency, @cost_center, @request_steps, @created_at,
           @requester_username, @template_name, @requester_name
         );
         SET IDENTITY_INSERT workflow_requests OFF;
       `);
+    const sigRaw = r.requester_signature != null ? String(r.requester_signature).trim() : "";
+    if (sigRaw.length > 0) {
+      await pool
+        .request()
+        .input("request_id", sql.Int, r.id)
+        .input("signature_data", sql.NVarChar(sql.MAX), sigRaw)
+        .query(`
+          MERGE dbo.workflow_request_requester_signatures WITH (HOLDLOCK) AS tgt
+          USING (SELECT @request_id AS request_id, @signature_data AS signature_data) AS src
+          ON (tgt.request_id = src.request_id)
+          WHEN MATCHED THEN UPDATE SET signature_data = src.signature_data
+          WHEN NOT MATCHED BY TARGET THEN INSERT (request_id, signature_data) VALUES (src.request_id, src.signature_data);
+        `);
+    }
   }
   console.log("[migrate] workflow_requests:", requests.length);
 
