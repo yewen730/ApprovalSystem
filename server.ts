@@ -1291,10 +1291,15 @@ const bodyIndicatesRequesterSigned = (body: any): boolean => {
   return typeof s === "string" && s.trim().length > 0;
 };
 
-const bodyIndicatesApproverSigned = (body: any): boolean => {
-  if (body?.approver_signed === true || body?.approver_signed === 1) return true;
-  const s = body?.approver_signature;
-  return typeof s === "string" && s.trim().length > 0;
+/**
+ * Approver pad image for procurement PR/PO/SR/invoice (same rules as SPA `isSignatureImageDataUrl`).
+ * Do not treat `approver_signed: true` alone as valid — clients could otherwise approve with no image.
+ */
+const isProcurementApproverSignatureDataUrl = (s: unknown): boolean => {
+  if (typeof s !== "string") return false;
+  const t = s.trim();
+  if (!/^data:image\/(png|jpeg|jpg);base64,/i.test(t)) return false;
+  return t.length >= 80;
 };
 
 const legacyJsonArrayCellToCsv = (raw: unknown): string | null => {
@@ -3957,7 +3962,6 @@ async function startServer() {
   app.post("/api/workflow-requests/:id/approve", authenticate, requireEntityContext, async (req: any, res) => {
     const { status, comment, approver_signature, on_behalf_of_approver_id } = req.body;
     const requestId = req.params.id;
-    const approverSigned = bodyIndicatesApproverSigned(req.body);
     const approverSigStored =
       typeof approver_signature === "string" && approver_signature.trim().length > 0 ? approver_signature.trim() : null;
 
@@ -4024,7 +4028,7 @@ async function startServer() {
     const isProcurementSignatureDoc =
       request.template_category === "procurement" &&
       (isPRName(tplName) || isPOName(tplName) || isSRName(tplName) || n.includes("invoice"));
-    if (status === "approved" && isProcurementSignatureDoc && !approverSigned) {
+    if (status === "approved" && isProcurementSignatureDoc && !isProcurementApproverSignatureDataUrl(approver_signature)) {
       return res.status(400).json({ error: "Signature is required to approve this procurement document" });
     }
 

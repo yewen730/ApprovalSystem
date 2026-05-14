@@ -2368,16 +2368,15 @@ const printWorkflowRequestReportPdf = (request: WorkflowRequest) => {
   return buildPdfPreview(doc, `PR_${displayRequestSerial(request)}.pdf`);
 };
 
-/** Prefer `/approvals` payload (designation + signatures) when viewing details for this request. */
-function mergeRequestApprovalsForPdf(
-  request: WorkflowRequest,
-  selectedId: number | undefined,
-  detailApprovals: RequestApproval[]
-): WorkflowRequest {
-  if (detailApprovals.length > 0 && selectedId != null && request.id === selectedId) {
-    return { ...request, approvals: detailApprovals };
-  }
-  return request;
+/** List APIs omit signature LOBs; load detail + approvals right before PR/SR PDF so images stamp correctly. */
+async function fetchWorkflowRequestDetailAndApprovalsForPdf(
+  requestId: number
+): Promise<{ full: WorkflowRequest; approvals: RequestApproval[] }> {
+  const [full, approvals] = await Promise.all([
+    api.request(`/api/workflow-requests/${requestId}`) as Promise<WorkflowRequest>,
+    api.request(`/api/workflow-requests/${requestId}/approvals`) as Promise<RequestApproval[]>,
+  ]);
+  return { full, approvals };
 }
 
 function createWorkflowRequestPdfPreview(request: WorkflowRequest): { url: string; fileName: string; pdfDataUrl: string } {
@@ -2404,8 +2403,8 @@ async function persistPrSrFormPdfAfterWorkflowCompleted(
   const ent = String(requestBeforeTransition.entity || '').trim();
   if (ent) api.setActiveEntity(ent);
   try {
-    const appData = await api.request(`/api/workflow-requests/${requestId}/approvals`);
-    const merged = mergeRequestApprovalsForPdf(requestBeforeTransition, requestId, appData);
+    const { full, approvals } = await fetchWorkflowRequestDetailAndApprovalsForPdf(requestId);
+    const merged = { ...requestBeforeTransition, ...full, approvals };
     const preview = createWorkflowRequestPdfPreview(merged);
     await persistGeneratedProcurementFormPdf(requestId, preview.pdfDataUrl);
   } catch (e) {
@@ -3384,6 +3383,7 @@ const WorkflowRequestList = ({
   const [filterDept, setFilterDept] = useState<string>('all');
   const [filterEntity, setFilterEntity] = useState<string>('all');
   const [filterChosenApprover, setFilterChosenApprover] = useState<string>('all');
+  const [filterRequesterName, setFilterRequesterName] = useState<string>('all');
   const [listSearch, setListSearch] = useState('');
   const [sortBy, setSortBy] = useState<
     'request' | 'entity' | 'department' | 'requester' | 'chosenApprover' | 'status' | 'date'
@@ -3517,11 +3517,22 @@ const WorkflowRequestList = ({
     .map(([id, label]) => ({ id, label }))
     .sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }));
 
+  const requesterNameOptions = Array.from(
+    new Set(
+      requests
+        .map((r) => String(r.requester_name || '').trim())
+        .filter((n) => !!n)
+    )
+  ).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+
   const searchQ = listSearch.trim().toLowerCase();
   const filteredRequests = requests.filter(r => {
     const statusMatch = filterStatus === 'all' || normalizeWorkflowRequestStatus(r.status) === filterStatus;
     const deptMatch = filterDept === 'all' || r.department === filterDept;
     const entityMatch = filterEntity === 'all' || String(r.entity || '').trim() === filterEntity;
+    const requesterNameMatch =
+      filterRequesterName === 'all' ||
+      String(r.requester_name || '').trim() === filterRequesterName;
     const chosenApproverMatch =
       filterChosenApprover === 'all' ||
       (filterChosenApprover === 'none' && !requestHasChosenApprover(r)) ||
@@ -3545,7 +3556,7 @@ const WorkflowRequestList = ({
         .join(' ')
         .toLowerCase()
         .includes(searchQ);
-    return statusMatch && deptMatch && entityMatch && chosenApproverMatch && searchMatch;
+    return statusMatch && deptMatch && entityMatch && requesterNameMatch && chosenApproverMatch && searchMatch;
   });
 
   const toggleSort = (
@@ -3608,29 +3619,54 @@ const WorkflowRequestList = ({
       if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
       return null;
     });
-    await fetchDetails(request.id);
+    /** List API omits `requester_signature` (LOB); load one detail row so Approvals & Requests shows the real pad image. */
+    await Promise.all([
+      fetchDetails(request.id),
+      (async () => {
+        try {
+          const full = (await api.request(`/api/workflow-requests/${request.id}`)) as WorkflowRequest;
+          setSelectedRequest((prev) => (!prev || prev.id !== full.id ? prev : { ...prev, ...full }));
+        } catch (e: unknown) {
+          toast.error(e instanceof Error ? e.message : 'Could not load full request details');
+        }
+      })(),
+    ]);
   };
 
-  const handlePrintPR = (request: WorkflowRequest) => {
-    const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
-    const preview = createWorkflowRequestPdfPreview(merged);
-    void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
-    setViewingPdf((prev) => {
-      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return { url: preview.url, fileName: preview.fileName };
-    });
-    toast.success('PDF ready to view');
+  const handlePrintPR = async (request: WorkflowRequest) => {
+    const ent = String(request.entity || '').trim();
+    if (ent) api.setActiveEntity(ent);
+    try {
+      const { full, approvals: appRows } = await fetchWorkflowRequestDetailAndApprovalsForPdf(request.id);
+      const merged = { ...request, ...full, approvals: appRows };
+      const preview = createWorkflowRequestPdfPreview(merged);
+      void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
+      setViewingPdf((prev) => {
+        if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+        return { url: preview.url, fileName: preview.fileName };
+      });
+      toast.success('PDF ready to view');
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : 'Failed to build PDF');
+    }
   };
 
-  const handleShowRequestPdfInline = (request: WorkflowRequest) => {
-    const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
-    const preview = createWorkflowRequestPdfPreview(merged);
-    void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
-    setDetailsPdfPreview((prev) => {
-      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return { url: preview.url, fileName: preview.fileName };
-    });
-    setDetailsViewMode('pdf');
+  const handleShowRequestPdfInline = async (request: WorkflowRequest) => {
+    const ent = String(request.entity || '').trim();
+    if (ent) api.setActiveEntity(ent);
+    try {
+      const { full, approvals: appRows } = await fetchWorkflowRequestDetailAndApprovalsForPdf(request.id);
+      const merged = { ...request, ...full, approvals: appRows };
+      const preview = createWorkflowRequestPdfPreview(merged);
+      void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
+      setDetailsPdfPreview((prev) => {
+        if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+        return { url: preview.url, fileName: preview.fileName };
+      });
+      setDetailsViewMode('pdf');
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : 'Failed to build PDF');
+    }
   };
 
   const fetchDetails = async (id: number) => {
@@ -4137,6 +4173,23 @@ const WorkflowRequestList = ({
           </div>
 
           <div className="flex items-center gap-2 bg-white border border-zinc-200 rounded-lg px-3 py-1.5 min-w-0">
+            <Users className="w-3 h-3 text-zinc-400 shrink-0" />
+            <select
+              className="text-xs bg-transparent border-none focus:ring-0 outline-none text-zinc-600 font-medium max-w-[11rem] sm:max-w-[14rem] truncate"
+              value={filterRequesterName}
+              onChange={(e) => setFilterRequesterName(e.target.value)}
+              title="Filter by requester name"
+            >
+              <option value="all">All requesters</option>
+              {requesterNameOptions.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2 bg-white border border-zinc-200 rounded-lg px-3 py-1.5 min-w-0">
             <UserPlus className="w-3 h-3 text-zinc-400 shrink-0" />
             <select
               className="text-xs bg-transparent border-none focus:ring-0 outline-none text-zinc-600 font-medium max-w-[11rem] sm:max-w-[14rem] truncate"
@@ -4166,12 +4219,13 @@ const WorkflowRequestList = ({
             Reload
           </button>
 
-          {(filterStatus !== 'all' || filterDept !== 'all' || filterEntity !== 'all' || filterChosenApprover !== 'all' || listSearch.trim() !== '') && (
+          {(filterStatus !== 'all' || filterDept !== 'all' || filterEntity !== 'all' || filterRequesterName !== 'all' || filterChosenApprover !== 'all' || listSearch.trim() !== '') && (
             <button 
               onClick={() => {
                 setFilterStatus('all');
                 setFilterDept('all');
                 setFilterEntity('all');
+                setFilterRequesterName('all');
                 setFilterChosenApprover('all');
                 setListSearch('');
               }}
@@ -6249,6 +6303,20 @@ function CostCentersAdminPage({ entity }: { entity: string | null }) {
     gl_account: string;
     active: boolean;
   } | null>(null);
+  const [catalogSearch, setCatalogSearch] = useState('');
+
+  const filteredRows = useMemo(() => {
+    const q = catalogSearch.trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter((row) => {
+      const gl = row.gl_account != null ? String(row.gl_account) : '';
+      return (
+        row.code.toLowerCase().includes(q) ||
+        row.name.toLowerCase().includes(q) ||
+        gl.toLowerCase().includes(q)
+      );
+    });
+  }, [rows, catalogSearch]);
 
   const load = useCallback(async () => {
     if (!ent) {
@@ -6414,12 +6482,23 @@ function CostCentersAdminPage({ entity }: { entity: string | null }) {
       </div>
 
       <div className="flex-1 min-h-0 overflow-auto rounded-xl border border-zinc-200 bg-white flex flex-col">
-        <div className="px-4 py-2 border-b border-zinc-100 flex items-center justify-between shrink-0">
-          <span className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Catalog</span>
+        <div className="px-4 py-2 border-b border-zinc-100 flex flex-wrap items-center gap-3 shrink-0">
+          <span className="text-xs font-bold text-zinc-500 uppercase tracking-wider shrink-0">Catalog</span>
+          <div className="flex-1 min-w-[12rem] max-w-md relative">
+            <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400 pointer-events-none" />
+            <input
+              type="search"
+              aria-label="Search cost centers"
+              placeholder="Search code, name, GL…"
+              className="w-full pl-8 pr-2 py-1.5 rounded-lg border border-zinc-200 text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+              value={catalogSearch}
+              onChange={(e) => setCatalogSearch(e.target.value)}
+            />
+          </div>
           <button
             type="button"
             onClick={() => void load()}
-            className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-600 hover:text-indigo-800"
+            className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-600 hover:text-indigo-800 shrink-0 ml-auto"
           >
             <RefreshCw className="w-3.5 h-3.5" />
             Refresh
@@ -6429,6 +6508,8 @@ function CostCentersAdminPage({ entity }: { entity: string | null }) {
           <div className="p-8 text-center text-sm text-zinc-500">Loading…</div>
         ) : rows.length === 0 ? (
           <div className="p-8 text-center text-sm text-zinc-500">No cost centers for this entity yet.</div>
+        ) : filteredRows.length === 0 ? (
+          <div className="p-8 text-center text-sm text-zinc-500">No cost centers match your search.</div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -6442,7 +6523,7 @@ function CostCentersAdminPage({ entity }: { entity: string | null }) {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row) => (
+                {filteredRows.map((row) => (
                   <tr key={row.id} className="border-b border-zinc-50 hover:bg-zinc-50/80">
                     {editing?.id === row.id ? (
                       <>
@@ -7380,26 +7461,40 @@ const ProcurementCenter = ({ user }: { user: User }) => {
     }
   };
 
-  const handlePrintPR = (request: WorkflowRequest) => {
-    const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
-    const preview = createWorkflowRequestPdfPreview(merged);
-    void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
-    setViewingPdf((prev) => {
-      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return { url: preview.url, fileName: preview.fileName };
-    });
-    toast.success('PDF ready to view');
+  const handlePrintPR = async (request: WorkflowRequest) => {
+    const ent = String(request.entity || '').trim();
+    if (ent) api.setActiveEntity(ent);
+    try {
+      const { full, approvals: appRows } = await fetchWorkflowRequestDetailAndApprovalsForPdf(request.id);
+      const merged = { ...request, ...full, approvals: appRows };
+      const preview = createWorkflowRequestPdfPreview(merged);
+      void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
+      setViewingPdf((prev) => {
+        if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+        return { url: preview.url, fileName: preview.fileName };
+      });
+      toast.success('PDF ready to view');
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : 'Failed to build PDF');
+    }
   };
 
-  const handleShowRequestPdfInline = (request: WorkflowRequest) => {
-    const merged = mergeRequestApprovalsForPdf(request, selectedRequest?.id, approvals);
-    const preview = createWorkflowRequestPdfPreview(merged);
-    void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
-    setDetailsPdfPreview((prev) => {
-      if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
-      return { url: preview.url, fileName: preview.fileName };
-    });
-    setDetailsViewMode('pdf');
+  const handleShowRequestPdfInline = async (request: WorkflowRequest) => {
+    const ent = String(request.entity || '').trim();
+    if (ent) api.setActiveEntity(ent);
+    try {
+      const { full, approvals: appRows } = await fetchWorkflowRequestDetailAndApprovalsForPdf(request.id);
+      const merged = { ...request, ...full, approvals: appRows };
+      const preview = createWorkflowRequestPdfPreview(merged);
+      void persistGeneratedProcurementFormPdf(request.id, preview.pdfDataUrl);
+      setDetailsPdfPreview((prev) => {
+        if (prev?.url.startsWith('blob:')) URL.revokeObjectURL(prev.url);
+        return { url: preview.url, fileName: preview.fileName };
+      });
+      setDetailsViewMode('pdf');
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : 'Failed to build PDF');
+    }
   };
 
   const handleGeneratePODraft = (request: WorkflowRequest) => {
